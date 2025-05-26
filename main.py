@@ -4,6 +4,7 @@ import pandas as pd
 import robin_stocks.robinhood as rh
 from dotenv import load_dotenv
 import os
+from scipy.optimize import brentq
 
 # looks for a .env file in the current directory
 # RH_USERNAME and RH_PASSWORD should be set in the .env file
@@ -49,6 +50,22 @@ def implied_move(stock_price, iv, days_list, confidence_levels):
     
     return pd.DataFrame(results)
 
+
+
+# Black-Scholes Call Price
+def black_scholes_call_price(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + sigma**2 / 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+# Function to solve: difference between market price and BS price
+def implied_volatility_call(S, K, T, r, market_price):
+    objective = lambda sigma: black_scholes_call_price(S, K, T, r, sigma) - market_price
+    return brentq(objective, 1e-5, 3)  # search in a reasonable range for sigma (0.001% - 300%)
+
+
+
+
 def main():
     # Example usage:
     stock_price = 100
@@ -58,6 +75,17 @@ def main():
 
     df = implied_move(stock_price, implied_volatility, days, confidence_levels)
     print(df)
+
+
+    # Example usage:
+    S = 100         # Current stock price
+    K = 105         # Strike price
+    T = 30/365      # Time to expiry in years
+    r = 0.01        # Risk-free rate
+    market_price = 2.50  # Observed option price in the market
+
+    iv = implied_volatility_call(S, K, T, r, market_price)
+    print(f"Implied Volatility: {iv:.2%}")
 
     login_robinhood(os.getenv("RH_USERNAME"), os.getenv("RH_PASSWORD"))  # Replace with your credentials
 
