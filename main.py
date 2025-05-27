@@ -68,10 +68,13 @@ def implied_volatility_call(S, K, T, r, market_price):
 
 def main():
     # Example usage:
-    stock_price = 100
-    implied_volatility = 0.30  # 30% IV
-    days = [1, 5, 10, 21, 30, 60]
-    confidence_levels = [0.68, 0.95]
+    stock_price = 590
+    implied_volatility = 0.1956  # 30% IV
+    days = [1, 3, 5, 10, 21, 30, 60]
+
+    # 1 sig = 68% confidence, 2 sig = 95% confidence
+    # 3 sig = 99.7% confidence
+    confidence_levels = [0.6827, 0.9545, 0.997]
 
     df = implied_move(stock_price, implied_volatility, days, confidence_levels)
     print(df)
