@@ -8,6 +8,7 @@ import os
 from scipy.optimize import brentq
 import click
 from datetime import datetime, timedelta
+from options import OptionPricer
 
 # looks for a .env file in the current directory
 # RH_USERNAME and RH_PASSWORD should be set in the .env file
@@ -77,6 +78,139 @@ def business_days_from_today(n):
             days_remaining -= 1
     return current_date.strftime('%Y-%m-%d')
 
+def calculate_time_to_expiry(expiration_date):
+    """
+    Calculate time to expiry in years from current date to expiration date.
+    
+    Parameters:
+    - expiration_date: str, expiration date in 'YYYY-MM-DD' format
+    
+    Returns:
+    - float, time to expiry in years
+    """
+    current_date = datetime.now()
+    exp_date = datetime.strptime(expiration_date, '%Y-%m-%d')
+    days_diff = (exp_date - current_date).days
+    return max(days_diff / 365.0, 1/365)  # Minimum 1 day to avoid division by zero
+
+def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
+    """
+    Calculate delta and gamma for all options of a given ticker on a specific expiration date.
+    
+    Parameters:
+    - ticker: str, stock ticker symbol
+    - expiration_date: str, expiration date in 'YYYY-MM-DD' format
+    - risk_free_rate: float, risk-free interest rate (default 2%)
+    
+    Returns:
+    - pandas.DataFrame with options data and calculated Greeks
+    """
+    try:
+        # Get current stock price
+        stock_price_list = rh.stocks.get_latest_price(ticker, priceType=None, includeExtendedHours=True)
+        if not stock_price_list:
+            raise ValueError(f"Could not retrieve price for {ticker}")
+        
+        stock_price = float(stock_price_list[0])
+        print(f"Current {ticker} price: ${stock_price:.2f}")
+        
+        # Calculate time to expiry
+        time_to_expiry = calculate_time_to_expiry(expiration_date)
+        print(f"Time to expiry: {time_to_expiry:.4f} years ({time_to_expiry*365:.1f} days)")
+        
+        # Get all available options for the expiration date
+        options_data = rh.options.find_options_by_expiration(ticker, expiration_date, info=None)
+        
+        if not options_data:
+            raise ValueError(f"No options found for {ticker} on {expiration_date}")
+        
+        print(f"Found {len(options_data)} options contracts")
+        
+        results = []
+        
+        for option in options_data:
+            try:
+                # Extract option details
+                strike_price = float(option.get('strike_price', 0))
+                option_type = option.get('type', '').lower()  # 'call' or 'put'
+                
+                # Get market price (use mark price if available, otherwise midpoint of bid/ask)
+                mark_price = option.get('mark_price')
+                bid_price = option.get('bid_price') 
+                ask_price = option.get('ask_price')
+                
+                if mark_price and float(mark_price) > 0:
+                    market_price = float(mark_price)
+                elif bid_price and ask_price and float(bid_price) > 0 and float(ask_price) > 0:
+                    market_price = (float(bid_price) + float(ask_price)) / 2
+                else:
+                    continue  # Skip options without valid pricing
+                
+                # Get implied volatility
+                implied_vol = option.get('implied_volatility')
+                if not implied_vol or float(implied_vol) <= 0:
+                    continue  # Skip options without IV
+                
+                implied_vol = float(implied_vol)
+                
+                # Create OptionPricer instance
+                pricer = OptionPricer(
+                    S=stock_price,
+                    K=strike_price, 
+                    T=time_to_expiry,
+                    r=risk_free_rate,
+                    market_price=market_price
+                )
+                
+                # Calculate Greeks
+                delta = pricer.delta(implied_vol, option_type)
+                gamma = pricer.gamma(implied_vol)
+                vega = pricer.vega(implied_vol)
+                theta = pricer.theta(implied_vol, option_type)
+                
+                # Calculate theoretical price using Black-Scholes
+                if option_type == 'call':
+                    theoretical_price = pricer.black_scholes_call(implied_vol)
+                else:
+                    theoretical_price = pricer.black_scholes_put(implied_vol)
+                
+                # Store results
+                results.append({
+                    'ticker': ticker,
+                    'expiration_date': expiration_date,
+                    'option_type': option_type.upper(),
+                    'strike_price': strike_price,
+                    'market_price': market_price,
+                    'theoretical_price': theoretical_price,
+                    'bid_price': float(bid_price) if bid_price else None,
+                    'ask_price': float(ask_price) if ask_price else None,
+                    'implied_volatility': implied_vol,
+                    'delta': delta,
+                    'gamma': gamma,
+                    'vega': vega,
+                    'theta': theta,
+                    'volume': option.get('volume'),
+                    'open_interest': option.get('open_interest'),
+                    'time_to_expiry_days': time_to_expiry * 365
+                })
+                
+            except (ValueError, TypeError, KeyError) as e:
+                print(f"Error processing option {option.get('strike_price', 'unknown')}: {e}")
+                continue
+        
+        if not results:
+            raise ValueError(f"No valid options data found for {ticker} on {expiration_date}")
+        
+        # Create DataFrame and sort by strike price and option type
+        df = pd.DataFrame(results)
+        df = df.sort_values(['option_type', 'strike_price'])
+        
+        return df
+        
+    except Exception as e:
+        print(f"Error calculating options Greeks: {e}")
+        return pd.DataFrame()
+
 @click.group()
 def cli():
     """
@@ -131,6 +265,89 @@ def emove(ticker, days, confidence):
 
     df = implied_move(stock_price, iv, days, confidence_levels)
     print(df)
+
+@cli.command()
+@click.option('--ticker', default='SPY', help='Ticker symbol of the stock (default: SPY)')
+@click.option('--expiration', help='Expiration date in YYYY-MM-DD format (default: next business day)')
+@click.option('--rate', default=0.02, help='Risk-free interest rate (default: 0.02 or 2%)')
+@click.option('--output', help='Output file path to save results as CSV (optional)')
+@click.option('--min-volume', default=0, help='Minimum volume filter (default: 0)')
+@click.option('--show-all', is_flag=True, help='Show all Greeks (delta, gamma, vega, theta) instead of just delta and gamma')
+def greeks(ticker, expiration, rate, output, min_volume, show_all):
+    """
+    Calculate delta and gamma (and optionally other Greeks) for all options on a given expiration date.
+    
+    This command fetches all available options contracts for the specified ticker and expiration date,
+    then calculates the Black-Scholes Greeks for each contract.
+    """
+    try:
+        # Set default expiration to next business day if not provided
+        if not expiration:
+            expiration = business_days_from_today(1)
+            click.echo(f"Using default expiration date: {expiration}")
+        
+        click.echo(f"Calculating Greeks for {ticker} options expiring on {expiration}")
+        click.echo(f"Using risk-free rate: {rate:.2%}")
+        
+        # Calculate options Greeks
+        df = calculate_options_greeks(ticker, expiration, rate)
+        
+        if df.empty:
+            click.echo("No options data found or error occurred.")
+            return
+        
+        # Apply volume filter
+        if min_volume > 0:
+            df = df[df['volume'].fillna(0) >= min_volume]
+            click.echo(f"Filtered to options with volume >= {min_volume}")
+        
+        # Select columns to display
+        if show_all:
+            display_columns = [
+                'option_type', 'strike_price', 'market_price', 'theoretical_price',
+                'bid_price', 'ask_price', 'implied_volatility', 'delta', 'gamma', 
+                'vega', 'theta', 'volume', 'open_interest'
+            ]
+        else:
+            display_columns = [
+                'option_type', 'strike_price', 'market_price', 'implied_volatility',
+                'delta', 'gamma', 'volume', 'open_interest'
+            ]
+        
+        # Format and display results
+        display_df = df[display_columns].copy()
+        
+        # Round numerical columns for better display
+        numeric_columns = ['market_price', 'theoretical_price', 'bid_price', 'ask_price', 
+                          'implied_volatility', 'delta', 'gamma', 'vega', 'theta']
+        for col in numeric_columns:
+            if col in display_df.columns:
+                if col == 'implied_volatility':
+                    display_df[col] = display_df[col].round(4)
+                elif col in ['delta', 'gamma', 'vega', 'theta']:
+                    display_df[col] = display_df[col].round(6)
+                else:
+                    display_df[col] = display_df[col].round(2)
+        
+        click.echo(f"\nFound {len(display_df)} options contracts:")
+        click.echo(f"Calls: {len(display_df[display_df['option_type'] == 'CALL'])}")
+        click.echo(f"Puts: {len(display_df[display_df['option_type'] == 'PUT'])}")
+        
+        # Display summary statistics
+        click.echo(f"\nDelta range: {df['delta'].min():.4f} to {df['delta'].max():.4f}")
+        click.echo(f"Gamma range: {df['gamma'].min():.6f} to {df['gamma'].max():.6f}")
+        
+        # Display the data
+        click.echo("\nOptions Greeks Data:")
+        click.echo(display_df.to_string(index=False))
+        
+        # Save to CSV if output file specified
+        if output:
+            df.to_csv(output, index=False)
+            click.echo(f"\nFull results saved to: {output}")
+            
+    except Exception as e:
+        click.echo(f"Error: {e}")
 
 
 
