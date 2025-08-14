@@ -109,6 +109,137 @@ class OptionPricer:
         
         return theta / 365  # Convert to daily theta
 
+    def gex_per_contract(self, sigma, open_interest, option_type='call'):
+        """
+        Calculate Gamma Exposure (GEX) for a single options contract.
+        
+        GEX represents the dollar amount of gamma exposure for each 1% move in the underlying.
+        For market makers who are short options, positive GEX means they need to buy stock as price goes up
+        and sell as price goes down (stabilizing effect). Negative GEX means the opposite (destabilizing).
+        
+        Parameters:
+        - sigma: float, volatility
+        - open_interest: int, number of contracts outstanding
+        - option_type: str, 'call' or 'put'
+        
+        Returns:
+        - float, GEX value in dollars
+        """
+        if not open_interest or open_interest <= 0:
+            return 0.0
+            
+        gamma_value = self.gamma(sigma)
+        
+        # GEX = Gamma × Open Interest × 100 shares/contract × Spot Price × 0.01 (for 1% move)
+        # Market makers are typically short options, so we flip the sign
+        gex = -gamma_value * open_interest * 100 * self.S * 0.01
+        
+        return gex
+    
+    def gex_notional(self, sigma, open_interest, option_type='call'):
+        """
+        Calculate notional GEX (total gamma exposure in dollar terms).
+        
+        Parameters:
+        - sigma: float, volatility
+        - open_interest: int, number of contracts outstanding
+        - option_type: str, 'call' or 'put'
+        
+        Returns:
+        - float, notional GEX value in dollars
+        """
+        if not open_interest or open_interest <= 0:
+            return 0.0
+            
+        gamma_value = self.gamma(sigma)
+        
+        # Notional GEX = Gamma × Open Interest × 100 shares/contract × (Spot Price)^2
+        # This represents the total dollar gamma exposure
+        notional_gex = -gamma_value * open_interest * 100 * (self.S ** 2)
+        
+        return notional_gex
+
+    @staticmethod
+    def calculate_portfolio_gex(gex_values):
+        """
+        Calculate total portfolio GEX and determine gamma positioning.
+        
+        Parameters:
+        - gex_values: list of floats, individual contract GEX values
+        
+        Returns:
+        - dict with portfolio GEX metrics and positioning analysis
+        """
+        total_gex = sum(gex_values)
+        call_gex = sum([gex for gex in gex_values if gex > 0])
+        put_gex = sum([gex for gex in gex_values if gex < 0])
+        
+        # Determine gamma positioning
+        if abs(total_gex) < 1000000:  # Less than $1M threshold
+            gamma_position = "GAMMA NEUTRAL"
+            position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
+        elif total_gex > 0:
+            gamma_position = "LONG GAMMA"
+            position_description = "Market makers are net short gamma. They will buy on dips and sell on rallies (stabilizing)."
+        else:
+            gamma_position = "SHORT GAMMA"
+            position_description = "Market makers are net long gamma. They will sell on dips and buy on rallies (destabilizing)."
+        
+        return {
+            'total_gex': total_gex,
+            'call_gex': call_gex,
+            'put_gex': put_gex,
+            'net_gex': total_gex,
+            'gamma_position': gamma_position,
+            'position_description': position_description,
+            'gex_per_1pct_move': total_gex,
+            'abs_gex': abs(total_gex)
+        }
+
+    @staticmethod
+    def get_gamma_levels(spot_price, gex_by_strike):
+        """
+        Identify key gamma levels (strikes with highest absolute GEX).
+        
+        Parameters:
+        - spot_price: float, current underlying price
+        - gex_by_strike: dict, mapping of strike prices to GEX values
+        
+        Returns:
+        - dict with key gamma levels and analysis
+        """
+        if not gex_by_strike:
+            return {}
+            
+        # Sort strikes by absolute GEX (highest first)
+        sorted_strikes = sorted(gex_by_strike.items(), 
+                              key=lambda x: abs(x[1]), reverse=True)
+        
+        # Find largest positive and negative GEX levels
+        max_positive_gex = max(gex_by_strike.items(), key=lambda x: x[1])
+        max_negative_gex = min(gex_by_strike.items(), key=lambda x: x[1])
+        
+        # Find closest strikes to current price
+        strikes_above = {k: v for k, v in gex_by_strike.items() if k > spot_price}
+        strikes_below = {k: v for k, v in gex_by_strike.items() if k < spot_price}
+        
+        resistance_level = None
+        support_level = None
+        
+        if strikes_above:
+            resistance_level = min(strikes_above.items(), key=lambda x: x[0])
+        if strikes_below:
+            support_level = max(strikes_below.items(), key=lambda x: x[0])
+        
+        return {
+            'top_3_gamma_strikes': sorted_strikes[:3],
+            'max_positive_gex_strike': max_positive_gex,
+            'max_negative_gex_strike': max_negative_gex,
+            'nearest_resistance': resistance_level,
+            'nearest_support': support_level,
+            'current_spot': spot_price
+        }
+
     def implied_volatility_bs(self, option_type='call'):
         if option_type == 'call':
             objective = lambda sigma: self.black_scholes_call(sigma) - self.market_price

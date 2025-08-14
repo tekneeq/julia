@@ -168,6 +168,13 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
                 vega = pricer.vega(implied_vol)
                 theta = pricer.theta(implied_vol, option_type)
                 
+                # Calculate GEX (Gamma Exposure)
+                open_interest_val = option.get('open_interest')
+                open_interest_val = int(open_interest_val) if open_interest_val else 0
+                
+                gex_per_contract = pricer.gex_per_contract(implied_vol, open_interest_val, option_type)
+                gex_notional = pricer.gex_notional(implied_vol, open_interest_val, option_type)
+                
                 # Calculate theoretical price using Black-Scholes
                 if option_type == 'call':
                     theoretical_price = pricer.black_scholes_call(implied_vol)
@@ -189,8 +196,10 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
                     'gamma': gamma,
                     'vega': vega,
                     'theta': theta,
+                    'gex_per_contract': gex_per_contract,
+                    'gex_notional': gex_notional,
                     'volume': option.get('volume'),
-                    'open_interest': option.get('open_interest'),
+                    'open_interest': open_interest_val,
                     'time_to_expiry_days': time_to_expiry * 365
                 })
                 
@@ -204,6 +213,21 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
         # Create DataFrame and sort by strike price and option type
         df = pd.DataFrame(results)
         df = df.sort_values(['option_type', 'strike_price'])
+        
+        # Calculate portfolio-level GEX analysis
+        if not df.empty:
+            # Portfolio GEX analysis
+            all_gex = df['gex_per_contract'].tolist()
+            portfolio_gex = OptionPricer.calculate_portfolio_gex(all_gex)
+            
+            # GEX by strike analysis
+            gex_by_strike = df.groupby('strike_price')['gex_per_contract'].sum().to_dict()
+            gamma_levels = OptionPricer.get_gamma_levels(stock_price, gex_by_strike)
+            
+            # Add portfolio analysis to DataFrame as metadata
+            df.attrs['portfolio_gex'] = portfolio_gex
+            df.attrs['gamma_levels'] = gamma_levels
+            df.attrs['stock_price'] = stock_price
         
         return df
         
@@ -273,12 +297,16 @@ def emove(ticker, days, confidence):
 @click.option('--output', help='Output file path to save results as CSV (optional)')
 @click.option('--min-volume', default=0, help='Minimum volume filter (default: 0)')
 @click.option('--show-all', is_flag=True, help='Show all Greeks (delta, gamma, vega, theta) instead of just delta and gamma')
-def greeks(ticker, expiration, rate, output, min_volume, show_all):
+@click.option('--show-gex', is_flag=True, help='Show Gamma Exposure (GEX) analysis and positioning')
+def greeks(ticker, expiration, rate, output, min_volume, show_all, show_gex):
     """
-    Calculate delta and gamma (and optionally other Greeks) for all options on a given expiration date.
+    Calculate delta, gamma, GEX (and optionally other Greeks) for all options on a given expiration date.
     
     This command fetches all available options contracts for the specified ticker and expiration date,
-    then calculates the Black-Scholes Greeks for each contract.
+    then calculates the Black-Scholes Greeks and Gamma Exposure (GEX) for each contract.
+    
+    GEX Analysis helps determine if the market is in a Long Gamma, Short Gamma, or Gamma Neutral environment,
+    which affects expected market maker hedging flows and volatility patterns.
     """
     try:
         # Set default expiration to next business day if not provided
@@ -306,26 +334,33 @@ def greeks(ticker, expiration, rate, output, min_volume, show_all):
             display_columns = [
                 'option_type', 'strike_price', 'market_price', 'theoretical_price',
                 'bid_price', 'ask_price', 'implied_volatility', 'delta', 'gamma', 
-                'vega', 'theta', 'volume', 'open_interest'
+                'vega', 'theta', 'gex_per_contract', 'gex_notional', 'volume', 'open_interest'
             ]
         else:
             display_columns = [
                 'option_type', 'strike_price', 'market_price', 'implied_volatility',
-                'delta', 'gamma', 'volume', 'open_interest'
+                'delta', 'gamma', 'gex_per_contract', 'gex_notional', 'volume', 'open_interest'
             ]
+        
+        # Remove GEX columns if not requested for display
+        if not show_gex:
+            display_columns = [col for col in display_columns if not col.startswith('gex_')]
         
         # Format and display results
         display_df = df[display_columns].copy()
         
         # Round numerical columns for better display
         numeric_columns = ['market_price', 'theoretical_price', 'bid_price', 'ask_price', 
-                          'implied_volatility', 'delta', 'gamma', 'vega', 'theta']
+                          'implied_volatility', 'delta', 'gamma', 'vega', 'theta', 
+                          'gex_per_contract', 'gex_notional']
         for col in numeric_columns:
             if col in display_df.columns:
                 if col == 'implied_volatility':
                     display_df[col] = display_df[col].round(4)
                 elif col in ['delta', 'gamma', 'vega', 'theta']:
                     display_df[col] = display_df[col].round(6)
+                elif col in ['gex_per_contract', 'gex_notional']:
+                    display_df[col] = display_df[col].round(0).astype(int)
                 else:
                     display_df[col] = display_df[col].round(2)
         
@@ -336,6 +371,56 @@ def greeks(ticker, expiration, rate, output, min_volume, show_all):
         # Display summary statistics
         click.echo(f"\nDelta range: {df['delta'].min():.4f} to {df['delta'].max():.4f}")
         click.echo(f"Gamma range: {df['gamma'].min():.6f} to {df['gamma'].max():.6f}")
+        
+        # Display GEX Analysis
+        if hasattr(df, 'attrs') and 'portfolio_gex' in df.attrs and show_gex:
+            portfolio_gex = df.attrs['portfolio_gex']
+            gamma_levels = df.attrs['gamma_levels']
+            stock_price = df.attrs['stock_price']
+            
+            click.echo(f"\n{'='*60}")
+            click.echo(f"GAMMA EXPOSURE (GEX) ANALYSIS")
+            click.echo(f"{'='*60}")
+            
+            # Portfolio GEX Summary
+            click.echo(f"\nPortfolio GEX Summary:")
+            click.echo(f"  Current Position: {portfolio_gex['gamma_position']}")
+            click.echo(f"  Total GEX: ${portfolio_gex['total_gex']:,.0f}")
+            click.echo(f"  Call GEX: ${portfolio_gex['call_gex']:,.0f}")
+            click.echo(f"  Put GEX: ${portfolio_gex['put_gex']:,.0f}")
+            click.echo(f"  Net GEX: ${portfolio_gex['net_gex']:,.0f}")
+            click.echo(f"\nMarket Impact:")
+            click.echo(f"  {portfolio_gex['position_description']}")
+            
+            # Key Gamma Levels
+            if gamma_levels and 'top_3_gamma_strikes' in gamma_levels:
+                click.echo(f"\nKey Gamma Levels (Top 3 by absolute GEX):")
+                for i, (strike, gex) in enumerate(gamma_levels['top_3_gamma_strikes'], 1):
+                    distance = ((strike - stock_price) / stock_price) * 100
+                    click.echo(f"  {i}. ${strike:.0f} - GEX: ${gex:,.0f} ({distance:+.1f}% from spot)")
+                
+                # Support/Resistance levels
+                if gamma_levels.get('nearest_support'):
+                    support_strike, support_gex = gamma_levels['nearest_support']
+                    click.echo(f"\nNearest Support: ${support_strike:.0f} (GEX: ${support_gex:,.0f})")
+                
+                if gamma_levels.get('nearest_resistance'):
+                    resistance_strike, resistance_gex = gamma_levels['nearest_resistance']
+                    click.echo(f"Nearest Resistance: ${resistance_strike:.0f} (GEX: ${resistance_gex:,.0f})")
+            
+            # GEX interpretation
+            total_gex_millions = portfolio_gex['total_gex'] / 1000000
+            click.echo(f"\nGEX Interpretation:")
+            if abs(total_gex_millions) < 1:
+                click.echo(f"  Low GEX environment (${abs(total_gex_millions):.1f}M) - Expect normal volatility")
+            elif abs(total_gex_millions) < 10:
+                click.echo(f"  Moderate GEX environment (${abs(total_gex_millions):.1f}M) - Some dealer flow impact")
+            else:
+                click.echo(f"  High GEX environment (${abs(total_gex_millions):.1f}M) - Significant dealer flow expected")
+        elif show_gex and hasattr(df, 'attrs') and 'portfolio_gex' in df.attrs:
+            # Show basic GEX summary even if detailed analysis failed
+            portfolio_gex = df.attrs['portfolio_gex']
+            click.echo(f"\nGEX Summary: {portfolio_gex['gamma_position']} - Net GEX: ${portfolio_gex['net_gex']:,.0f}")
         
         # Display the data
         click.echo("\nOptions Greeks Data:")
