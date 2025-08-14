@@ -23,6 +23,92 @@ class OptionPricer:
         d2 = d1 - sigma * np.sqrt(self.T)
         return self.K * np.exp(-self.r * self.T) * norm.cdf(-d2) - self.S * np.exp(-self.q * self.T) * norm.cdf(-d1)
 
+    # --- Greeks Calculations ---
+    def delta(self, sigma, option_type='call'):
+        """
+        Calculate delta (price sensitivity to underlying price changes).
+        
+        Parameters:
+        - sigma: float, volatility
+        - option_type: str, 'call' or 'put'
+        
+        Returns:
+        - float, delta value
+        """
+        if self.T <= 0:
+            # At expiration
+            if option_type == 'call':
+                return 1.0 if self.S > self.K else 0.0
+            else:
+                return -1.0 if self.S < self.K else 0.0
+        
+        d1 = (np.log(self.S / self.K) + (self.r - self.q + sigma**2 / 2) * self.T) / (sigma * np.sqrt(self.T))
+        
+        if option_type == 'call':
+            return np.exp(-self.q * self.T) * norm.cdf(d1)
+        else:  # put
+            return -np.exp(-self.q * self.T) * norm.cdf(-d1)
+
+    def gamma(self, sigma):
+        """
+        Calculate gamma (rate of change of delta with respect to underlying price).
+        Gamma is the same for both calls and puts.
+        
+        Parameters:
+        - sigma: float, volatility
+        
+        Returns:
+        - float, gamma value
+        """
+        if self.T <= 0:
+            return 0.0  # At expiration, gamma is 0
+        
+        d1 = (np.log(self.S / self.K) + (self.r - self.q + sigma**2 / 2) * self.T) / (sigma * np.sqrt(self.T))
+        return (np.exp(-self.q * self.T) * norm.pdf(d1)) / (self.S * sigma * np.sqrt(self.T))
+
+    def vega(self, sigma):
+        """
+        Calculate vega (price sensitivity to volatility changes).
+        Vega is the same for both calls and puts.
+        
+        Parameters:
+        - sigma: float, volatility
+        
+        Returns:
+        - float, vega value
+        """
+        if self.T <= 0:
+            return 0.0  # At expiration, vega is 0
+        
+        d1 = (np.log(self.S / self.K) + (self.r - self.q + sigma**2 / 2) * self.T) / (sigma * np.sqrt(self.T))
+        return self.S * np.exp(-self.q * self.T) * norm.pdf(d1) * np.sqrt(self.T) / 100  # Divided by 100 for 1% change
+
+    def theta(self, sigma, option_type='call'):
+        """
+        Calculate theta (time decay).
+        
+        Parameters:
+        - sigma: float, volatility
+        - option_type: str, 'call' or 'put'
+        
+        Returns:
+        - float, theta value (usually negative)
+        """
+        if self.T <= 0:
+            return 0.0  # At expiration, theta is 0
+        
+        d1 = (np.log(self.S / self.K) + (self.r - self.q + sigma**2 / 2) * self.T) / (sigma * np.sqrt(self.T))
+        d2 = d1 - sigma * np.sqrt(self.T)
+        
+        common_term = -(self.S * np.exp(-self.q * self.T) * norm.pdf(d1) * sigma) / (2 * np.sqrt(self.T))
+        
+        if option_type == 'call':
+            theta = common_term - self.r * self.K * np.exp(-self.r * self.T) * norm.cdf(d2) + self.q * self.S * np.exp(-self.q * self.T) * norm.cdf(d1)
+        else:  # put
+            theta = common_term + self.r * self.K * np.exp(-self.r * self.T) * norm.cdf(-d2) - self.q * self.S * np.exp(-self.q * self.T) * norm.cdf(-d1)
+        
+        return theta / 365  # Convert to daily theta
+
     def implied_volatility_bs(self, option_type='call'):
         if option_type == 'call':
             objective = lambda sigma: self.black_scholes_call(sigma) - self.market_price
@@ -66,14 +152,27 @@ class OptionPricer:
 
 # --- Example Usage ---
 if __name__ == "__main__":
+    # Test European options pricing and Greeks
     pricer_eur = OptionPricer(S=100, K=95, T=60/365, r=0.01, market_price=4.20)
     iv_eur_put = pricer_eur.implied_volatility_bs(option_type='put')
     print(f"European Put IV: {iv_eur_put:.2%}")
+    
+    # Test Greeks calculations
+    print(f"European Put Delta: {pricer_eur.delta(iv_eur_put, 'put'):.4f}")
+    print(f"European Put Gamma: {pricer_eur.gamma(iv_eur_put):.6f}")
+    print(f"European Put Vega: {pricer_eur.vega(iv_eur_put):.4f}")
+    print(f"European Put Theta: {pricer_eur.theta(iv_eur_put, 'put'):.4f}")
 
     pricer_amer_put = OptionPricer(S=100, K=105, T=90/365, r=0.015, market_price=7.30)
     iv_amer_put = pricer_amer_put.implied_volatility_american(option_type='put')
-    print(f"American Put IV: {iv_amer_put:.2%}")
+    print(f"\nAmerican Put IV: {iv_amer_put:.2%}")
+    print(f"American Put Delta: {pricer_amer_put.delta(iv_amer_put, 'put'):.4f}")
+    print(f"American Put Gamma: {pricer_amer_put.gamma(iv_amer_put):.6f}")
 
     pricer_amer_call = OptionPricer(S=100, K=95, T=90/365, r=0.01, market_price=8.50, q=0.02)
     iv_amer_call = pricer_amer_call.implied_volatility_american(option_type='call')
-    print(f"American Call IV (with dividends): {iv_amer_call:.2%}")
+    print(f"\nAmerican Call IV (with dividends): {iv_amer_call:.2%}")
+    print(f"American Call Delta: {pricer_amer_call.delta(iv_amer_call, 'call'):.4f}")
+    print(f"American Call Gamma: {pricer_amer_call.gamma(iv_amer_call):.6f}")
+    print(f"American Call Vega: {pricer_amer_call.vega(iv_amer_call):.4f}")
+    print(f"American Call Theta: {pricer_amer_call.theta(iv_amer_call, 'call'):.4f}")
