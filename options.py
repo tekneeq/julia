@@ -185,9 +185,48 @@ class OptionPricer:
         return notional_gex
 
     @staticmethod
+    def calculate_portfolio_gex_with_breakdown(gex_values, call_gex_total, put_gex_total):
+        """
+        Calculate total portfolio GEX and determine gamma positioning with proper call/put breakdown.
+        
+        Parameters:
+        - gex_values: list of floats, all individual contract GEX values
+        - call_gex_total: float, sum of all call GEX (should be negative)
+        - put_gex_total: float, sum of all put GEX (should be positive)
+        
+        Returns:
+        - dict with portfolio GEX metrics and positioning analysis
+        """
+        total_gex = sum(gex_values)
+        
+        # Determine gamma positioning
+        if abs(total_gex) < 1000000:  # Less than $1M threshold
+            gamma_position = "GAMMA NEUTRAL"
+            position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
+        elif total_gex > 0:
+            gamma_position = "LONG GAMMA"
+            position_description = "Net stabilizing hedging flows from market makers. They will buy dips and sell rallies."
+        else:
+            gamma_position = "SHORT GAMMA"
+            position_description = "Net destabilizing hedging flows from market makers. They will sell dips and buy rallies."
+        
+        return {
+            'total_gex': total_gex,
+            'call_gex': call_gex_total,  # Properly calculated call GEX
+            'put_gex': put_gex_total,    # Properly calculated put GEX
+            'net_gex': total_gex,
+            'gamma_position': gamma_position,
+            'position_description': position_description,
+            'gex_per_1pct_move': total_gex,
+            'abs_gex': abs(total_gex)
+        }
+
+    @staticmethod
     def calculate_portfolio_gex(gex_values):
         """
         Calculate total portfolio GEX and determine gamma positioning.
+        
+        DEPRECATED: Use calculate_portfolio_gex_with_breakdown for proper call/put separation.
         
         Parameters:
         - gex_values: list of floats, individual contract GEX values
@@ -196,8 +235,11 @@ class OptionPricer:
         - dict with portfolio GEX metrics and positioning analysis
         """
         total_gex = sum(gex_values)
-        call_gex = sum([gex for gex in gex_values if gex > 0])
-        put_gex = sum([gex for gex in gex_values if gex < 0])
+        
+        # NOTE: This method incorrectly tries to separate calls/puts by GEX sign
+        # It's kept for backward compatibility but should not be used
+        call_gex = sum([gex for gex in gex_values if gex < 0])  # Calls should be negative
+        put_gex = sum([gex for gex in gex_values if gex > 0])   # Puts should be positive
         
         # Determine gamma positioning
         if abs(total_gex) < 1000000:  # Less than $1M threshold
@@ -205,10 +247,10 @@ class OptionPricer:
             position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
         elif total_gex > 0:
             gamma_position = "LONG GAMMA"
-            position_description = "Market makers are net short gamma. They will buy on dips and sell on rallies (stabilizing)."
+            position_description = "Net stabilizing hedging flows from market makers. They will buy dips and sell rallies."
         else:
             gamma_position = "SHORT GAMMA"
-            position_description = "Market makers are net long gamma. They will sell on dips and buy on rallies (destabilizing)."
+            position_description = "Net destabilizing hedging flows from market makers. They will sell dips and buy rallies."
         
         return {
             'total_gex': total_gex,

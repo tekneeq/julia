@@ -232,7 +232,14 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
         if not df.empty:
             # Portfolio GEX analysis
             all_gex = df['gex_per_contract'].tolist()
-            portfolio_gex = OptionPricer.calculate_portfolio_gex(all_gex)
+            
+            # Calculate call and put GEX separately based on actual option types
+            call_gex_total = df[df['option_type'] == 'CALL']['gex_per_contract'].sum()
+            put_gex_total = df[df['option_type'] == 'PUT']['gex_per_contract'].sum()
+            
+            portfolio_gex = OptionPricer.calculate_portfolio_gex_with_breakdown(
+                all_gex, call_gex_total, put_gex_total
+            )
             
             # GEX by strike analysis
             gex_by_strike = df.groupby('strike_price')['gex_per_contract'].sum().to_dict()
