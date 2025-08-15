@@ -140,8 +140,12 @@ class OptionPricer:
         if option_type.lower() == 'call':
             # Calls: Market makers buy high, sell low (destabilizing) → negative GEX
             gex = -base_gex
-        else:  # put
+        elif option_type.lower() == 'put':
             # Puts: Market makers sell high, buy low (stabilizing) → positive GEX  
+            gex = base_gex
+        else:
+            # Unknown option type - this shouldn't happen
+            print(f"WARNING: Unknown option_type '{option_type}', defaulting to PUT logic")
             gex = base_gex
         
         return gex
@@ -170,8 +174,12 @@ class OptionPricer:
         if option_type.lower() == 'call':
             # Calls: Destabilizing effect → negative GEX
             notional_gex = -base_notional_gex
-        else:  # put
+        elif option_type.lower() == 'put':
             # Puts: Stabilizing effect → positive GEX
+            notional_gex = base_notional_gex
+        else:
+            # Unknown option type - this shouldn't happen
+            print(f"WARNING: Unknown option_type '{option_type}' in notional calculation, defaulting to PUT logic")
             notional_gex = base_notional_gex
         
         return notional_gex

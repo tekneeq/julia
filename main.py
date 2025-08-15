@@ -176,10 +176,12 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
                 gex_notional = pricer.gex_notional(implied_vol, open_interest_val, option_type)
                 
                 # Debug: Print first few options to help diagnose $0 GEX issues
-                if len(results) < 3:  # Only print for first 3 options
+                if len(results) < 5:  # Show first 5 options for better debugging
                     print(f"DEBUG Option {len(results)+1}: {option_type.upper()} ${strike_price}")
                     print(f"  Raw option type: '{option.get('type', 'MISSING')}'")
                     print(f"  Processed option_type: '{option_type}'")
+                    print(f"  Is 'call'? {option_type.lower() == 'call'}")
+                    print(f"  Is 'put'? {option_type.lower() == 'put'}")
                     print(f"  Open Interest: {open_interest_val}")
                     print(f"  Gamma: {gamma:.6f}")
                     print(f"  GEX per contract: ${gex_per_contract:,.0f}")
@@ -390,16 +392,33 @@ def greeks(ticker, expiration, rate, output, min_volume, show_all, show_gex):
             options_with_gex = len(df[df['gex_per_contract'] != 0])
             options_with_oi = len(df[df['open_interest'] > 0])
             
+            # Analyze call vs put breakdown
+            calls = df[df['option_type'] == 'CALL']
+            puts = df[df['option_type'] == 'PUT']
+            call_gex_positive = len(calls[calls['gex_per_contract'] > 0])
+            put_gex_positive = len(puts[puts['gex_per_contract'] > 0])
+            call_gex_negative = len(calls[calls['gex_per_contract'] < 0])
+            put_gex_negative = len(puts[puts['gex_per_contract'] < 0])
+            
             click.echo(f"\nGEX Debug Summary:")
             click.echo(f"  Total options: {total_options}")
+            click.echo(f"  Calls: {len(calls)} | Puts: {len(puts)}")
             click.echo(f"  Options with open interest > 0: {options_with_oi}")
             click.echo(f"  Options with non-zero GEX: {options_with_gex}")
             click.echo(f"  GEX range: ${df['gex_per_contract'].min():,.0f} to ${df['gex_per_contract'].max():,.0f}")
             
+            click.echo(f"\nGEX Sign Analysis:")
+            click.echo(f"  Calls with negative GEX: {call_gex_negative} ✅ (expected)")
+            click.echo(f"  Calls with positive GEX: {call_gex_positive} ❌ (unexpected)")
+            click.echo(f"  Puts with positive GEX: {put_gex_positive} ✅ (expected)")
+            click.echo(f"  Puts with negative GEX: {put_gex_negative} ❌ (unexpected)")
+            
             if options_with_gex == 0:
                 click.echo(f"  ⚠️  All options have $0 GEX - likely due to zero open interest")
-            elif options_with_oi > options_with_gex:
-                click.echo(f"  ⚠️  Some options have OI but $0 GEX - check gamma values")
+            elif put_gex_negative > 0:
+                click.echo(f"  🚨 PROBLEM: {put_gex_negative} puts have negative GEX (should be positive)")
+            elif len(puts) == 0:
+                click.echo(f"  🚨 PROBLEM: No PUT options found - check API data")
             
         # Display GEX Analysis
         if hasattr(df, 'attrs') and 'portfolio_gex' in df.attrs and show_gex:
