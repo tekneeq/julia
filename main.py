@@ -175,6 +175,15 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
                 gex_per_contract = pricer.gex_per_contract(implied_vol, open_interest_val, option_type)
                 gex_notional = pricer.gex_notional(implied_vol, open_interest_val, option_type)
                 
+                # Debug: Print first few options to help diagnose $0 GEX issues
+                if len(results) < 3:  # Only print for first 3 options
+                    print(f"DEBUG Option {len(results)+1}: {option_type.upper()} ${strike_price}")
+                    print(f"  Open Interest: {open_interest_val}")
+                    print(f"  Gamma: {gamma:.6f}")
+                    print(f"  GEX per contract: ${gex_per_contract:,.0f}")
+                    print(f"  Stock price: ${stock_price}")
+                    print("---")
+                
                 # Calculate theoretical price using Black-Scholes
                 if option_type == 'call':
                     theoretical_price = pricer.black_scholes_call(implied_vol)
@@ -372,6 +381,23 @@ def greeks(ticker, expiration, rate, output, min_volume, show_all, show_gex):
         click.echo(f"\nDelta range: {df['delta'].min():.4f} to {df['delta'].max():.4f}")
         click.echo(f"Gamma range: {df['gamma'].min():.6f} to {df['gamma'].max():.6f}")
         
+        # GEX debugging summary
+        if 'gex_per_contract' in df.columns:
+            total_options = len(df)
+            options_with_gex = len(df[df['gex_per_contract'] != 0])
+            options_with_oi = len(df[df['open_interest'] > 0])
+            
+            click.echo(f"\nGEX Debug Summary:")
+            click.echo(f"  Total options: {total_options}")
+            click.echo(f"  Options with open interest > 0: {options_with_oi}")
+            click.echo(f"  Options with non-zero GEX: {options_with_gex}")
+            click.echo(f"  GEX range: ${df['gex_per_contract'].min():,.0f} to ${df['gex_per_contract'].max():,.0f}")
+            
+            if options_with_gex == 0:
+                click.echo(f"  ⚠️  All options have $0 GEX - likely due to zero open interest")
+            elif options_with_oi > options_with_gex:
+                click.echo(f"  ⚠️  Some options have OI but $0 GEX - check gamma values")
+            
         # Display GEX Analysis
         if hasattr(df, 'attrs') and 'portfolio_gex' in df.attrs and show_gex:
             portfolio_gex = df.attrs['portfolio_gex']
