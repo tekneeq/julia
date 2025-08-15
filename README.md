@@ -17,6 +17,21 @@ A Python tool for calculating options Greeks (Delta, Gamma, Vega, Theta) using B
 - **Key Gamma Levels**: Identify strikes with highest gamma exposure that act as support/resistance
 - **Market Impact Analysis**: Understand expected dealer hedging flows and volatility patterns
 
+### Local Caching System
+- **Automatic Caching**: Options data cached locally to reduce API calls and improve performance
+- **Configurable Expiration**: Default 4-hour cache expiration with customizable settings
+- **Cache Validation**: Automatic validation of cached data freshness
+- **Selective Refresh**: Option to bypass cache or force refresh specific data
+- **Cache Management**: Built-in tools to view stats, list data, and cleanup cache files
+- **Performance Tracking**: Hit rate monitoring and API request savings metrics
+
+### Enhanced CLI Interface
+- **New `--show-gex` flag**: Display comprehensive GEX analysis
+- **Detailed market impact analysis**: Understand expected dealer hedging flows
+- **Enhanced debugging output**: Diagnose GEX calculation issues
+- **Local caching system**: Automatic caching with configurable expiration
+- **Cache management tools**: View stats, clear cache, manage data
+
 ### CLI Commands
 
 #### Calculate Greeks for All Options on a Given Day
@@ -32,6 +47,8 @@ python main.py greeks --ticker SPY --expiration 2024-01-19
 - `--min-volume`: Filter options by minimum volume (default: 0)
 - `--show-all`: Show all Greeks instead of just delta and gamma
 - `--show-gex`: Show Gamma Exposure (GEX) analysis and positioning
+- `--no-cache`: Disable caching and always fetch fresh data
+- `--refresh-cache`: Force refresh cached data with fresh API call
 
 **Examples:**
 ```bash
@@ -49,6 +66,42 @@ python main.py greeks --ticker SPY --show-gex
 
 # Complete analysis with all Greeks and GEX
 python main.py greeks --ticker AAPL --expiration 2024-02-16 --show-all --show-gex
+
+# Force fresh data (bypass cache)
+python main.py greeks --ticker SPY --no-cache --show-gex
+
+# Refresh cache with latest data
+python main.py greeks --ticker SPY --refresh-cache --show-gex
+```
+
+#### Manage Options Data Cache
+```bash
+python main.py cache --stats
+```
+
+**Cache Options:**
+- `--stats`: Show detailed cache statistics and performance metrics
+- `--list`: List all cached data with timestamps and validity
+- `--clear-expired`: Remove expired cache files
+- `--clear-ticker TICKER`: Remove all cache files for specific ticker
+- `--clear-all`: Remove all cached data (with confirmation)
+
+**Cache Examples:**
+```bash
+# View cache statistics
+python main.py cache --stats
+
+# List all cached data
+python main.py cache --list
+
+# Clear expired cache files
+python main.py cache --clear-expired
+
+# Clear cache for specific ticker
+python main.py cache --clear-ticker SPY
+
+# Clear all cache (with confirmation)
+python main.py cache --clear-all
 ```
 
 #### Calculate Implied Move
@@ -155,6 +208,26 @@ When using `--show-gex`, additional analysis is provided:
 - **Key Gamma Levels**: Top strikes by absolute GEX
 - **Support/Resistance**: Nearest GEX levels above/below current price
 - **Market Impact**: Expected dealer hedging behavior
+
+## Benefits
+
+### Performance & Efficiency
+- **Fast Analysis**: Local caching reduces API calls and speeds up repeated analysis
+- **Reduced Rate Limiting**: Avoid hitting Robinhood API limits during development and testing
+- **Offline Analysis**: Work with previously cached data even without internet connectivity
+- **Bulk Processing**: Efficiently analyze multiple tickers and expiration dates
+
+### Market Intelligence
+- **Gamma Positioning**: Understand if market makers will provide stabilizing or destabilizing flows
+- **Volatility Prediction**: High absolute GEX environments tend to have more dealer-driven volatility
+- **Support/Resistance**: Key gamma strikes act as natural price magnets and turning points
+- **Flow Analysis**: Predict market maker hedging behavior based on options positioning
+
+### Risk Management
+- **Portfolio Impact**: Understand how your options portfolio affects overall market gamma
+- **Hedging Insights**: Identify key strikes where gamma effects are concentrated
+- **Market Regime**: Determine current volatility environment (long/short/neutral gamma)
+- **Timing Analysis**: Use GEX to time entries and exits around key gamma levels
 
 ## Notes
 
