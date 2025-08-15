@@ -1,6 +1,29 @@
-# Options Greeks Calculator
+# Julia - Options Greeks & Gamma Exposure Analysis
 
-A Python tool for calculating options Greeks (Delta, Gamma, Vega, Theta) using Black-Scholes pricing models and real-time data from Robinhood API.
+A comprehensive Python toolkit for calculating options Greeks (Delta, Gamma, Vega, Theta) using Black-Scholes pricing models with real-time data from Robinhood API, featuring advanced Gamma Exposure (GEX) analysis and local caching.
+
+## Installation
+
+### For End Users
+```bash
+# Install from source
+pip install -e .
+
+# Use the 'lia' command
+lia greeks --ticker SPY --show-gex
+lia cache --stats
+```
+
+### For Development
+```bash
+# Clone and install in development mode
+git clone https://github.com/tekneeq/julia.git
+cd julia
+pip install -e .
+
+# Or use the development CLI script
+python cli.py greeks --ticker SPY --show-gex
+```
 
 ## Features
 
@@ -17,11 +40,21 @@ A Python tool for calculating options Greeks (Delta, Gamma, Vega, Theta) using B
 - **Key Gamma Levels**: Identify strikes with highest gamma exposure that act as support/resistance
 - **Market Impact Analysis**: Understand expected dealer hedging flows and volatility patterns
 
+### Local Caching System
+- **Smart Caching**: 4-hour auto-expiration to balance freshness with performance
+- **Cache Control**: `--no-cache`, `--refresh-cache` options for flexible data management
+- **Performance Tracking**: Hit rates, API requests saved, cache health monitoring
+- **Organized Storage**: Structured cache by ticker/expiration with metadata
+
 ### CLI Commands
 
 #### Calculate Greeks for All Options on a Given Day
 ```bash
-python main.py greeks --ticker SPY --expiration 2024-01-19
+# Using installed package
+lia greeks --ticker SPY --expiration 2024-01-19
+
+# Or during development
+python cli.py greeks --ticker SPY --expiration 2024-01-19
 ```
 
 **Options:**
@@ -36,45 +69,70 @@ python main.py greeks --ticker SPY --expiration 2024-01-19
 **Examples:**
 ```bash
 # Basic usage - calculate Greeks for SPY options expiring tomorrow
-python main.py greeks
+lia greeks
+# or: python cli.py greeks
 
 # Calculate Greeks for AAPL options expiring on a specific date
-python main.py greeks --ticker AAPL --expiration 2024-02-16
+lia greeks --ticker AAPL --expiration 2024-02-16
 
 # Show all Greeks with volume filter and save to CSV
-python main.py greeks --ticker TSLA --expiration 2024-01-26 --show-all --min-volume 10 --output tesla_greeks.csv
+lia greeks --ticker TSLA --expiration 2024-01-26 --show-all --min-volume 10 --output tesla_greeks.csv
 
 # Show GEX analysis to determine gamma positioning
-python main.py greeks --ticker SPY --show-gex
+lia greeks --ticker SPY --show-gex
 
 # Complete analysis with all Greeks and GEX
-python main.py greeks --ticker AAPL --expiration 2024-02-16 --show-all --show-gex
+lia greeks --ticker AAPL --expiration 2024-02-16 --show-all --show-gex
+
+# Cache management examples
+lia greeks --ticker SPY --no-cache          # Always fetch fresh data
+lia greeks --ticker SPY --refresh-cache     # Update cache with fresh data
+```
+
+#### Manage Options Data Cache
+```bash
+# View cache statistics
+lia cache --stats
+
+# List all cached data
+lia cache --list
+
+# Clear expired cache files
+lia cache --clear-expired
+
+# Clear cache for specific ticker
+lia cache --clear-ticker SPY
+
+# Clear all cached data
+lia cache --clear-all
 ```
 
 #### Calculate Implied Move
 ```bash
-python main.py emove --ticker SPY --days 1,3,5 --confidence 0.68,0.95
+lia emove --ticker SPY --days 1,3,5 --confidence 0.68,0.95
+# or: python cli.py emove --ticker SPY --days 1,3,5 --confidence 0.68,0.95
 ```
 
-## Installation
+## Setup
 
-1. Install dependencies:
+### Robinhood Credentials
+Set up your Robinhood credentials in a `.env` file in the project root:
+
 ```bash
-pip install numpy scipy pandas robin-stocks python-dotenv click
-```
-
-2. Set up Robinhood credentials in `.env` file:
-```
+# Create .env file
 RH_USERNAME=your_username
 RH_PASSWORD=your_password
 ```
+
+**Note**: The `.env` file is automatically ignored by git for security.
 
 ## Usage
 
 ### Programmatic Usage
 
 ```python
-from options import OptionPricer
+from julia.options import OptionPricer
+from julia.options_cache import get_cache_instance
 
 # Create option pricer
 pricer = OptionPricer(S=100, K=105, T=30/365, r=0.02, market_price=2.50)
@@ -92,6 +150,10 @@ theta = pricer.theta(iv, 'put')
 open_interest = 1000  # Example open interest
 gex_per_contract = pricer.gex_per_contract(iv, open_interest, 'put')
 gex_notional = pricer.gex_notional(iv, open_interest, 'put')
+
+# Use caching system
+cache = get_cache_instance()
+stats = cache.get_stats()
 
 print(f"Delta: {delta:.4f}")
 print(f"Gamma: {gamma:.6f}")

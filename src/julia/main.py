@@ -8,8 +8,8 @@ import os
 from scipy.optimize import brentq
 import click
 from datetime import datetime, timedelta
-from options import OptionPricer
-from options_cache import get_cache_instance
+from .options import OptionPricer
+from .options_cache import get_cache_instance
 
 # looks for a .env file in the current directory
 # RH_USERNAME and RH_PASSWORD should be set in the .env file
