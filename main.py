@@ -178,9 +178,12 @@ def calculate_options_greeks(ticker, expiration_date, risk_free_rate=0.02):
                 # Debug: Print first few options to help diagnose $0 GEX issues
                 if len(results) < 3:  # Only print for first 3 options
                     print(f"DEBUG Option {len(results)+1}: {option_type.upper()} ${strike_price}")
+                    print(f"  Raw option type: '{option.get('type', 'MISSING')}'")
+                    print(f"  Processed option_type: '{option_type}'")
                     print(f"  Open Interest: {open_interest_val}")
                     print(f"  Gamma: {gamma:.6f}")
                     print(f"  GEX per contract: ${gex_per_contract:,.0f}")
+                    print(f"  GEX notional: ${gex_notional:,.0f}")
                     print(f"  Stock price: ${stock_price}")
                     print("---")
                 
