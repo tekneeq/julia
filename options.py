@@ -113,9 +113,12 @@ class OptionPricer:
         """
         Calculate Gamma Exposure (GEX) for a single options contract.
         
-        GEX represents the dollar amount of gamma exposure for each 1% move in the underlying.
-        For market makers who are short options, positive GEX means they need to buy stock as price goes up
-        and sell as price goes down (stabilizing effect). Negative GEX means the opposite (destabilizing).
+        GEX represents the dollar amount of stock market makers must buy/sell for each 1% move.
+        
+        For CALLS: Market makers short calls must buy stock when price rises, sell when price falls
+                  → This AMPLIFIES moves (destabilizing) → NEGATIVE GEX
+        For PUTS:  Market makers short puts must sell stock when price rises, buy when price falls  
+                  → This DAMPENS moves (stabilizing) → POSITIVE GEX
         
         Parameters:
         - sigma: float, volatility
@@ -130,9 +133,16 @@ class OptionPricer:
             
         gamma_value = self.gamma(sigma)
         
-        # GEX = Gamma × Open Interest × 100 shares/contract × Spot Price × 0.01 (for 1% move)
-        # Market makers are typically short options, so we flip the sign
-        gex = -gamma_value * open_interest * 100 * self.S * 0.01
+        # Base GEX calculation
+        base_gex = gamma_value * open_interest * 100 * self.S * 0.01
+        
+        # Apply correct sign based on option type and market maker perspective
+        if option_type.lower() == 'call':
+            # Calls: Market makers buy high, sell low (destabilizing) → negative GEX
+            gex = -base_gex
+        else:  # put
+            # Puts: Market makers sell high, buy low (stabilizing) → positive GEX  
+            gex = base_gex
         
         return gex
     
@@ -153,9 +163,16 @@ class OptionPricer:
             
         gamma_value = self.gamma(sigma)
         
-        # Notional GEX = Gamma × Open Interest × 100 shares/contract × (Spot Price)^2
-        # This represents the total dollar gamma exposure
-        notional_gex = -gamma_value * open_interest * 100 * (self.S ** 2)
+        # Base notional GEX calculation
+        base_notional_gex = gamma_value * open_interest * 100 * (self.S ** 2)
+        
+        # Apply correct sign based on option type
+        if option_type.lower() == 'call':
+            # Calls: Destabilizing effect → negative GEX
+            notional_gex = -base_notional_gex
+        else:  # put
+            # Puts: Stabilizing effect → positive GEX
+            notional_gex = base_notional_gex
         
         return notional_gex
 
