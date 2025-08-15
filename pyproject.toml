@@ -13,3 +13,6 @@ dependencies = [
     "ruff>=0.11.11",
     "scipy>=1.13.1",
 ]
+
+[project.scripts]
+lia = "main:cli"
