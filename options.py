@@ -113,9 +113,12 @@ class OptionPricer:
         """
         Calculate Gamma Exposure (GEX) for a single options contract.
         
-        GEX represents the dollar amount of gamma exposure for each 1% move in the underlying.
-        For market makers who are short options, positive GEX means they need to buy stock as price goes up
-        and sell as price goes down (stabilizing effect). Negative GEX means the opposite (destabilizing).
+        GEX represents the dollar amount of stock market makers must buy/sell for each 1% move.
+        
+        For CALLS: Market makers short calls must buy stock when price rises, sell when price falls
+                  → This AMPLIFIES moves (destabilizing) → NEGATIVE GEX
+        For PUTS:  Market makers short puts must sell stock when price rises, buy when price falls  
+                  → This DAMPENS moves (stabilizing) → POSITIVE GEX
         
         Parameters:
         - sigma: float, volatility
@@ -130,9 +133,20 @@ class OptionPricer:
             
         gamma_value = self.gamma(sigma)
         
-        # GEX = Gamma × Open Interest × 100 shares/contract × Spot Price × 0.01 (for 1% move)
-        # Market makers are typically short options, so we flip the sign
-        gex = -gamma_value * open_interest * 100 * self.S * 0.01
+        # Base GEX calculation
+        base_gex = gamma_value * open_interest * 100 * self.S * 0.01
+        
+        # Apply correct sign based on option type and market maker perspective
+        if option_type.lower() == 'call':
+            # Calls: Market makers buy high, sell low (destabilizing) → negative GEX
+            gex = -base_gex
+        elif option_type.lower() == 'put':
+            # Puts: Market makers sell high, buy low (stabilizing) → positive GEX  
+            gex = base_gex
+        else:
+            # Unknown option type - this shouldn't happen
+            print(f"WARNING: Unknown option_type '{option_type}', defaulting to PUT logic")
+            gex = base_gex
         
         return gex
     
@@ -153,16 +167,66 @@ class OptionPricer:
             
         gamma_value = self.gamma(sigma)
         
-        # Notional GEX = Gamma × Open Interest × 100 shares/contract × (Spot Price)^2
-        # This represents the total dollar gamma exposure
-        notional_gex = -gamma_value * open_interest * 100 * (self.S ** 2)
+        # Base notional GEX calculation
+        base_notional_gex = gamma_value * open_interest * 100 * (self.S ** 2)
+        
+        # Apply correct sign based on option type
+        if option_type.lower() == 'call':
+            # Calls: Destabilizing effect → negative GEX
+            notional_gex = -base_notional_gex
+        elif option_type.lower() == 'put':
+            # Puts: Stabilizing effect → positive GEX
+            notional_gex = base_notional_gex
+        else:
+            # Unknown option type - this shouldn't happen
+            print(f"WARNING: Unknown option_type '{option_type}' in notional calculation, defaulting to PUT logic")
+            notional_gex = base_notional_gex
         
         return notional_gex
+
+    @staticmethod
+    def calculate_portfolio_gex_with_breakdown(gex_values, call_gex_total, put_gex_total):
+        """
+        Calculate total portfolio GEX and determine gamma positioning with proper call/put breakdown.
+        
+        Parameters:
+        - gex_values: list of floats, all individual contract GEX values
+        - call_gex_total: float, sum of all call GEX (should be negative)
+        - put_gex_total: float, sum of all put GEX (should be positive)
+        
+        Returns:
+        - dict with portfolio GEX metrics and positioning analysis
+        """
+        total_gex = sum(gex_values)
+        
+        # Determine gamma positioning
+        if abs(total_gex) < 1000000:  # Less than $1M threshold
+            gamma_position = "GAMMA NEUTRAL"
+            position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
+        elif total_gex > 0:
+            gamma_position = "LONG GAMMA"
+            position_description = "Net stabilizing hedging flows from market makers. They will buy dips and sell rallies."
+        else:
+            gamma_position = "SHORT GAMMA"
+            position_description = "Net destabilizing hedging flows from market makers. They will sell dips and buy rallies."
+        
+        return {
+            'total_gex': total_gex,
+            'call_gex': call_gex_total,  # Properly calculated call GEX
+            'put_gex': put_gex_total,    # Properly calculated put GEX
+            'net_gex': total_gex,
+            'gamma_position': gamma_position,
+            'position_description': position_description,
+            'gex_per_1pct_move': total_gex,
+            'abs_gex': abs(total_gex)
+        }
 
     @staticmethod
     def calculate_portfolio_gex(gex_values):
         """
         Calculate total portfolio GEX and determine gamma positioning.
+        
+        DEPRECATED: Use calculate_portfolio_gex_with_breakdown for proper call/put separation.
         
         Parameters:
         - gex_values: list of floats, individual contract GEX values
@@ -171,8 +235,11 @@ class OptionPricer:
         - dict with portfolio GEX metrics and positioning analysis
         """
         total_gex = sum(gex_values)
-        call_gex = sum([gex for gex in gex_values if gex > 0])
-        put_gex = sum([gex for gex in gex_values if gex < 0])
+        
+        # NOTE: This method incorrectly tries to separate calls/puts by GEX sign
+        # It's kept for backward compatibility but should not be used
+        call_gex = sum([gex for gex in gex_values if gex < 0])  # Calls should be negative
+        put_gex = sum([gex for gex in gex_values if gex > 0])   # Puts should be positive
         
         # Determine gamma positioning
         if abs(total_gex) < 1000000:  # Less than $1M threshold
@@ -180,10 +247,10 @@ class OptionPricer:
             position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
         elif total_gex > 0:
             gamma_position = "LONG GAMMA"
-            position_description = "Market makers are net short gamma. They will buy on dips and sell on rallies (stabilizing)."
+            position_description = "Net stabilizing hedging flows from market makers. They will buy dips and sell rallies."
         else:
             gamma_position = "SHORT GAMMA"
-            position_description = "Market makers are net long gamma. They will sell on dips and buy on rallies (destabilizing)."
+            position_description = "Net destabilizing hedging flows from market makers. They will sell dips and buy rallies."
         
         return {
             'total_gex': total_gex,
