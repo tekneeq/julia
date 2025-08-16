@@ -10,10 +10,53 @@ import click
 from datetime import datetime, timedelta
 from .options import OptionPricer
 from .options_cache import get_cache_instance
+import functools
 
 # looks for a .env file in the current directory
 # RH_USERNAME and RH_PASSWORD should be set in the .env file
 load_dotenv()
+
+
+def is_logged_in():
+    """
+    Check if user is already logged in to Robinhood.
+    
+    Returns:
+    - bool: True if logged in, False otherwise
+    """
+    try:
+        # Try to load account profile - this will fail if not logged in
+        rh.profiles.load_account_profile()
+        return True
+    except:
+        return False
+
+
+def ensure_logged_in(func):
+    """
+    Decorator to ensure user is logged in before executing command.
+    If not logged in, will call login_robinhood with credentials from environment.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_logged_in():
+            username = os.getenv("RH_USERNAME")
+            password = os.getenv("RH_PASSWORD")
+            if not username or not password:
+                click.echo("❌ Error: RH_USERNAME and RH_PASSWORD must be set in environment variables or .env file")
+                click.echo("Please set these credentials and try again.")
+                return
+            
+            click.echo("🔐 Logging in to Robinhood...")
+            try:
+                login_robinhood(username, password)
+                click.echo("✅ Successfully logged in to Robinhood")
+            except Exception as e:
+                click.echo(f"❌ Login failed: {e}")
+                return
+        
+        return func(*args, **kwargs)
+    return wrapper
 
 
 def login_robinhood(username, password):
@@ -351,6 +394,7 @@ def cli():
     default="0.6827,0.9545,0.997",
     help="Comma-separated list of confidence levels (default: 0.6827,0.9545,0.997)",
 )
+@ensure_logged_in
 def emove(ticker, days, confidence):
 
     stock_price = rh.stocks.get_latest_price(
@@ -439,6 +483,7 @@ def emove(ticker, days, confidence):
     is_flag=True,
     help="Force refresh cached data with fresh API call",
 )
+@ensure_logged_in
 def greeks(
     ticker,
     expiration,
@@ -727,6 +772,7 @@ def greeks(
     is_flag=True,
     help="Force refresh cached data with fresh API call",
 )
+@ensure_logged_in
 def opt(ticker, days, rate, no_cache, refresh_cache):
     """
     Print options data (put and call) for the strike closest to current underlying price.
@@ -904,6 +950,7 @@ def opt(ticker, days, rate, no_cache, refresh_cache):
 @click.option(
     "--clear-ticker", help="Clear cache for specific ticker (e.g., SPY)"
 )
+@ensure_logged_in
 def cache(stats, list_cache, clear_all, clear_expired, clear_ticker):
     """
     Manage options data cache.
@@ -1041,7 +1088,4 @@ def main():
 
 
 if __name__ == "__main__":
-    login_robinhood(
-        os.getenv("RH_USERNAME"), os.getenv("RH_PASSWORD")
-    )  # Replace with your credentials
     cli()
