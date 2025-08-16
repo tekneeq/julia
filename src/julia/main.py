@@ -683,6 +683,150 @@ def greeks(ticker, expiration, rate, output, min_volume, show_all, show_gex, no_
 
 
 @cli.command()
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
+)
+@click.option(
+    "--days", 
+    default=1, 
+    type=int,
+    help="Business days from now to get options data (default: 1)"
+)
+@click.option(
+    "--rate", default=0.02, help="Risk-free interest rate (default: 0.02 or 2%)"
+)
+@click.option(
+    "--no-cache", 
+    is_flag=True, 
+    help="Disable caching and always fetch fresh data"
+)
+@click.option(
+    "--refresh-cache", 
+    is_flag=True, 
+    help="Force refresh cached data with fresh API call"
+)
+def closest_strike(ticker, days, rate, no_cache, refresh_cache):
+    """
+    Print options data (put and call) for the strike closest to current underlying price.
+    
+    This command calculates the target expiration date based on business days from now,
+    fetches all options data for that date, finds the strike price closest to the current
+    underlying price, and displays both put and call option data for that strike.
+    
+    The command reuses the Greeks calculation functionality to gather comprehensive
+    options data including prices, Greeks, and GEX values.
+    """
+    try:
+        # Calculate target expiration date
+        expiration_date = business_days_from_today(days)
+        click.echo(f"Target expiration date: {expiration_date} ({days} business days from now)")
+        
+        # Get options data using the existing Greeks function
+        click.echo(f"Fetching options data for {ticker}...")
+        df = calculate_options_greeks(ticker, expiration_date, rate, use_cache=not no_cache, refresh_cache=refresh_cache)
+        
+        if df.empty:
+            click.echo("No options data found or error occurred.")
+            return
+        
+        # Get current stock price from the DataFrame attributes
+        if hasattr(df, 'attrs') and 'stock_price' in df.attrs:
+            current_price = df.attrs['stock_price']
+        else:
+            # Fallback: get fresh stock price
+            stock_price_list = rh.stocks.get_latest_price(ticker, priceType=None, includeExtendedHours=True)
+            if not stock_price_list:
+                click.echo(f"Could not retrieve current price for {ticker}")
+                return
+            current_price = float(stock_price_list[0])
+        
+        click.echo(f"Current {ticker} price: ${current_price:.2f}")
+        
+        # Find the strike closest to current price
+        unique_strikes = df['strike_price'].unique()
+        closest_strike = min(unique_strikes, key=lambda x: abs(x - current_price))
+        
+        click.echo(f"Closest strike to current price: ${closest_strike:.2f}")
+        click.echo(f"Distance from current price: ${abs(closest_strike - current_price):.2f} ({((closest_strike - current_price) / current_price * 100):+.2f}%)")
+        
+        # Filter data for the closest strike (both call and put)
+        closest_options = df[df['strike_price'] == closest_strike].copy()
+        
+        if closest_options.empty:
+            click.echo(f"No options found for strike ${closest_strike:.2f}")
+            return
+        
+        # Separate calls and puts
+        calls = closest_options[closest_options['option_type'] == 'CALL']
+        puts = closest_options[closest_options['option_type'] == 'PUT']
+        
+        # Display header
+        click.echo(f"\n{'='*80}")
+        click.echo(f"OPTIONS DATA FOR CLOSEST STRIKE: ${closest_strike:.2f}")
+        click.echo(f"Expiration: {expiration_date} | Current Price: ${current_price:.2f}")
+        click.echo(f"{'='*80}")
+        
+        # Define columns to display
+        display_columns = [
+            'option_type', 'market_price', 'theoretical_price', 'bid_price', 'ask_price',
+            'implied_volatility', 'delta', 'gamma', 'vega', 'theta', 
+            'gex_per_contract', 'volume', 'open_interest'
+        ]
+        
+        # Format and display the data
+        for option_type, data in [('CALL', calls), ('PUT', puts)]:
+            if not data.empty:
+                click.echo(f"\n{option_type} Option:")
+                click.echo("-" * 50)
+                
+                # Get the single row
+                option_data = data.iloc[0]
+                
+                # Display key information in a formatted way
+                click.echo(f"  Market Price:     ${option_data['market_price']:.2f}")
+                click.echo(f"  Theoretical:      ${option_data['theoretical_price']:.2f}")
+                click.echo(f"  Bid/Ask:          ${option_data['bid_price']:.2f} / ${option_data['ask_price']:.2f}")
+                click.echo(f"  Implied Vol:      {option_data['implied_volatility']:.2%}")
+                click.echo(f"  Delta:            {option_data['delta']:.4f}")
+                click.echo(f"  Gamma:            {option_data['gamma']:.6f}")
+                click.echo(f"  Vega:             {option_data['vega']:.4f}")
+                click.echo(f"  Theta:            {option_data['theta']:.4f}")
+                click.echo(f"  GEX/Contract:     ${option_data['gex_per_contract']:,.0f}")
+                click.echo(f"  Volume:           {option_data['volume'] or 0}")
+                click.echo(f"  Open Interest:    {option_data['open_interest']}")
+            else:
+                click.echo(f"\n{option_type} Option: No data available")
+        
+        # Display summary comparison
+        if not calls.empty and not puts.empty:
+            call_data = calls.iloc[0]
+            put_data = puts.iloc[0]
+            
+            click.echo(f"\n{'='*50}")
+            click.echo("COMPARISON SUMMARY")
+            click.echo(f"{'='*50}")
+            click.echo(f"Call vs Put Prices:   ${call_data['market_price']:.2f} vs ${put_data['market_price']:.2f}")
+            click.echo(f"Call vs Put Deltas:   {call_data['delta']:.4f} vs {put_data['delta']:.4f}")
+            click.echo(f"Call vs Put Volume:   {call_data['volume'] or 0} vs {put_data['volume'] or 0}")
+            click.echo(f"Call vs Put OI:       {call_data['open_interest']} vs {put_data['open_interest']}")
+            
+            # Calculate Put-Call parity check
+            # C - P = S - K*e^(-r*T)
+            time_to_expiry = calculate_time_to_expiry(expiration_date)
+            theoretical_diff = current_price - closest_strike * np.exp(-rate * time_to_expiry)
+            actual_diff = call_data['market_price'] - put_data['market_price']
+            parity_deviation = actual_diff - theoretical_diff
+            
+            click.echo(f"\nPut-Call Parity Check:")
+            click.echo(f"  Theoretical C-P:    ${theoretical_diff:.2f}")
+            click.echo(f"  Actual C-P:         ${actual_diff:.2f}")
+            click.echo(f"  Deviation:          ${parity_deviation:.2f}")
+        
+    except Exception as e:
+        click.echo(f"Error: {e}")
+
+
+@cli.command()
 @click.option('--stats', is_flag=True, help='Show cache statistics')
 @click.option('--list', 'list_cache', is_flag=True, help='List all cached data')
 @click.option('--clear-all', is_flag=True, help='Clear all cached data')
