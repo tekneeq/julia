@@ -493,11 +493,11 @@ def range(ticker):
         lo_pct = (lo - op) / op
         range_pct = range_value / op
         print(
-            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value} ({range_pct:.2%})"
+            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value:.2f} ({range_pct:.2%})"
         )
     else:
         print(
-            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 'N/A'}"
+            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 0.0:.2%}"
         )
 
 
