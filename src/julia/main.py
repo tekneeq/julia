@@ -450,6 +450,59 @@ def emove(ticker, days, confidence):
 @click.option(
     "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
 )
+@ensure_logged_in
+def range(ticker):
+
+    def todays_high_low_intraday(symbol: str, bounds: str = "regular") -> tuple[float | None, float | None]:
+        candles = rh.stocks.get_stock_historicals(
+            symbol,
+            interval="5minute",
+            span="day",
+            bounds=bounds
+        )
+        if not candles:
+            return None, None
+        highs = [float(candle['high_price']) for candle in candles if candle.get('high_price')]
+        lows = [float(candle['low_price']) for candle in candles if candle.get('low_price')]
+        return max(highs) if highs else None, min(lows) if lows else None
+    
+    def todays_high_low(symbol: str) -> tuple[float | None, float | None]:
+        hi, lo = todays_high_low_intraday(symbol)
+        if hi is None or lo is None:
+            hi, lo = todays_high_low_intraday(symbol, bounds="trading")
+
+        return hi, lo
+
+    hi, lo = todays_high_low(ticker)
+    print(f"{ticker} Today's High: {hi}, Low: {lo}, Range: {hi - lo if hi and lo else 'N/A'}")
+
+
+
+    stock_price = rh.stocks.get_latest_price(
+        ticker, priceType=None, includeExtendedHours=True
+    )
+    if stock_price is None:
+        click.echo(
+            f"Could not retrieve price for {ticker}. Please check the ticker symbol."
+        )
+        return
+
+    stock_price = float(stock_price[0])
+    click.echo(f"Current {ticker} price: {stock_price}")
+
+    # TODO: optionType 'call' or 'put'
+    # YYYY-MM-DD
+    expirationDate = business_days_from_today(1)
+    strikePrice = int(stock_price)
+    options_data_list = rh.options.find_options_by_expiration_and_strike(
+        ticker, expirationDate, strikePrice, optionType="call", info=None
+    )
+
+
+@cli.command()
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
+)
 @click.option(
     "--expiration",
     help="Expiration date in YYYY-MM-DD format (default: next business day)",
