@@ -453,7 +453,7 @@ def emove(ticker, days, confidence):
 @ensure_logged_in
 def range(ticker):
 
-    def todays_high_low_intraday(symbol: str, bounds: str = "regular") -> tuple[float | None, float | None]:
+    def todays_high_low_intraday(symbol: str, bounds: str = "regular") -> tuple[float | None, float | None, float | None]:
         candles = rh.stocks.get_stock_historicals(
             symbol,
             interval="5minute",
@@ -461,20 +461,44 @@ def range(ticker):
             bounds=bounds
         )
         if not candles:
-            return None, None
+            return None, None, None
         highs = [float(candle['high_price']) for candle in candles if candle.get('high_price')]
         lows = [float(candle['low_price']) for candle in candles if candle.get('low_price')]
-        return max(highs) if highs else None, min(lows) if lows else None
-    
-    def todays_high_low(symbol: str) -> tuple[float | None, float | None]:
-        hi, lo = todays_high_low_intraday(symbol)
-        if hi is None or lo is None:
-            hi, lo = todays_high_low_intraday(symbol, bounds="trading")
+        # Opening price: first candle's open where available
+        open_price: float | None = None
+        for candle in candles:
+            if candle.get('open_price') is not None:
+                try:
+                    open_price = float(candle['open_price'])
+                except (TypeError, ValueError):
+                    open_price = None
+                break
+        return (
+            max(highs) if highs else None,
+            min(lows) if lows else None,
+            open_price,
+        )
 
-        return hi, lo
+    def todays_high_low(symbol: str) -> tuple[float | None, float | None, float | None]:
+        hi, lo, op = todays_high_low_intraday(symbol)
+        if hi is None or lo is None or op is None:
+            hi, lo, op = todays_high_low_intraday(symbol, bounds="trading")
 
-    hi, lo = todays_high_low(ticker)
-    print(f"{ticker} Today's High: {hi}, Low: {lo}, Range: {hi - lo if hi and lo else 'N/A'}")
+        return hi, lo, op
+
+    hi, lo, op = todays_high_low(ticker)
+    range_value = (hi - lo) if (hi is not None and lo is not None) else None
+    if op is not None and hi is not None and lo is not None and range_value is not None and op != 0:
+        hi_pct = (hi - op) / op
+        lo_pct = (lo - op) / op
+        range_pct = range_value / op
+        print(
+            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value} ({range_pct:.2%})"
+        )
+    else:
+        print(
+            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 'N/A'}"
+        )
 
 
 
