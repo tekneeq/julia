@@ -495,12 +495,34 @@ def range(ticker):
         lo_pct = (lo - op) / op
         range_pct = range_value / op
         print(
-            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value:.2f} ({range_pct:.2%})"
+            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value} ({range_pct:.2%})"
         )
     else:
         print(
-            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 0.0:.2%}"
+            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 'N/A'}"
         )
+
+
+
+    stock_price = rh.stocks.get_latest_price(
+        ticker, priceType=None, includeExtendedHours=True
+    )
+    if stock_price is None:
+        click.echo(
+            f"Could not retrieve price for {ticker}. Please check the ticker symbol."
+        )
+        return
+
+    stock_price = float(stock_price[0])
+    click.echo(f"Current {ticker} price: {stock_price}")
+
+    # TODO: optionType 'call' or 'put'
+    # YYYY-MM-DD
+    expirationDate = business_days_from_today(1)
+    strikePrice = int(stock_price)
+    options_data_list = rh.options.find_options_by_expiration_and_strike(
+        ticker, expirationDate, strikePrice, optionType="call", info=None
+    )
 
 
 @cli.command()
