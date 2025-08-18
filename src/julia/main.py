@@ -96,9 +96,11 @@ def implied_move(stock_price, iv, days_list, confidence_levels):
                     "Days": days,
                     "Confidence Level": f"{int(conf * 100)}%",
                     "Implied Move ($)": round(move, 2),
+                    "Implied Move (%)": f"{round((move / stock_price) * 100, 2)}%",
                     "Price Range": f"{round(stock_price - move, 2)} - {round(stock_price + move, 2)}",
                 }
             )
+
 
     return pd.DataFrame(results)
 
