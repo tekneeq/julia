@@ -205,10 +205,10 @@ class OptionPricer:
             position_description = "Market is approximately gamma neutral. Limited systematic flow expected from gamma hedging."
         elif total_gex > 0:
             gamma_position = "LONG GAMMA"
-            position_description = "Market makers are net short gamma. They will buy on dips and sell on rallies (stabilizing)."
+            position_description = "Market makers are net long gamma. They will sell on dips and buy on rallies (destabilizing)."
         else:
             gamma_position = "SHORT GAMMA"
-            position_description = "Market makers are net long gamma. They will sell on dips and buy on rallies (destabilizing)."
+            position_description = "Market makers are net short gamma. They will buy on dips and sell on rallies (stabilizing)."
         
         return {
             'total_gex': total_gex,
