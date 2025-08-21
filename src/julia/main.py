@@ -446,70 +446,91 @@ def emove(ticker, days, confidence):
 
     df = implied_move(stock_price, iv, days, confidence_levels)
 
-    # Augment table with option prices at closest strike (put for lower range, call for upper range)
-    closest_call_price = None
-    closest_put_price = None
+    # Augment table with option prices nearest to bounds for each row
+    lower_put_prices = []
+    upper_call_prices = []
     try:
         options_chain = rh.options.find_options_by_expiration(
             ticker, expirationDate, info=None
         )
+        call_by_strike = {}
+        put_by_strike = {}
+
+        def get_market_price(opt_contract):
+            mark_price = opt_contract.get("mark_price")
+            bid_price = opt_contract.get("bid_price")
+            ask_price = opt_contract.get("ask_price")
+            try:
+                if mark_price is not None and float(mark_price) > 0:
+                    return float(mark_price)
+                if (
+                    bid_price is not None
+                    and ask_price is not None
+                    and float(bid_price) > 0
+                    and float(ask_price) > 0
+                ):
+                    return (float(bid_price) + float(ask_price)) / 2.0
+            except (TypeError, ValueError):
+                return None
+            return None
+
         if options_chain:
-            # Gather unique strikes
-            strikes = [
-                float(opt.get("strike_price"))
-                for opt in options_chain
-                if opt.get("strike_price") is not None
-            ]
+            strikes = []
+            for opt in options_chain:
+                sp = opt.get("strike_price")
+                if sp is None:
+                    continue
+                try:
+                    k = float(sp)
+                except (TypeError, ValueError):
+                    continue
+                mp = get_market_price(opt)
+                if mp is None:
+                    continue
+                strikes.append(k)
+                t = (opt.get("type") or "").lower()
+                if t == "call":
+                    call_by_strike[k] = mp
+                elif t == "put":
+                    put_by_strike[k] = mp
+
             if strikes:
-                closest_strike = min(strikes, key=lambda k: abs(k - stock_price))
+                def closest(target, values):
+                    return min(values, key=lambda v: abs(v - target))
 
-                def get_market_price(opt_contract):
-                    mark_price = opt_contract.get("mark_price")
-                    bid_price = opt_contract.get("bid_price")
-                    ask_price = opt_contract.get("ask_price")
-                    try:
-                        if mark_price is not None and float(mark_price) > 0:
-                            return float(mark_price)
-                        if (
-                            bid_price is not None
-                            and ask_price is not None
-                            and float(bid_price) > 0
-                            and float(ask_price) > 0
-                        ):
-                            return (float(bid_price) + float(ask_price)) / 2.0
-                    except (TypeError, ValueError):
-                        return None
-                    return None
+                for _, row in df.iterrows():
+                    move_amt = float(row["Implied Move ($)"])
+                    lower_bound = stock_price - move_amt
+                    upper_bound = stock_price + move_amt
 
-                # Find call and put at closest strike
-                for opt in options_chain:
-                    try:
-                        if float(opt.get("strike_price", -1)) != closest_strike:
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-                    opt_type = (opt.get("type") or "").lower()
-                    mp = get_market_price(opt)
-                    if mp is None:
-                        continue
-                    if opt_type == "call" and closest_call_price is None:
-                        closest_call_price = round(mp, 2)
-                    elif opt_type == "put" and closest_put_price is None:
-                        closest_put_price = round(mp, 2)
-                    if closest_call_price is not None and closest_put_price is not None:
-                        break
+                    # Find closest strikes to bounds
+                    lower_strike = closest(lower_bound, strikes)
+                    upper_strike = closest(upper_bound, strikes)
+
+                    # Lookup prices
+                    lower_put_prices.append(
+                        round(put_by_strike.get(lower_strike), 2)
+                        if lower_strike in put_by_strike
+                        else np.nan
+                    )
+                    upper_call_prices.append(
+                        round(call_by_strike.get(upper_strike), 2)
+                        if upper_strike in call_by_strike
+                        else np.nan
+                    )
+            else:
+                lower_put_prices = [np.nan] * len(df)
+                upper_call_prices = [np.nan] * len(df)
+        else:
+            lower_put_prices = [np.nan] * len(df)
+            upper_call_prices = [np.nan] * len(df)
 
     except Exception:
-        # If fetching or parsing fails, leave prices as None
-        pass
+        lower_put_prices = [np.nan] * len(df)
+        upper_call_prices = [np.nan] * len(df)
 
-    # Add columns for display
-    df["Lower Put ($)"] = (
-        closest_put_price if closest_put_price is not None else np.nan
-    )
-    df["Upper Call ($)"] = (
-        closest_call_price if closest_call_price is not None else np.nan
-    )
+    df["Lower Put ($)"] = lower_put_prices
+    df["Upper Call ($)"] = upper_call_prices
 
     print(df)
 
