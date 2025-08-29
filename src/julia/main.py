@@ -490,16 +490,19 @@ def range(ticker):
 
     hi, lo, op = todays_high_low(ticker)
     range_value = (hi - lo) if (hi is not None and lo is not None) else None
+
+    todays_date = business_days_from_today(0)
+
     if op is not None and hi is not None and lo is not None and range_value is not None and op != 0:
         hi_pct = (hi - op) / op
         lo_pct = (lo - op) / op
         range_pct = range_value / op
         print(
-            f"{ticker} Today's High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value:.2f} ({range_pct:.2%})"
+            f"{ticker} {todays_date} High: {hi} ({hi_pct:.2%}), Low: {lo} ({lo_pct:.2%}), Range: {range_value:.2f} ({range_pct:.2%})"
         )
     else:
         print(
-            f"{ticker} Today's High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 0.0:.2%}"
+            f"{ticker} {todays_date} High: {hi}, Low: {lo}, Range: {range_value if range_value is not None else 0.0:.2%}"
         )
 
 
