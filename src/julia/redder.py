@@ -40,7 +40,7 @@ printed_comment_ids = set()
 comment_idx = 0
 time_sleep = 0
 while True:
-    if time_sleep % 5 == 0:
+    if time_sleep % 30 == 0:
         try:
             latest_submission.refresh()
         except Exception:

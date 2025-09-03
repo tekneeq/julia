@@ -54,10 +54,12 @@ async def on_message(msg):
     if msg.content == "!ping":
         await msg.reply("pong!")
 
-    if msg.content == "!rpost":
+    if "!rpost" in msg.content:
+        message = msg.content.split("!rpost")[1].strip()
 
-        latest_submission.reply("This is my comment posted via PRAW 🤖")
-        await msg.reply("pong!")
+        comment = latest_submission.reply(message)
+        comment_id = comment.id
+        await msg.reply(f"comment id: {comment_id}")
 
 
 client.run(TOKEN)
