@@ -1,0 +1,7 @@
+https://www.reddit.com/prefs/apps
+
+
+uv run python src/julia/redder.py  
+uv run lia emove
+uv run lia range
+uv run lia greeks --show-gex
