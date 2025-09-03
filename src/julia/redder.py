@@ -37,29 +37,22 @@ for idx, submission in enumerate(
 # --- Tracking printed comments ---
 printed_comment_ids = set()
 
-# Seed with existing comments so we only print new ones after startup
-latest_submission.comments.replace_more(limit=0)
-for comment in latest_submission.comments.list():
-    printed_comment_ids.add(comment.id)
-
-# --- Continuous loop ---
-try:
-    while True:
-        # Expand any "MoreComments" placeholders
+comment_idx = 0
+time_sleep = 0
+while True:
+    if time_sleep % 5 == 0:
         latest_submission.comments.replace_more(limit=0)
-
-        # Loop through all comments
         for comment in latest_submission.comments.list():
-            if comment.id not in printed_comment_ids:
-                printed_comment_ids.add(comment.id)  # Mark as printed
 
-                # Print new comment
-                print(f"[{comment.author}] {comment.body}")
-                print("-" * 50)
+            if comment.id in printed_comment_ids:
+                continue
 
-        # Wait a bit before checking again (to avoid hitting API rate limits)
-        time.sleep(10)
-except KeyboardInterrupt:
-    print("Stopping comment stream. Goodbye.")
-# Daily Discussion Thread for September 03, 2025
-# Weekend Discussion Thread for the Weekend of October 18, 2024
+            printed_comment_ids.add(comment.id)
+            comment_idx += 1
+            print(f"[{comment_idx}]")
+            print(f"[{comment.author}] {comment.body}")
+            print("-" * 50)
+
+    time.sleep(1)
+    time_sleep += 1
+    print(f"Time sleep: {time_sleep}")
