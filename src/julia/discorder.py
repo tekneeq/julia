@@ -12,7 +12,8 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 
-intents = Intents.default()  # set more if you need them
+intents = Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 
 
