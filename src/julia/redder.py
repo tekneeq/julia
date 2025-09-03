@@ -41,7 +41,13 @@ comment_idx = 0
 time_sleep = 0
 while True:
     if time_sleep % 5 == 0:
-        latest_submission.comments.replace_more(limit=0)
+        try:
+            latest_submission.refresh()
+        except Exception:
+            latest_submission = reddit.submission(id=submission_id)
+        latest_submission.comment_sort = "new"
+        latest_submission.comments.replace_more(limit=None)
+
         for comment in latest_submission.comments.list():
 
             if comment.id in printed_comment_ids:
