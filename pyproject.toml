@@ -25,6 +25,7 @@ dependencies = [
     "click>=8.1.8",
     "numpy>=2.0.2",
     "pandas>=2.2.3",
+    "praw>=7.8.1",
     "python-dotenv>=1.1.0",
     "robin-stocks>=3.4.0",
     "ruff>=0.11.11",
