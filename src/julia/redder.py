@@ -57,7 +57,9 @@ while True:
             printed_comment_ids.add(comment.id)
             comment_idx += 1
             print(f"[{comment_idx}]")
-            print(f"[{comment.author}] {comment.body}")
+            print(
+                f"[{comment.author}] ({comment.id} {comment.score}) {comment.body}"
+            )
             print("-" * 50)
 
         print(f"there has been {comment_idx - last_comment_idx} new comments.")
