@@ -59,7 +59,7 @@ async def on_message(msg):
 
         comment = latest_submission.reply(message)
         comment_id = comment.id
-        await msg.reply(f"comment id: {comment_id}")
+        await msg.reply(f"Commented: '{message}' (comment id: {comment_id})")
 
 
 client.run(TOKEN)

@@ -38,6 +38,7 @@ for idx, submission in enumerate(
 printed_comment_ids = set()
 
 comment_idx = 0
+last_comment_idx = 0
 time_sleep = 0
 while True:
     if time_sleep % 30 == 0:
@@ -59,6 +60,10 @@ while True:
             print(f"[{comment.author}] {comment.body}")
             print("-" * 50)
 
+        print(f"there has been {comment_idx - last_comment_idx} new comments.")
+        last_comment_idx = comment_idx
+
     time.sleep(1)
     time_sleep += 1
-    print(f"Time sleep: {time_sleep}")
+    if time_sleep % 15 == 0:
+        print(f"Time sleep: {time_sleep}")
