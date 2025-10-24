@@ -7,7 +7,7 @@ name = "julia"
 version = "0.1.0"
 description = "Options Greeks and Gamma Exposure Analysis toolkit"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 authors = [
     {name = "Julia Options Team"}
 ]
@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "click>=8.1.8",
     "discord>=2.3.2",
+    "markupsafe==3.0.2",
     "numpy>=2.0.2",
     "pandas>=2.2.3",
     "praw>=7.8.1",
@@ -31,6 +32,9 @@ dependencies = [
     "robin-stocks>=3.4.0",
     "ruff>=0.11.11",
     "scipy>=1.13.1",
+    "torch>=2.9.0",
+    "torchaudio>=2.9.0",
+    "torchvision>=0.24.0",
 ]
 
 [project.scripts]
@@ -41,3 +45,7 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true

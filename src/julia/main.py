@@ -20,7 +20,7 @@ load_dotenv()
 def is_logged_in():
     """
     Check if user is already logged in to Robinhood.
-    
+
     Returns:
     - bool: True if logged in, False otherwise
     """
@@ -37,16 +37,19 @@ def ensure_logged_in(func):
     Decorator to ensure user is logged in before executing command.
     If not logged in, will call login_robinhood with credentials from environment.
     """
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not is_logged_in():
             username = os.getenv("RH_USERNAME")
             password = os.getenv("RH_PASSWORD")
             if not username or not password:
-                click.echo("❌ Error: RH_USERNAME and RH_PASSWORD must be set in environment variables or .env file")
+                click.echo(
+                    "❌ Error: RH_USERNAME and RH_PASSWORD must be set in environment variables or .env file"
+                )
                 click.echo("Please set these credentials and try again.")
                 return
-            
+
             click.echo("🔐 Logging in to Robinhood...")
             try:
                 login_robinhood(username, password)
@@ -54,8 +57,9 @@ def ensure_logged_in(func):
             except Exception as e:
                 click.echo(f"❌ Login failed: {e}")
                 return
-        
+
         return func(*args, **kwargs)
+
     return wrapper
 
 
@@ -100,7 +104,6 @@ def implied_move(stock_price, iv, days_list, confidence_levels):
                     "Price Range": f"{round(stock_price - move, 2)} - {round(stock_price + move, 2)}",
                 }
             )
-
 
     return pd.DataFrame(results)
 
@@ -452,26 +455,49 @@ def emove(ticker, days, confidence):
 @click.option(
     "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
 )
+@click.option(
+    "--days", default=1, help="Days from now to get options data (default: 1)"
+)
+@ensure_logged_in
+def option(ticker="SPY", days=1):
+    expiration_date = business_days_from_today(days)
+    options_data = rh.options.find_options_by_expiration(
+        ticker, expiration_date, info=None
+    )
+    print(json.dumps(options_data, indent=4))
+
+
+@cli.command()
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
+)
 @ensure_logged_in
 def range(ticker):
 
-    def todays_high_low_intraday(symbol: str, bounds: str = "regular") -> tuple[float | None, float | None, float | None]:
+    def todays_high_low_intraday(
+        symbol: str, bounds: str = "regular"
+    ) -> tuple[float | None, float | None, float | None]:
         candles = rh.stocks.get_stock_historicals(
-            symbol,
-            interval="5minute",
-            span="day",
-            bounds=bounds
+            symbol, interval="5minute", span="day", bounds=bounds
         )
         if not candles:
             return None, None, None
-        highs = [float(candle['high_price']) for candle in candles if candle.get('high_price')]
-        lows = [float(candle['low_price']) for candle in candles if candle.get('low_price')]
+        highs = [
+            float(candle["high_price"])
+            for candle in candles
+            if candle.get("high_price")
+        ]
+        lows = [
+            float(candle["low_price"])
+            for candle in candles
+            if candle.get("low_price")
+        ]
         # Opening price: first candle's open where available
         open_price: float | None = None
         for candle in candles:
-            if candle.get('open_price') is not None:
+            if candle.get("open_price") is not None:
                 try:
-                    open_price = float(candle['open_price'])
+                    open_price = float(candle["open_price"])
                 except (TypeError, ValueError):
                     open_price = None
                 break
@@ -481,7 +507,9 @@ def range(ticker):
             open_price,
         )
 
-    def todays_high_low(symbol: str) -> tuple[float | None, float | None, float | None]:
+    def todays_high_low(
+        symbol: str,
+    ) -> tuple[float | None, float | None, float | None]:
         hi, lo, op = todays_high_low_intraday(symbol)
         if hi is None or lo is None or op is None:
             hi, lo, op = todays_high_low_intraday(symbol, bounds="trading")
@@ -493,7 +521,13 @@ def range(ticker):
 
     todays_date = business_days_from_today(0)
 
-    if op is not None and hi is not None and lo is not None and range_value is not None and op != 0:
+    if (
+        op is not None
+        and hi is not None
+        and lo is not None
+        and range_value is not None
+        and op != 0
+    ):
         hi_pct = (hi - op) / op
         lo_pct = (lo - op) / op
         range_pct = range_value / op
