@@ -8,8 +8,8 @@ import os
 from scipy.optimize import brentq
 import click
 from datetime import datetime, timedelta
-from .options import OptionPricer
-from .options_cache import get_cache_instance
+from julia.options import OptionPricer
+from julia.options_cache import get_cache_instance
 import functools
 
 # looks for a .env file in the current directory
