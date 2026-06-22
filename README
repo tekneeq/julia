@@ -19,4 +19,17 @@ uv run lia emove-check --ticker SPY    # just SPY
 uv run lia emove-stats
 uv run lia emove-stats --ticker SPY
 
+--
 UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22
+
+--
+# Throughout the day — each run records a fresh snapshot
+UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22 --refresh-cache
+# ... later ...
+UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22 --refresh-cache
+
+# See what changed (intraday: trust volume, not OI)
+UV_NATIVE_TLS=true uv run lia greeks-diff --ticker SPY --expiration 2026-06-22
+
+# See what's in the DB
+UV_NATIVE_TLS=true uv run lia greeks-history --ticker SPY --expiration 2026-06-22
