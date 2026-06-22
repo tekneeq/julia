@@ -5,3 +5,18 @@ uv run python src/julia/redder.py
 uv run lia emove
 uv run lia range
 uv run lia greeks --show-gex
+
+
+# As before, but now also records to .options_cache/predictions.db
+uv run lia emove
+uv run lia emove --ticker QQQ --days 1,3,5
+
+# Later, once target dates have passed
+uv run lia emove-check                 # all tickers
+uv run lia emove-check --ticker SPY    # just SPY
+
+# Calibration summary
+uv run lia emove-stats
+uv run lia emove-stats --ticker SPY
+
+UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22
