@@ -10,6 +10,8 @@ import click
 from datetime import datetime, timedelta
 from julia.options import OptionPricer
 from julia.options_cache import get_cache_instance
+from julia import predictions_store
+from julia import gex_store
 import functools
 
 # looks for a .env file in the current directory
@@ -399,8 +401,24 @@ def cli():
     default="0.6827,0.9545,0.997",
     help="Comma-separated list of confidence levels (default: 0.6827,0.9545,0.997)",
 )
+@click.option(
+    "--expiration",
+    default=None,
+    help="Expiration date YYYY-MM-DD to source IV from "
+    "(default: next business day). Use today's date for 0DTE IV.",
+)
+@click.option(
+    "--today",
+    is_flag=True,
+    help="Shortcut for --expiration=<today> (0DTE IV).",
+)
+@click.option(
+    "--no-record",
+    is_flag=True,
+    help="Don't persist this prediction to the local SQLite store",
+)
 @ensure_logged_in
-def emove(ticker, days, confidence):
+def emove(ticker, days, confidence, expiration, today, no_record):
 
     stock_price = rh.stocks.get_latest_price(
         ticker, priceType=None, includeExtendedHours=True
@@ -414,9 +432,20 @@ def emove(ticker, days, confidence):
     stock_price = float(stock_price[0])
     click.echo(f"Current {ticker} price: {stock_price}")
 
-    # TODO: optionType 'call' or 'put'
-    # YYYY-MM-DD
-    expirationDate = business_days_from_today(1)
+    if today and expiration:
+        click.echo("❌ Pass either --today or --expiration, not both.")
+        return
+    if today:
+        expirationDate = business_days_from_today(0)
+    elif expiration:
+        try:
+            datetime.strptime(expiration, "%Y-%m-%d")
+        except ValueError:
+            click.echo(f"❌ Invalid --expiration '{expiration}'. Use YYYY-MM-DD.")
+            return
+        expirationDate = expiration
+    else:
+        expirationDate = business_days_from_today(1)
     strikePrice = int(stock_price)
     options_data_list = rh.options.find_options_by_expiration_and_strike(
         ticker, expirationDate, strikePrice, optionType="call", info=None
@@ -445,10 +474,160 @@ def emove(ticker, days, confidence):
     # 3 sig = 99.7% confidence
     # confidence_levels = [0.6827, 0.9545, 0.997]
     confidence_levels = [float(c) for c in confidence.split(",")]
-    days = [int(d) for d in days.split(",")]
+    days_list = [int(d) for d in days.split(",")]
 
-    df = implied_move(stock_price, iv, days, confidence_levels)
+    df = implied_move(stock_price, iv, days_list, confidence_levels)
     print(df)
+
+    if not no_record:
+        bands = _build_bands(stock_price, iv, days_list, confidence_levels)
+        try:
+            pid = predictions_store.record_prediction(
+                ticker=ticker,
+                spot_price=stock_price,
+                iv=iv,
+                strike_price=float(strikePrice),
+                option_type="call",
+                expiration_date=expirationDate,
+                bands=bands,
+            )
+            click.echo(f"📒 Recorded prediction {pid}")
+        except Exception as e:
+            click.echo(f"⚠️  Could not record prediction: {e}")
+
+
+def _build_bands(stock_price, iv, days_list, confidence_levels):
+    """Build raw-float Band rows mirroring the printed implied_move table."""
+    bands = []
+    for days in days_list:
+        target_date = business_days_from_today(days)
+        for conf in confidence_levels:
+            z = norm.ppf((1 + conf) / 2)
+            move = stock_price * iv * np.sqrt(days / 252) * z
+            bands.append(
+                predictions_store.Band(
+                    days=days,
+                    target_date=target_date,
+                    confidence=conf,
+                    implied_move=round(float(move), 4),
+                    low=round(float(stock_price - move), 4),
+                    high=round(float(stock_price + move), 4),
+                )
+            )
+    return bands
+
+
+def _daily_close_by_date(ticker):
+    """Fetch a year of daily bars for `ticker` and return {YYYY-MM-DD: close}."""
+    historicals = rh.stocks.get_stock_historicals(
+        ticker, interval="day", span="year"
+    )
+    closes = {}
+    for bar in historicals or []:
+        begins_at = bar.get("begins_at") or ""
+        close = bar.get("close_price")
+        if not begins_at or close is None:
+            continue
+        # begins_at looks like '2026-06-20T13:30:00Z'
+        date = begins_at[:10]
+        try:
+            closes[date] = float(close)
+        except (TypeError, ValueError):
+            continue
+    return closes
+
+
+@cli.command("emove-check")
+@click.option(
+    "--ticker",
+    default=None,
+    help="Only check predictions for this ticker (default: all)",
+)
+@ensure_logged_in
+def emove_check(ticker):
+    """Backfill realized closes for `emove` predictions whose target date has passed."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    pending = predictions_store.pending_outcomes(today, ticker=ticker)
+    if not pending:
+        click.echo("✅ Nothing to check — no pending outcomes")
+        return
+
+    click.echo(f"Found {len(pending)} pending outcome(s)")
+
+    close_cache: dict[str, dict[str, float]] = {}
+    recorded = 0
+    skipped = 0
+    for row in pending:
+        sym = row["ticker"]
+        if sym not in close_cache:
+            try:
+                close_cache[sym] = _daily_close_by_date(sym)
+            except Exception as e:
+                click.echo(f"  ⚠️  {sym}: failed to fetch historicals ({e})")
+                close_cache[sym] = {}
+        close = close_cache[sym].get(row["target_date"])
+        if close is None:
+            click.echo(
+                f"  ⏭  {sym} {row['target_date']} (+{row['days']}d): no close available yet"
+            )
+            skipped += 1
+            continue
+        actual_move = close - float(row["spot_price"])
+        predictions_store.record_outcome(
+            prediction_id=row["prediction_id"],
+            days=row["days"],
+            target_date=row["target_date"],
+            actual_price=close,
+            actual_move=actual_move,
+        )
+        sign = "+" if actual_move >= 0 else ""
+        click.echo(
+            f"  📌 {sym} +{row['days']}d {row['target_date']}: "
+            f"close={close:.2f} move={sign}{actual_move:.2f} "
+            f"({sign}{actual_move / float(row['spot_price']) * 100:.2f}%)"
+        )
+        recorded += 1
+
+    click.echo(f"\nRecorded {recorded}, skipped {skipped}")
+
+
+@cli.command("emove-stats")
+@click.option(
+    "--ticker", default=None, help="Filter to one ticker (default: all)"
+)
+def emove_stats(ticker):
+    """Show calibration of recorded `emove` predictions vs realized moves."""
+    summary = predictions_store.counts()
+    click.echo(
+        f"📊 predictions={summary['predictions']} "
+        f"bands={summary['bands']} outcomes={summary['outcomes']}"
+    )
+
+    rows = predictions_store.stats_rows(ticker=ticker)
+    if not rows:
+        click.echo(
+            "No realized outcomes yet — run `lia emove-check` once a "
+            "prediction's target date has passed."
+        )
+        return
+
+    df = pd.DataFrame(
+        [
+            {
+                "ticker": r["ticker"],
+                "days": r["days"],
+                "conf": f"{r['confidence'] * 100:.2f}%",
+                "n": r["n"],
+                "hits": r["hits"],
+                "hit_rate": f"{(r['hits'] / r['n']) * 100:.1f}%",
+                "avg_implied": f"{r['avg_implied_pct'] * 100:.2f}%",
+                "avg_realized_abs": f"{r['avg_abs_move_pct'] * 100:.2f}%",
+            }
+            for r in rows
+        ]
+    )
+    click.echo("")
+    click.echo(df.to_string(index=False))
 
 
 @cli.command()
@@ -577,10 +756,15 @@ def range(ticker):
     is_flag=True,
     help="Force refresh cached data with fresh API call",
 )
+@click.option(
+    "--no-record",
+    is_flag=True,
+    help="Don't snapshot this run to the local SQLite store (used by greeks-diff)",
+)
 @ensure_logged_in
 def greeks(
     ticker,
-    expiration,
+    expiration,  # YYYY-MM-DD, e.g. "2026-06-23"
     rate,
     output,
     min_volume,
@@ -588,6 +772,7 @@ def greeks(
     show_gex,
     no_cache,
     refresh_cache,
+    no_record,
 ):
     """
     Calculate delta, gamma, GEX (and optionally other Greeks) for all options on a given expiration date.
@@ -621,6 +806,18 @@ def greeks(
         if df.empty:
             click.echo("No options data found or error occurred.")
             return
+
+        if not no_record:
+            try:
+                sid = _record_greeks_snapshot(df, ticker, expiration, rate)
+                click.echo(f"📒 Recorded snapshot {sid}")
+                if not refresh_cache and not no_cache:
+                    click.echo(
+                        "   (data may be from cache; pass --refresh-cache for a "
+                        "fresh intraday snapshot)"
+                    )
+            except Exception as e:
+                click.echo(f"⚠️  Could not record snapshot: {e}")
 
         # Apply volume filter
         if min_volume > 0:
@@ -843,15 +1040,613 @@ def greeks(
         click.echo(f"Error: {e}")
 
 
+def _record_greeks_snapshot(df, ticker, expiration, rate):
+    """Persist a `greeks` run as one gex_snapshots row + N strike rows.
+
+    Reads the unfiltered DataFrame returned by ``calculate_options_greeks``.
+    Strike rows with no IV or pricing are already excluded upstream.
+    """
+    spot_price = float(df.attrs.get("stock_price") or 0.0)
+    strikes = []
+    for _, row in df.iterrows():
+        oi = row.get("open_interest")
+        vol = row.get("volume")
+        strikes.append(
+            gex_store.StrikeSnapshot(
+                option_type=str(row["option_type"]).lower(),
+                strike_price=float(row["strike_price"]),
+                mark_price=_safe_float(row.get("market_price")),
+                implied_vol=_safe_float(row.get("implied_volatility")),
+                delta=_safe_float(row.get("delta")),
+                gamma=_safe_float(row.get("gamma")),
+                gex_per_contract=_safe_float(row.get("gex_per_contract")),
+                volume=int(vol) if vol not in (None, "") else None,
+                open_interest=int(oi) if oi not in (None, "") else None,
+            )
+        )
+    return gex_store.record_snapshot(
+        ticker=ticker,
+        expiration_date=expiration,
+        spot_price=spot_price,
+        risk_free_rate=float(rate),
+        strikes=strikes,
+    )
+
+
+def _safe_float(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@cli.command("greeks-history")
+@click.option(
+    "--ticker", default=None, help="Filter to one ticker (default: all)"
+)
+@click.option(
+    "--expiration", default=None, help="Filter to one expiration YYYY-MM-DD"
+)
+@click.option("--limit", default=20, help="Max snapshots to show (default: 20)")
+def greeks_history(ticker, expiration, limit):
+    """List recent gex snapshots (most recent first).
+
+    The `idx` column is what to pass to `greeks-diff --from/--to`
+    (1 = most recent).
+    """
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration, limit=limit
+    )
+    if not rows:
+        click.echo("No greeks snapshots yet — run `lia greeks` to record one.")
+        return
+
+    df = pd.DataFrame(
+        [
+            {
+                "idx": i + 1,
+                "id": r["id"],
+                "captured_at": r["captured_at"],
+                "ticker": r["ticker"],
+                "exp": r["expiration_date"],
+                "spot": f"{r['spot_price']:.2f}",
+                "C_OI": r["call_oi"],
+                "P_OI": r["put_oi"],
+                "C_vol": r["call_volume"],
+                "P_vol": r["put_volume"],
+                "P/C_vol": f"{(r['put_volume'] / r['call_volume']):.2f}"
+                if r["call_volume"]
+                else "n/a",
+                "net_gex": f"{(r['total_gex'] or 0):,.0f}",
+            }
+            for i, r in enumerate(rows)
+        ]
+    )
+    click.echo(df.to_string(index=False))
+
+
+@cli.command("greeks-diff")
+@click.option(
+    "--ticker", required=True, help="Ticker (required)"
+)
+@click.option(
+    "--expiration", required=True, help="Expiration date YYYY-MM-DD (required)"
+)
+@click.option(
+    "--from", "from_ref", default=None,
+    help=(
+        "Snapshot to compare FROM. Accepts a ULID, an integer index "
+        "(1 = most recent, 2 = next, ...), or 'first'. "
+        "Default: 2nd most recent."
+    ),
+)
+@click.option(
+    "--to", "to_ref", default=None,
+    help=(
+        "Snapshot to compare TO. Accepts a ULID, an integer index "
+        "(1 = most recent), or 'last'/'latest'. Default: most recent."
+    ),
+)
+@click.option(
+    "--full-day", is_flag=True,
+    help="Shortcut: diff the first snapshot of the day vs the latest "
+    "(overrides --from/--to).",
+)
+@click.option(
+    "--top", default=5, type=int,
+    help="Show top N per-strike movers by Δvolume per side (default: 5, 0 to skip)",
+)
+def greeks_diff(ticker, expiration, from_ref, to_ref, full_day, top):
+    """Diff two gex snapshots for the same (ticker, expiration).
+
+    Shows what changed between two points in time — most useful for spotting
+    where call vs put positioning was added through the day or week.
+
+    Pick snapshots with `--from` / `--to`. Examples:
+      `--from 4 --to 1`     (4th-most-recent vs latest)
+      `--from first --to 1` (first of the day vs latest)
+      `--full-day`          (same as above, shortcut)
+      `--from <ULID> --to <ULID>` (explicit)
+
+    Use `lia greeks-history` to see the indices.
+    """
+    if full_day:
+        from_ref = "first"
+        to_ref = "1"
+
+    if from_ref or to_ref:
+        older = _resolve_snapshot_ref(
+            from_ref or "2", ticker=ticker, expiration=expiration
+        )
+        newer = _resolve_snapshot_ref(
+            to_ref or "1", ticker=ticker, expiration=expiration
+        )
+        if not older:
+            click.echo(f"❌ --from snapshot '{from_ref}' not found.")
+            return
+        if not newer:
+            click.echo(f"❌ --to snapshot '{to_ref}' not found.")
+            return
+        # Make sure (older, newer) is in chronological order even if the user
+        # passed them backwards — diffing always reads "older → newer".
+        if older["captured_at"] > newer["captured_at"]:
+            older, newer = newer, older
+    else:
+        older, newer = gex_store.latest_two(
+            ticker=ticker, expiration_date=expiration
+        )
+        if not older or not newer:
+            click.echo(
+                f"Need at least 2 snapshots for {ticker} {expiration}. "
+                "Run `lia greeks` twice (use --refresh-cache for fresh data)."
+            )
+            return
+
+    # Header
+    click.echo(
+        f"\n{ticker} {expiration}  "
+        f"{older['captured_at']}  →  {newer['captured_at']}"
+    )
+    dt = _iso_diff_minutes(older["captured_at"], newer["captured_at"])
+    if dt is not None:
+        click.echo(f"Elapsed: {dt:.0f} min")
+
+    # Spot
+    d_spot = newer["spot_price"] - older["spot_price"]
+    pct = (d_spot / older["spot_price"] * 100) if older["spot_price"] else 0.0
+    click.echo(
+        f"\nSpot: {older['spot_price']:.2f}  →  {newer['spot_price']:.2f}  "
+        f"({_sign(d_spot)}{d_spot:.2f}, {_sign(d_spot)}{pct:.2f}%)"
+    )
+
+    # Headline: intraday "more calls vs more puts being added" — by VOLUME
+    click.echo("\nIntraday signal (volume — cumulative since open):")
+    _print_pair(
+        "  Calls",
+        older["call_volume"], newer["call_volume"],
+        is_int=True,
+    )
+    _print_pair(
+        "  Puts ",
+        older["put_volume"], newer["put_volume"],
+        is_int=True,
+    )
+    pc_old = (older["put_volume"] / older["call_volume"]) if older["call_volume"] else None
+    pc_new = (newer["put_volume"] / newer["call_volume"]) if newer["call_volume"] else None
+    if pc_old is not None and pc_new is not None:
+        click.echo(
+            f"  P/C vol ratio: {pc_old:.2f}  →  {pc_new:.2f}  "
+            f"({_sign(pc_new - pc_old)}{pc_new - pc_old:.2f})"
+        )
+
+    # OI — meaningful day-over-day only
+    d_call_oi = newer["call_oi"] - older["call_oi"]
+    d_put_oi = newer["put_oi"] - older["put_oi"]
+    click.echo("\nDay-over-day signal (open interest — updates EOD):")
+    _print_pair("  Calls", older["call_oi"], newer["call_oi"], is_int=True)
+    _print_pair("  Puts ", older["put_oi"], newer["put_oi"], is_int=True)
+    if d_call_oi == 0 and d_put_oi == 0:
+        click.echo("  (ΔOI = 0 — expected within same trading day)")
+
+    # Notional delta — dollar exposure being added
+    click.echo("\nNotional delta ($, derived from OI × delta × 100 × spot):")
+    _print_pair(
+        "  Calls", older["call_notional_delta"], newer["call_notional_delta"],
+        is_money=True,
+    )
+    _print_pair(
+        "  Puts ", older["put_notional_delta"], newer["put_notional_delta"],
+        is_money=True,
+    )
+
+    # GEX
+    click.echo("\nGEX:")
+    _print_pair(
+        "  Net  ", older["total_gex"], newer["total_gex"], is_money=True
+    )
+    _print_pair(
+        "  Calls", older["call_gex"], newer["call_gex"], is_money=True
+    )
+    _print_pair(
+        "  Puts ", older["put_gex"], newer["put_gex"], is_money=True
+    )
+
+    if top > 0:
+        _print_strike_movers(older["id"], newer["id"], top)
+
+
+def _resolve_snapshot_ref(ref, *, ticker, expiration):
+    """Resolve a user-supplied --from/--to value to a snapshot row.
+
+    Accepts:
+      - integer / digit string  → N-th most recent (1 = latest)
+      - 'first'                 → earliest snapshot for (ticker, expiration)
+      - 'last' / 'latest'       → most recent
+      - 26-char ULID            → direct lookup by id
+    """
+    if ref is None:
+        return None
+    ref_str = str(ref).strip()
+    if ref_str.lower() == "first":
+        return gex_store.first_snapshot(
+            ticker=ticker, expiration_date=expiration
+        )
+    if ref_str.lower() in ("last", "latest"):
+        return gex_store.nth_most_recent(
+            ticker=ticker, expiration_date=expiration, n=1
+        )
+    if ref_str.isdigit():
+        return gex_store.nth_most_recent(
+            ticker=ticker, expiration_date=expiration, n=int(ref_str)
+        )
+    return gex_store.get_snapshot(ref_str)
+
+
+def _iso_diff_minutes(a, b):
+    try:
+        return (
+            datetime.fromisoformat(b.replace("Z", "+00:00"))
+            - datetime.fromisoformat(a.replace("Z", "+00:00"))
+        ).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+def _sign(x):
+    if x is None:
+        return ""
+    return "+" if x >= 0 else ""
+
+
+def _print_pair(label, old, new, *, is_int=False, is_money=False):
+    if old is None or new is None:
+        click.echo(f"{label}: n/a")
+        return
+    d = new - old
+    if is_money:
+        click.echo(
+            f"{label}: {old:>15,.0f}  →  {new:>15,.0f}  "
+            f"(Δ {_sign(d)}{d:,.0f})"
+        )
+    elif is_int:
+        click.echo(
+            f"{label}: {old:>10,d}  →  {new:>10,d}  (Δ {_sign(d)}{d:,d})"
+        )
+    else:
+        click.echo(
+            f"{label}: {old:>10.2f}  →  {new:>10.2f}  (Δ {_sign(d)}{d:.2f})"
+        )
+
+
+def _print_strike_movers(older_id, newer_id, top):
+    """Top-N per-strike movers by Δvolume, split by call/put."""
+    older_strikes = {
+        (r["option_type"], r["strike_price"]): r
+        for r in gex_store.get_strikes(older_id)
+    }
+    newer_strikes = {
+        (r["option_type"], r["strike_price"]): r
+        for r in gex_store.get_strikes(newer_id)
+    }
+    keys = set(older_strikes) | set(newer_strikes)
+    movers = []
+    for k in keys:
+        o = older_strikes.get(k)
+        n = newer_strikes.get(k)
+        o_vol = (o["volume"] if o and o["volume"] is not None else 0)
+        n_vol = (n["volume"] if n and n["volume"] is not None else 0)
+        o_oi = (o["open_interest"] if o and o["open_interest"] is not None else 0)
+        n_oi = (n["open_interest"] if n and n["open_interest"] is not None else 0)
+        movers.append(
+            {
+                "type": k[0],
+                "strike": k[1],
+                "d_vol": n_vol - o_vol,
+                "d_oi": n_oi - o_oi,
+                "vol_now": n_vol,
+                "oi_now": n_oi,
+            }
+        )
+
+    for side in ("call", "put"):
+        side_movers = [m for m in movers if m["type"] == side and m["d_vol"] != 0]
+        if not side_movers:
+            continue
+        side_movers.sort(key=lambda m: abs(m["d_vol"]), reverse=True)
+        click.echo(f"\nTop {side} Δvolume:")
+        df = pd.DataFrame(side_movers[:top])
+        click.echo(df.to_string(index=False))
+
+
+@cli.command("oi-value")
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol (default: SPY)"
+)
+@click.option(
+    "--expiration", required=True, help="Expiration date YYYY-MM-DD (required)"
+)
+@click.option(
+    "--rate", default=0.02, help="Risk-free rate (default: 0.02)"
+)
+@click.option(
+    "--range", "range_pct", default=5.0, type=float,
+    help="Only include strikes within +/- N percent of spot (default: 5). "
+    "Pass 0 to include the whole chain.",
+)
+@click.option(
+    "--out", default=None,
+    help="Output PNG path (default: plots/oi-value-{ticker}-{expiration}[-cumulative].png)",
+)
+@click.option(
+    "--cumulative", is_flag=True,
+    help="Plot cumulative sums (running total by strike) instead of per-strike bars.",
+)
+@click.option(
+    "--no-open", is_flag=True, help="Don't auto-open the PNG when done",
+)
+@click.option("--no-cache", is_flag=True, help="Disable options-chain cache")
+@click.option("--refresh-cache", is_flag=True, help="Force refresh options-chain cache")
+@ensure_logged_in
+def oi_value(
+    ticker, expiration, rate, range_pct, out, cumulative,
+    no_open, no_cache, refresh_cache,
+):
+    """Plot Market Price × Open Interest per strike.
+
+    Default (bar mode): calls point up, puts point down — a "money profile"
+    showing where dollar exposure sits at each strike.
+
+    With `--cumulative`: plots the running total of dollar OI, direction
+    aligned to each side's payoff:
+      - Calls cumulate low→high: at strike X, y = Σ(strike ≤ X).
+      - Puts  cumulate high→low: at strike X, y = Σ(strike ≥ X).
+    So both curves peak toward spot and fall off toward their OTM tail.
+    Useful for seeing where value *concentrates* along the chain.
+
+    Uses `market_price * open_interest * 100` (options are per 100 shares).
+    """
+    try:
+        datetime.strptime(expiration, "%Y-%m-%d")
+    except ValueError:
+        click.echo(f"❌ Invalid --expiration '{expiration}'. Use YYYY-MM-DD.")
+        return
+
+    # Deferred import so the CLI stays fast when this command isn't used
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = calculate_options_greeks(
+        ticker, expiration, rate,
+        use_cache=not no_cache, refresh_cache=refresh_cache,
+    )
+    if df.empty:
+        click.echo("No options data found.")
+        return
+
+    spot = float(df.attrs.get("stock_price") or 0.0)
+    if spot <= 0:
+        click.echo("Could not determine spot price.")
+        return
+
+    df = df.copy()
+    df["oi_value"] = (
+        df["market_price"].fillna(0).astype(float)
+        * df["open_interest"].fillna(0).astype(float)
+        * 100.0
+    )
+
+    if range_pct > 0:
+        lo = spot * (1 - range_pct / 100)
+        hi = spot * (1 + range_pct / 100)
+        df = df[(df["strike_price"] >= lo) & (df["strike_price"] <= hi)]
+
+    if df.empty:
+        click.echo(
+            f"No strikes within ±{range_pct}% of ${spot:.2f}. "
+            "Try a larger --range."
+        )
+        return
+
+    calls = (
+        df[df["option_type"].str.upper() == "CALL"]
+        .groupby("strike_price")["oi_value"].sum()
+    )
+    puts = (
+        df[df["option_type"].str.upper() == "PUT"]
+        .groupby("strike_price")["oi_value"].sum()
+    )
+    strikes = sorted(set(calls.index) | set(puts.index))
+    call_vals = [float(calls.get(k, 0.0)) for k in strikes]
+    put_vals_positive = [float(puts.get(k, 0.0)) for k in strikes]
+    put_vals_negative = [-v for v in put_vals_positive]
+
+    total_call = sum(call_vals)
+    total_put = sum(put_vals_positive)
+
+    strike_step = (
+        float(np.min(np.diff(strikes))) if len(strikes) > 1 else 1.0
+    )
+    if strike_step <= 0:
+        strike_step = 1.0
+    bar_width = strike_step * 0.8
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    scope = f"±{range_pct:.0f}% of spot" if range_pct > 0 else "full chain"
+    crossing_x, crossing_y = None, None
+
+    if cumulative:
+        # Calls: cumulate low→high (value payoff builds as strike drops
+        # BELOW spot, so at strike X the cum is sum of strikes ≤ X).
+        call_cum = np.cumsum(call_vals)
+        # Puts: cumulate high→low (put value payoff builds as strike rises
+        # ABOVE spot, so at strike X the cum is sum of strikes ≥ X).
+        put_arr = np.array(put_vals_positive)
+        put_cum = np.cumsum(put_arr[::-1])[::-1]
+
+        crossing_x, crossing_y = _find_curve_crossing(
+            strikes, call_cum, put_cum
+        )
+
+        ax.step(
+            strikes, call_cum, where="post", color="#2ca02c",
+            linewidth=2.2,
+            label=f"Call cum ≤ strike  (total ${total_call/1e6:,.1f}M)",
+        )
+        ax.step(
+            strikes, put_cum, where="post", color="#d62728",
+            linewidth=2.2,
+            label=f"Put  cum ≥ strike  (total ${total_put/1e6:,.1f}M)",
+        )
+        ax.axvline(
+            spot, color="black", linestyle="--", linewidth=1.2,
+            label=f"Spot ${spot:.2f}",
+        )
+        if crossing_x is not None:
+            ax.axvline(
+                crossing_x, color="#1f77b4", linestyle=":", linewidth=1.6,
+                label=f"Crossing ${crossing_x:.2f}  (${crossing_y/1e6:,.2f}M)",
+            )
+            ax.plot(
+                [crossing_x], [crossing_y], marker="o", markersize=8,
+                markerfacecolor="#1f77b4", markeredgecolor="white",
+                markeredgewidth=1.5, zorder=5,
+            )
+            ax.annotate(
+                f"${crossing_x:.2f}",
+                xy=(crossing_x, crossing_y),
+                xytext=(8, 10), textcoords="offset points",
+                fontsize=10, fontweight="bold", color="#1f77b4",
+            )
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel("Cumulative Market Price × OI × 100  ($)")
+        ax.set_title(
+            f"{ticker} {expiration} — Cumulative Dollar OI  "
+            f"(calls low→high, puts high→low)  ({scope})"
+        )
+        ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda x, _: f"${x/1e6:,.1f}M")
+        )
+    else:
+        ax.bar(
+            strikes, call_vals,
+            width=bar_width, color="#2ca02c", alpha=0.85,
+            label=f"Call  (total ${total_call/1e6:,.1f}M)",
+        )
+        ax.bar(
+            strikes, put_vals_negative,
+            width=bar_width, color="#d62728", alpha=0.85,
+            label=f"Put  (total ${total_put/1e6:,.1f}M)",
+        )
+        ax.axvline(
+            spot, color="black", linestyle="--", linewidth=1.2,
+            label=f"Spot ${spot:.2f}",
+        )
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel("Market Price × OI × 100  ($, puts shown negative)")
+        ax.set_title(
+            f"{ticker} {expiration} — Dollar OI per strike  ({scope})"
+        )
+        ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda x, _: f"${abs(x)/1e6:,.1f}M")
+        )
+
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if not out:
+        os.makedirs("plots", exist_ok=True)
+        suffix = "-cumulative" if cumulative else ""
+        out = f"plots/oi-value-{ticker}-{expiration}{suffix}.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+
+    click.echo(f"📊 Saved: {out}")
+    click.echo(
+        f"    Spot ${spot:.2f} | Call ${total_call/1e6:,.1f}M | "
+        f"Put ${total_put/1e6:,.1f}M | strikes plotted: {len(strikes)}"
+    )
+    if cumulative and crossing_x is not None:
+        rel = (crossing_x - spot) / spot * 100 if spot else 0.0
+        click.echo(
+            f"    Crossing strike: ${crossing_x:.2f}  "
+            f"(${crossing_y/1e6:,.2f}M each, {rel:+.2f}% vs spot)"
+        )
+    if not no_open:
+        try:
+            import subprocess
+            subprocess.run(["open", out], check=False)
+        except Exception:
+            pass
+
+
+def _find_curve_crossing(strikes, call_cum, put_cum):
+    """Return (strike, y) where the ascending call cumsum crosses the
+    descending put cumsum, interpolated linearly between the two bracketing
+    strike points. Returns (None, None) if no crossing exists.
+    """
+    call_arr = np.asarray(call_cum, dtype=float)
+    put_arr = np.asarray(put_cum, dtype=float)
+    strike_arr = np.asarray(strikes, dtype=float)
+
+    diff = call_arr - put_arr
+    if len(diff) < 2:
+        return None, None
+    # Detect the first index i where sign(diff) flips between i and i+1.
+    sign = np.sign(diff)
+    flips = np.where(sign[:-1] != sign[1:])[0]
+    if len(flips) == 0:
+        return None, None
+    i = int(flips[0])
+    x1, x2 = float(strike_arr[i]), float(strike_arr[i + 1])
+    d1, d2 = float(diff[i]), float(diff[i + 1])
+    if d2 == d1:
+        return x1, float(call_arr[i])
+    t = -d1 / (d2 - d1)
+    cross_x = x1 + t * (x2 - x1)
+    cross_y = float(call_arr[i]) + t * (float(call_arr[i + 1]) - float(call_arr[i]))
+    return cross_x, cross_y
+
+
 @cli.command()
 @click.option(
     "--ticker", default="SPY", help="Ticker symbol of the stock (default: SPY)"
 )
 @click.option(
+    "--expiration",
+    default=None,
+    help="Expiration date YYYY-MM-DD (overrides --days if provided)",
+)
+@click.option(
     "--days",
     default=1,
     type=int,
-    help="Business days from now to get options data (default: 1)",
+    help="Business days from now to get options data (default: 1). "
+    "Ignored if --expiration is given.",
 )
 @click.option(
     "--rate", default=0.02, help="Risk-free interest rate (default: 0.02 or 2%)"
@@ -867,23 +1662,33 @@ def greeks(
     help="Force refresh cached data with fresh API call",
 )
 @ensure_logged_in
-def opt(ticker, days, rate, no_cache, refresh_cache):
+def opt(ticker, expiration, days, rate, no_cache, refresh_cache):
     """
     Print options data (put and call) for the strike closest to current underlying price.
 
-    This command calculates the target expiration date based on business days from now,
-    fetches all options data for that date, finds the strike price closest to the current
-    underlying price, and displays both put and call option data for that strike.
+    Pass either --expiration YYYY-MM-DD directly, or --days N to compute
+    the target date as N business days from now.
 
-    The command reuses the Greeks calculation functionality to gather comprehensive
-    options data including prices, Greeks, and GEX values.
+    The command fetches all options data for the chosen expiration, finds the
+    strike price closest to the current underlying price, and displays both
+    put and call option data for that strike (prices, Greeks, GEX).
     """
     try:
-        # Calculate target expiration date
-        expiration_date = business_days_from_today(days)
-        click.echo(
-            f"Target expiration date: {expiration_date} ({days} business days from now)"
-        )
+        if expiration:
+            try:
+                datetime.strptime(expiration, "%Y-%m-%d")
+            except ValueError:
+                click.echo(
+                    f"❌ Invalid --expiration '{expiration}'. Use YYYY-MM-DD."
+                )
+                return
+            expiration_date = expiration
+            click.echo(f"Target expiration date: {expiration_date}")
+        else:
+            expiration_date = business_days_from_today(days)
+            click.echo(
+                f"Target expiration date: {expiration_date} ({days} business days from now)"
+            )
 
         # Get options data using the existing Greeks function
         click.echo(f"Fetching options data for {ticker}...")

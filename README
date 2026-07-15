@@ -24,12 +24,36 @@ UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22
 
 --
 # Throughout the day — each run records a fresh snapshot
-UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22 --refresh-cache
+UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-07-07 --refresh-cache
 # ... later ...
 UV_NATIVE_TLS=true uv run lia greeks --show-gex --expiration 2026-06-22 --refresh-cache
+UV_NATIVE_TLS=true uv run lia greeks-diff --ticker SPY --expiration 2026-07-13 --full-day
 
 # See what changed (intraday: trust volume, not OI)
-UV_NATIVE_TLS=true uv run lia greeks-diff --ticker SPY --expiration 2026-06-22
+UV_NATIVE_TLS=true uv run lia greeks-diff --ticker SPY --expiration 2026-07-13
 
 # See what's in the DB
 UV_NATIVE_TLS=true uv run lia greeks-history --ticker SPY --expiration 2026-06-22
+
+
+UV_NATIVE_TLS=true uv run lia opt --ticker SPY --expiration 2026-07-14
+# Full chain for 2026-07-14, only strikes with meaningful activity
+UV_NATIVE_TLS=true uv run lia greeks --ticker SPY --expiration 2026-07-14 --min-volume 1000 --show-all
+# Same effect (0DTE today = 2026-07-14)
+UV_NATIVE_TLS=true uv run lia opt --ticker SPY --days 0
+
+
+# Default: ±5% around spot, auto-opens the PNG on macOS
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14
+
+# Wider view
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --range 10
+
+# Whole chain
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --range 0
+
+# Don't auto-open
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --no-open
+
+# Custom path
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --out ~/Desktop/spy-oi.png
