@@ -196,6 +196,9 @@ def calculate_options_greeks(
                 df.attrs["gamma_levels"] = cached_data["data"]["gamma_levels"]
             if "stock_price" in cached_data["data"]:
                 df.attrs["stock_price"] = cached_data["data"]["stock_price"]
+            calc_params = cached_data["data"].get("calculation_params") or {}
+            if calc_params.get("calculated_at"):
+                df.attrs["cached_calculated_at"] = calc_params["calculated_at"]
 
             return df
 
@@ -1404,28 +1407,37 @@ def _print_strike_movers(older_id, newer_id, top):
     help="Plot cumulative sums (running total by strike) instead of per-strike bars.",
 )
 @click.option(
+    "--metric", type=click.Choice(["dollars", "contracts"]), default="dollars",
+    show_default=True,
+    help="Y-axis metric: 'dollars' = market_price × OI × 100, "
+    "'contracts' = raw open interest count.",
+)
+@click.option(
     "--no-open", is_flag=True, help="Don't auto-open the PNG when done",
 )
 @click.option("--no-cache", is_flag=True, help="Disable options-chain cache")
 @click.option("--refresh-cache", is_flag=True, help="Force refresh options-chain cache")
 @ensure_logged_in
 def oi_value(
-    ticker, expiration, rate, range_pct, out, cumulative,
+    ticker, expiration, rate, range_pct, out, cumulative, metric,
     no_open, no_cache, refresh_cache,
 ):
-    """Plot Market Price × Open Interest per strike.
+    """Plot dollar OI or raw open interest per strike.
 
-    Default (bar mode): calls point up, puts point down — a "money profile"
-    showing where dollar exposure sits at each strike.
+    `--metric dollars` (default): market_price × open_interest × 100 — a
+    "money profile" showing where dollar exposure sits at each strike.
 
-    With `--cumulative`: plots the running total of dollar OI, direction
-    aligned to each side's payoff:
+    `--metric contracts`: raw open-interest count per strike. Useful for
+    spotting positioning "walls" independent of premium level (great for
+    dated options where premium is tiny but OI walls still pin price).
+
+    Bar mode: calls point up, puts point down.
+
+    With `--cumulative`: plots the running total, direction aligned to each
+    side's payoff:
       - Calls cumulate low→high: at strike X, y = Σ(strike ≤ X).
       - Puts  cumulate high→low: at strike X, y = Σ(strike ≥ X).
-    So both curves peak toward spot and fall off toward their OTM tail.
-    Useful for seeing where value *concentrates* along the chain.
-
-    Uses `market_price * open_interest * 100` (options are per 100 shares).
+    Both curves peak toward spot and fall off toward their OTM tail.
     """
     try:
         datetime.strptime(expiration, "%Y-%m-%d")
@@ -1446,155 +1458,96 @@ def oi_value(
         click.echo("No options data found.")
         return
 
+    # Always fetch a fresh spot price. The options chain may come from cache
+    # (which is fine for OI/premium — it doesn't move much intraday), but the
+    # spot line on the chart MUST reflect right-now.
     spot = float(df.attrs.get("stock_price") or 0.0)
+    try:
+        fresh_spot_list = rh.stocks.get_latest_price(
+            ticker, priceType=None, includeExtendedHours=True
+        )
+        if fresh_spot_list and fresh_spot_list[0]:
+            spot = float(fresh_spot_list[0])
+    except Exception as e:
+        click.echo(f"⚠️  Could not refresh spot ({e}); using cached value.")
     if spot <= 0:
         click.echo("Could not determine spot price.")
         return
 
-    df = df.copy()
-    df["oi_value"] = (
-        df["market_price"].fillna(0).astype(float)
-        * df["open_interest"].fillna(0).astype(float)
-        * 100.0
+    # Figure out how stale the options data itself is.
+    cached_at_iso = df.attrs.get("cached_calculated_at")
+    cache_age_min = None
+    data_as_of_local = None
+    if cached_at_iso:
+        try:
+            cached_dt = datetime.fromisoformat(cached_at_iso)
+            cache_age_min = (datetime.now() - cached_dt).total_seconds() / 60
+            data_as_of_local = cached_dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    scope = f"±{range_pct:.0f}% of spot" if range_pct > 0 else "full chain"
+    as_of = (
+        f"OI as of {data_as_of_local}"
+        if data_as_of_local
+        else f"OI as of {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
 
-    if range_pct > 0:
-        lo = spot * (1 - range_pct / 100)
-        hi = spot * (1 + range_pct / 100)
-        df = df[(df["strike_price"] >= lo) & (df["strike_price"] <= hi)]
+    result = _render_oi_panel(
+        ax, df=df, ticker=ticker, expiration=expiration, spot=spot,
+        metric=metric, cumulative=cumulative, range_pct=range_pct,
+        scope=scope, as_of=as_of,
+    )
 
-    if df.empty:
+    if result["empty"]:
         click.echo(
             f"No strikes within ±{range_pct}% of ${spot:.2f}. "
             "Try a larger --range."
         )
+        plt.close(fig)
         return
 
-    calls = (
-        df[df["option_type"].str.upper() == "CALL"]
-        .groupby("strike_price")["oi_value"].sum()
-    )
-    puts = (
-        df[df["option_type"].str.upper() == "PUT"]
-        .groupby("strike_price")["oi_value"].sum()
-    )
-    strikes = sorted(set(calls.index) | set(puts.index))
-    call_vals = [float(calls.get(k, 0.0)) for k in strikes]
-    put_vals_positive = [float(puts.get(k, 0.0)) for k in strikes]
-    put_vals_negative = [-v for v in put_vals_positive]
-
-    total_call = sum(call_vals)
-    total_put = sum(put_vals_positive)
-
-    strike_step = (
-        float(np.min(np.diff(strikes))) if len(strikes) > 1 else 1.0
-    )
-    if strike_step <= 0:
-        strike_step = 1.0
-    bar_width = strike_step * 0.8
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    scope = f"±{range_pct:.0f}% of spot" if range_pct > 0 else "full chain"
-    crossing_x, crossing_y = None, None
-
-    if cumulative:
-        # Calls: cumulate low→high (value payoff builds as strike drops
-        # BELOW spot, so at strike X the cum is sum of strikes ≤ X).
-        call_cum = np.cumsum(call_vals)
-        # Puts: cumulate high→low (put value payoff builds as strike rises
-        # ABOVE spot, so at strike X the cum is sum of strikes ≥ X).
-        put_arr = np.array(put_vals_positive)
-        put_cum = np.cumsum(put_arr[::-1])[::-1]
-
-        crossing_x, crossing_y = _find_curve_crossing(
-            strikes, call_cum, put_cum
-        )
-
-        ax.step(
-            strikes, call_cum, where="post", color="#2ca02c",
-            linewidth=2.2,
-            label=f"Call cum ≤ strike  (total ${total_call/1e6:,.1f}M)",
-        )
-        ax.step(
-            strikes, put_cum, where="post", color="#d62728",
-            linewidth=2.2,
-            label=f"Put  cum ≥ strike  (total ${total_put/1e6:,.1f}M)",
-        )
-        ax.axvline(
-            spot, color="black", linestyle="--", linewidth=1.2,
-            label=f"Spot ${spot:.2f}",
-        )
-        if crossing_x is not None:
-            ax.axvline(
-                crossing_x, color="#1f77b4", linestyle=":", linewidth=1.6,
-                label=f"Crossing ${crossing_x:.2f}  (${crossing_y/1e6:,.2f}M)",
-            )
-            ax.plot(
-                [crossing_x], [crossing_y], marker="o", markersize=8,
-                markerfacecolor="#1f77b4", markeredgecolor="white",
-                markeredgewidth=1.5, zorder=5,
-            )
-            ax.annotate(
-                f"${crossing_x:.2f}",
-                xy=(crossing_x, crossing_y),
-                xytext=(8, 10), textcoords="offset points",
-                fontsize=10, fontweight="bold", color="#1f77b4",
-            )
-        ax.set_xlabel("Strike price ($)")
-        ax.set_ylabel("Cumulative Market Price × OI × 100  ($)")
-        ax.set_title(
-            f"{ticker} {expiration} — Cumulative Dollar OI  "
-            f"(calls low→high, puts high→low)  ({scope})"
-        )
-        ax.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, _: f"${x/1e6:,.1f}M")
-        )
-    else:
-        ax.bar(
-            strikes, call_vals,
-            width=bar_width, color="#2ca02c", alpha=0.85,
-            label=f"Call  (total ${total_call/1e6:,.1f}M)",
-        )
-        ax.bar(
-            strikes, put_vals_negative,
-            width=bar_width, color="#d62728", alpha=0.85,
-            label=f"Put  (total ${total_put/1e6:,.1f}M)",
-        )
-        ax.axvline(
-            spot, color="black", linestyle="--", linewidth=1.2,
-            label=f"Spot ${spot:.2f}",
-        )
-        ax.axhline(0, color="black", linewidth=0.6)
-        ax.set_xlabel("Strike price ($)")
-        ax.set_ylabel("Market Price × OI × 100  ($, puts shown negative)")
-        ax.set_title(
-            f"{ticker} {expiration} — Dollar OI per strike  ({scope})"
-        )
-        ax.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, _: f"${abs(x)/1e6:,.1f}M")
-        )
-
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
     if not out:
         os.makedirs("plots", exist_ok=True)
-        suffix = "-cumulative" if cumulative else ""
-        out = f"plots/oi-value-{ticker}-{expiration}{suffix}.png"
+        cum_suffix = "-cumulative" if cumulative else ""
+        metric_suffix = "" if metric == "dollars" else "-contracts"
+        out = (
+            f"plots/oi-value-{ticker}-{expiration}"
+            f"{cum_suffix}{metric_suffix}.png"
+        )
     plt.savefig(out, dpi=120)
     plt.close(fig)
 
+    total_call = result["total_call"]
+    total_put = result["total_put"]
+    fmt_total = result["fmt_total"]
+    fmt_point = result["fmt_point"]
+    crossing_x = result["crossing_x"]
+    crossing_y = result["crossing_y"]
+
     click.echo(f"📊 Saved: {out}")
     click.echo(
-        f"    Spot ${spot:.2f} | Call ${total_call/1e6:,.1f}M | "
-        f"Put ${total_put/1e6:,.1f}M | strikes plotted: {len(strikes)}"
+        f"    Spot ${spot:.2f} (fresh) | Call {fmt_total(total_call)} | "
+        f"Put {fmt_total(total_put)} | strikes plotted: {result['strikes_count']}"
     )
+    if cache_age_min is not None:
+        stale_hint = (
+            "  ⚠️  pass --refresh-cache for live premium/OI"
+            if cache_age_min >= 15
+            else ""
+        )
+        click.echo(
+            f"    OI/premium data age: {cache_age_min:,.0f} min "
+            f"(cached at {data_as_of_local}){stale_hint}"
+        )
     if cumulative and crossing_x is not None:
         rel = (crossing_x - spot) / spot * 100 if spot else 0.0
         click.echo(
             f"    Crossing strike: ${crossing_x:.2f}  "
-            f"(${crossing_y/1e6:,.2f}M each, {rel:+.2f}% vs spot)"
+            f"({fmt_point(crossing_y)} each, {rel:+.2f}% vs spot)"
         )
     if not no_open:
         try:
@@ -1630,6 +1583,363 @@ def _find_curve_crossing(strikes, call_cum, put_cum):
     cross_x = x1 + t * (x2 - x1)
     cross_y = float(call_arr[i]) + t * (float(call_arr[i + 1]) - float(call_arr[i]))
     return cross_x, cross_y
+
+
+def _render_oi_panel(
+    ax,
+    *,
+    df,
+    ticker,
+    expiration,
+    spot,
+    metric,
+    cumulative,
+    range_pct,
+    scope,
+    as_of,
+    show_title=True,
+):
+    """Render one OI panel into a matplotlib axes.
+
+    Shared between `oi-value` (single-chart) and `oi-dashboard`
+    (multi-panel). Handles metric-value computation, strike filtering,
+    grouping, bar/cumulative plotting, spot line, and crossing annotation.
+
+    Returns a dict with computed totals so the caller can echo a summary.
+    """
+    import matplotlib.pyplot as plt
+
+    df = df.copy()
+    if metric == "dollars":
+        df["metric_value"] = (
+            df["market_price"].fillna(0).astype(float)
+            * df["open_interest"].fillna(0).astype(float)
+            * 100.0
+        )
+    else:
+        df["metric_value"] = df["open_interest"].fillna(0).astype(float)
+
+    if range_pct > 0:
+        lo = spot * (1 - range_pct / 100)
+        hi = spot * (1 + range_pct / 100)
+        df = df[(df["strike_price"] >= lo) & (df["strike_price"] <= hi)]
+
+    if df.empty:
+        return {
+            "empty": True, "strikes_count": 0,
+            "total_call": 0.0, "total_put": 0.0,
+            "crossing_x": None, "crossing_y": None,
+            "fmt_total": lambda v: str(v), "fmt_point": lambda v: str(v),
+        }
+
+    calls = (
+        df[df["option_type"].str.upper() == "CALL"]
+        .groupby("strike_price")["metric_value"].sum()
+    )
+    puts = (
+        df[df["option_type"].str.upper() == "PUT"]
+        .groupby("strike_price")["metric_value"].sum()
+    )
+    strikes = sorted(set(calls.index) | set(puts.index))
+    call_vals = [float(calls.get(k, 0.0)) for k in strikes]
+    put_vals_positive = [float(puts.get(k, 0.0)) for k in strikes]
+    put_vals_negative = [-v for v in put_vals_positive]
+
+    total_call = sum(call_vals)
+    total_put = sum(put_vals_positive)
+
+    strike_step = (
+        float(np.min(np.diff(strikes))) if len(strikes) > 1 else 1.0
+    )
+    if strike_step <= 0:
+        strike_step = 1.0
+    bar_width = strike_step * 0.8
+
+    if metric == "dollars":
+        y_fmt_signed = plt.FuncFormatter(lambda x, _: f"${x/1e6:,.1f}M")
+        y_fmt_abs = plt.FuncFormatter(lambda x, _: f"${abs(x)/1e6:,.1f}M")
+
+        def fmt_total(v: float) -> str:
+            return f"${v/1e6:,.1f}M"
+
+        def fmt_point(v: float) -> str:
+            return f"${v/1e6:,.2f}M"
+
+        y_label_bar = "Market Price × OI × 100  ($, puts shown negative)"
+        y_label_cum = "Cumulative Market Price × OI × 100  ($)"
+        title_bar = f"{ticker} {expiration} — Dollar OI per strike  ({scope})"
+        title_cum = (
+            f"{ticker} {expiration} — Cumulative Dollar OI  "
+            f"(calls low→high, puts high→low)  ({scope})"
+        )
+    else:
+        y_fmt_signed = plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+        y_fmt_abs = plt.FuncFormatter(lambda x, _: f"{abs(x):,.0f}")
+
+        def fmt_total(v: float) -> str:
+            return f"{v:,.0f} contracts"
+
+        def fmt_point(v: float) -> str:
+            return f"{v:,.0f}"
+
+        y_label_bar = "Open Interest  (contracts, puts shown negative)"
+        y_label_cum = "Cumulative Open Interest  (contracts)"
+        title_bar = (
+            f"{ticker} {expiration} — Open Interest per strike  ({scope})"
+        )
+        title_cum = (
+            f"{ticker} {expiration} — Cumulative Open Interest  "
+            f"(calls low→high, puts high→low)  ({scope})"
+        )
+
+    crossing_x, crossing_y = None, None
+    if cumulative:
+        call_cum = np.cumsum(call_vals)
+        put_arr = np.array(put_vals_positive)
+        put_cum = np.cumsum(put_arr[::-1])[::-1]
+
+        crossing_x, crossing_y = _find_curve_crossing(
+            strikes, call_cum, put_cum
+        )
+
+        ax.step(
+            strikes, call_cum, where="post", color="#2ca02c",
+            linewidth=2.2,
+            label=f"Call cum ≤ strike  (total {fmt_total(total_call)})",
+        )
+        ax.step(
+            strikes, put_cum, where="post", color="#d62728",
+            linewidth=2.2,
+            label=f"Put  cum ≥ strike  (total {fmt_total(total_put)})",
+        )
+        ax.axvline(
+            spot, color="black", linestyle="--", linewidth=1.2,
+            label=f"Spot ${spot:.2f}",
+        )
+        if crossing_x is not None:
+            ax.axvline(
+                crossing_x, color="#1f77b4", linestyle=":", linewidth=1.6,
+                label=(
+                    f"Crossing ${crossing_x:.2f}  "
+                    f"({fmt_point(crossing_y)})"
+                ),
+            )
+            ax.plot(
+                [crossing_x], [crossing_y], marker="o", markersize=8,
+                markerfacecolor="#1f77b4", markeredgecolor="white",
+                markeredgewidth=1.5, zorder=5,
+            )
+            ax.annotate(
+                f"${crossing_x:.2f}",
+                xy=(crossing_x, crossing_y),
+                xytext=(8, 10), textcoords="offset points",
+                fontsize=10, fontweight="bold", color="#1f77b4",
+            )
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel(y_label_cum)
+        if show_title:
+            ax.set_title(f"{title_cum}\nSpot ${spot:.2f}   ·   {as_of}")
+        ax.yaxis.set_major_formatter(y_fmt_signed)
+    else:
+        ax.bar(
+            strikes, call_vals,
+            width=bar_width, color="#2ca02c", alpha=0.85,
+            label=f"Call  (total {fmt_total(total_call)})",
+        )
+        ax.bar(
+            strikes, put_vals_negative,
+            width=bar_width, color="#d62728", alpha=0.85,
+            label=f"Put  (total {fmt_total(total_put)})",
+        )
+        ax.axvline(
+            spot, color="black", linestyle="--", linewidth=1.2,
+            label=f"Spot ${spot:.2f}",
+        )
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel(y_label_bar)
+        if show_title:
+            ax.set_title(f"{title_bar}\nSpot ${spot:.2f}   ·   {as_of}")
+        ax.yaxis.set_major_formatter(y_fmt_abs)
+
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    return {
+        "empty": False,
+        "strikes_count": len(strikes),
+        "total_call": total_call,
+        "total_put": total_put,
+        "crossing_x": crossing_x,
+        "crossing_y": crossing_y,
+        "fmt_total": fmt_total,
+        "fmt_point": fmt_point,
+    }
+
+
+@cli.command("oi-dashboard")
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol (default: SPY)"
+)
+@click.option(
+    "--expiration", required=True, help="Expiration date YYYY-MM-DD (required)"
+)
+@click.option(
+    "--rate", default=0.02, help="Risk-free rate (default: 0.02)"
+)
+@click.option(
+    "--range", "range_pct", default=5.0, type=float,
+    help="Only include strikes within +/- N percent of spot (default: 5). "
+    "Pass 0 to include the whole chain.",
+)
+@click.option(
+    "--out", default=None,
+    help="Output PNG path (default: plots/oi-dashboard-{ticker}-{expiration}.png)",
+)
+@click.option(
+    "--no-open", is_flag=True, help="Don't auto-open the PNG when done",
+)
+@click.option("--no-cache", is_flag=True, help="Disable options-chain cache")
+@click.option(
+    "--refresh-cache", is_flag=True,
+    help="Force refresh options-chain cache",
+)
+@ensure_logged_in
+def oi_dashboard(
+    ticker, expiration, rate, range_pct, out, no_open, no_cache, refresh_cache,
+):
+    """Three-panel OI dashboard for a single expiration, stacked vertically.
+
+    Panels (top → bottom):
+      1. Cumulative Dollar OI  (with crossing strike annotated)
+      2. Open Interest per strike (contracts)  — raw positioning walls
+      3. Dollar OI per strike  (market_price × OI × 100)
+
+    Same underlying data as three separate `lia oi-value` calls, but
+    rendered into one PNG so you can eyeball dollars vs contracts vs
+    cumulative pin lines side-by-side.
+    """
+    try:
+        datetime.strptime(expiration, "%Y-%m-%d")
+    except ValueError:
+        click.echo(f"❌ Invalid --expiration '{expiration}'. Use YYYY-MM-DD.")
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = calculate_options_greeks(
+        ticker, expiration, rate,
+        use_cache=not no_cache, refresh_cache=refresh_cache,
+    )
+    if df.empty:
+        click.echo("No options data found.")
+        return
+
+    spot = float(df.attrs.get("stock_price") or 0.0)
+    try:
+        fresh_spot_list = rh.stocks.get_latest_price(
+            ticker, priceType=None, includeExtendedHours=True
+        )
+        if fresh_spot_list and fresh_spot_list[0]:
+            spot = float(fresh_spot_list[0])
+    except Exception as e:
+        click.echo(f"⚠️  Could not refresh spot ({e}); using cached value.")
+    if spot <= 0:
+        click.echo("Could not determine spot price.")
+        return
+
+    cached_at_iso = df.attrs.get("cached_calculated_at")
+    cache_age_min = None
+    data_as_of_local = None
+    if cached_at_iso:
+        try:
+            cached_dt = datetime.fromisoformat(cached_at_iso)
+            cache_age_min = (datetime.now() - cached_dt).total_seconds() / 60
+            data_as_of_local = cached_dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+
+    scope = f"±{range_pct:.0f}% of spot" if range_pct > 0 else "full chain"
+    as_of = (
+        f"OI as of {data_as_of_local}"
+        if data_as_of_local
+        else f"OI as of {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+
+    panels = [
+        {"metric": "dollars", "cumulative": True},
+        {"metric": "contracts", "cumulative": False},
+        {"metric": "dollars", "cumulative": False},
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 20), sharex=True)
+    results = []
+    any_empty = False
+    for ax, panel in zip(axes, panels):
+        result = _render_oi_panel(
+            ax, df=df, ticker=ticker, expiration=expiration, spot=spot,
+            metric=panel["metric"], cumulative=panel["cumulative"],
+            range_pct=range_pct, scope=scope, as_of=as_of,
+            show_title=True,
+        )
+        results.append(result)
+        if result["empty"]:
+            any_empty = True
+
+    if any_empty:
+        click.echo(
+            f"No strikes within ±{range_pct}% of ${spot:.2f}. "
+            "Try a larger --range."
+        )
+        plt.close(fig)
+        return
+
+    fig.suptitle(
+        f"{ticker} {expiration} — OI Dashboard   ·   "
+        f"Spot ${spot:.2f}   ·   {as_of}",
+        fontsize=14, fontweight="bold", y=0.995,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.985))
+
+    if not out:
+        os.makedirs("plots", exist_ok=True)
+        out = f"plots/oi-dashboard-{ticker}-{expiration}.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+
+    click.echo(f"📊 Saved: {out}")
+    labels = ["Dollar cum", "Contracts bar", "Dollar bar"]
+    for label, result in zip(labels, results):
+        click.echo(
+            f"    {label:<14} | Call {result['fmt_total'](result['total_call'])} "
+            f"| Put {result['fmt_total'](result['total_put'])}"
+        )
+    cum_result = results[0]
+    if cum_result["crossing_x"] is not None:
+        rel = (cum_result["crossing_x"] - spot) / spot * 100 if spot else 0.0
+        click.echo(
+            f"    Crossing strike (dollar cum): ${cum_result['crossing_x']:.2f}  "
+            f"({cum_result['fmt_point'](cum_result['crossing_y'])} each, "
+            f"{rel:+.2f}% vs spot)"
+        )
+    if cache_age_min is not None:
+        stale_hint = (
+            "  ⚠️  pass --refresh-cache for live premium/OI"
+            if cache_age_min >= 15
+            else ""
+        )
+        click.echo(
+            f"    OI/premium data age: {cache_age_min:,.0f} min "
+            f"(cached at {data_as_of_local}){stale_hint}"
+        )
+    if not no_open:
+        try:
+            import subprocess
+            subprocess.run(["open", out], check=False)
+        except Exception:
+            pass
 
 
 @cli.command()

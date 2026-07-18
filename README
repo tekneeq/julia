@@ -9,7 +9,7 @@ uv run lia greeks --show-gex
 
 # As before, but now also records to .options_cache/predictions.db
 uv run lia emove
-uv run lia emove --ticker QQQ --days 1,3,5
+uv run lia emove --ticker SPY --days 1,3,5
 
 # Later, once target dates have passed
 uv run lia emove-check                 # all tickers
@@ -57,3 +57,15 @@ UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --no
 
 # Custom path
 UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --out ~/Desktop/spy-oi.png
+
+# Cumulative view
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --cumulative
+
+# Bar view (default, unchanged)
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14
+
+# Wider range on the cumulative
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --cumulative --range 10
+
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-20 --metric contracts
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-20 --metric dollars
