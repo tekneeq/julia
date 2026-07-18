@@ -84,3 +84,45 @@ UV_NATIVE_TLS=true uv run lia oi-dashboard --ticker SPY --expiration 2026-07-24 
 
 # Compare the two:
 UV_NATIVE_TLS=true uv run lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
+--
+
+Step 1 — see what snapshots you have:
+UV_NATIVE_TLS=true uv run lia greeks-history --ticker SPY --expiration 2026-07-24
+
+Step 2 — pick a pair with --from and --to:
+# Default: latest vs previous (equivalent to --from 2 --to 1)
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
+
+# Latest vs the very first ever recorded for this expiration
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24 --from first --to latest
+
+# Latest vs the 3rd-most-recent (skip a snapshot)
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24 --from 3 --to 1
+
+# Compare two specific snapshots by ULID (copy-paste from greeks-history)
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24 \
+  --from 01KXV5Y0KRMCPJ5144GVVPYZTC \
+  --to   01KXV84QRJ2BZBRD0XY2YGM3Q7
+
+# You can also mix — e.g. specific old ULID vs latest
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24 \
+  --from 01KXV5Y0KRMCPJ5144GVVPYZTC --to latest
+
+  # Right now — records snapshot A
+lia oi-dashboard --ticker SPY --expiration 2026-07-24
+
+# Monday close — records snapshot B
+lia oi-dashboard --ticker SPY --expiration 2026-07-24 --refresh-cache
+
+# Default diff = B vs A, no flags needed:
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
+
+
+--from / --to ref types accepted by oi-dashboard-diff:
+
+| Ref             | Meaning                                                               |
+|-----------------|-----------------------------------------------------------------------|
+| latest / last   | The most recent snapshot                                              |
+| first           | The oldest snapshot ever recorded for that ticker+expiration          |
+| A number (N)    | N-th most recent (1 = latest, 2 = second-most-recent, ...)            |
+| A full ULID     | Direct lookup by ID (copy from `greeks-history`)                      |
