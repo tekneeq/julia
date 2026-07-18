@@ -1585,6 +1585,147 @@ def _find_curve_crossing(strikes, call_cum, put_cum):
     return cross_x, cross_y
 
 
+def _prepare_oi_series(df, spot, metric, range_pct):
+    """Compute per-strike sums for OI plotting.
+
+    Filters by spot ± ``range_pct``%, computes the chosen metric per
+    strike, and returns everything both single-panel and diff renderers
+    need. Returns ``None`` if no strikes fall within range.
+    """
+    df = df.copy()
+    if metric == "dollars":
+        df["metric_value"] = (
+            df["market_price"].fillna(0).astype(float)
+            * df["open_interest"].fillna(0).astype(float)
+            * 100.0
+        )
+    else:
+        df["metric_value"] = df["open_interest"].fillna(0).astype(float)
+
+    if range_pct > 0:
+        lo = spot * (1 - range_pct / 100)
+        hi = spot * (1 + range_pct / 100)
+        df = df[(df["strike_price"] >= lo) & (df["strike_price"] <= hi)]
+
+    if df.empty:
+        return None
+
+    calls = (
+        df[df["option_type"].str.upper() == "CALL"]
+        .groupby("strike_price")["metric_value"].sum()
+    )
+    puts = (
+        df[df["option_type"].str.upper() == "PUT"]
+        .groupby("strike_price")["metric_value"].sum()
+    )
+    strikes = sorted(set(calls.index) | set(puts.index))
+    calls_by_strike = {float(k): float(v) for k, v in calls.items()}
+    puts_by_strike = {float(k): float(v) for k, v in puts.items()}
+    call_vals = [calls_by_strike.get(k, 0.0) for k in strikes]
+    put_vals_positive = [puts_by_strike.get(k, 0.0) for k in strikes]
+    put_vals_negative = [-v for v in put_vals_positive]
+
+    return {
+        "strikes": strikes,
+        "call_vals": call_vals,
+        "put_vals_positive": put_vals_positive,
+        "put_vals_negative": put_vals_negative,
+        "calls_by_strike": calls_by_strike,
+        "puts_by_strike": puts_by_strike,
+        "total_call": sum(call_vals),
+        "total_put": sum(put_vals_positive),
+    }
+
+
+def _oi_metric_style(metric, ticker, expiration, scope):
+    """Formatters, labels, and titles for one metric.
+
+    Kept out of `_render_oi_panel` so the diff renderer can reuse it
+    without importing plotting internals.
+    """
+    import matplotlib.pyplot as plt
+
+    if metric == "dollars":
+        return {
+            "y_fmt_signed": plt.FuncFormatter(lambda x, _: f"${x/1e6:,.1f}M"),
+            "y_fmt_abs": plt.FuncFormatter(lambda x, _: f"${abs(x)/1e6:,.1f}M"),
+            "fmt_total": lambda v: f"${v/1e6:,.1f}M",
+            "fmt_point": lambda v: f"${v/1e6:,.2f}M",
+            "y_label_bar": (
+                "Market Price × OI × 100  ($, puts shown negative)"
+            ),
+            "y_label_cum": "Cumulative Market Price × OI × 100  ($)",
+            "title_bar": (
+                f"{ticker} {expiration} — Dollar OI per strike  ({scope})"
+            ),
+            "title_cum": (
+                f"{ticker} {expiration} — Cumulative Dollar OI  "
+                f"(calls low→high, puts high→low)  ({scope})"
+            ),
+        }
+    return {
+        "y_fmt_signed": plt.FuncFormatter(lambda x, _: f"{x:,.0f}"),
+        "y_fmt_abs": plt.FuncFormatter(lambda x, _: f"{abs(x):,.0f}"),
+        "fmt_total": lambda v: f"{v:,.0f} contracts",
+        "fmt_point": lambda v: f"{v:,.0f}",
+        "y_label_bar": "Open Interest  (contracts, puts shown negative)",
+        "y_label_cum": "Cumulative Open Interest  (contracts)",
+        "title_bar": (
+            f"{ticker} {expiration} — Open Interest per strike  ({scope})"
+        ),
+        "title_cum": (
+            f"{ticker} {expiration} — Cumulative Open Interest  "
+            f"(calls low→high, puts high→low)  ({scope})"
+        ),
+    }
+
+
+def _bar_width(strikes, fraction=0.8):
+    step = float(np.min(np.diff(strikes))) if len(strikes) > 1 else 1.0
+    if step <= 0:
+        step = 1.0
+    return step * fraction, step
+
+
+def _load_oi_snapshot_df(snapshot_row):
+    """Reconstruct a DataFrame from a stored snapshot.
+
+    Returned columns match what `_prepare_oi_series` expects
+    (``strike_price``, ``option_type``, ``market_price``,
+    ``open_interest``). Returns ``None`` if the snapshot has no strikes.
+    """
+    rows = gex_store.get_strikes(snapshot_row["id"])
+    if not rows:
+        return None
+    data = [
+        {
+            "strike_price": float(r["strike_price"]),
+            "option_type": str(r["option_type"]).lower(),
+            "market_price": (
+                float(r["mark_price"]) if r["mark_price"] is not None else 0.0
+            ),
+            "open_interest": (
+                int(r["open_interest"])
+                if r["open_interest"] is not None
+                else 0
+            ),
+        }
+        for r in rows
+    ]
+    return pd.DataFrame(data)
+
+
+def _local_ts(iso_ts):
+    """Format an ISO-UTC timestamp for a chart title/legend (local wall time)."""
+    if not iso_ts:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso_ts
+
+
 def _render_oi_panel(
     ax,
     *,
@@ -1602,29 +1743,11 @@ def _render_oi_panel(
     """Render one OI panel into a matplotlib axes.
 
     Shared between `oi-value` (single-chart) and `oi-dashboard`
-    (multi-panel). Handles metric-value computation, strike filtering,
-    grouping, bar/cumulative plotting, spot line, and crossing annotation.
-
-    Returns a dict with computed totals so the caller can echo a summary.
+    (multi-panel). Returns a dict with computed totals so the caller
+    can echo a summary.
     """
-    import matplotlib.pyplot as plt
-
-    df = df.copy()
-    if metric == "dollars":
-        df["metric_value"] = (
-            df["market_price"].fillna(0).astype(float)
-            * df["open_interest"].fillna(0).astype(float)
-            * 100.0
-        )
-    else:
-        df["metric_value"] = df["open_interest"].fillna(0).astype(float)
-
-    if range_pct > 0:
-        lo = spot * (1 - range_pct / 100)
-        hi = spot * (1 + range_pct / 100)
-        df = df[(df["strike_price"] >= lo) & (df["strike_price"] <= hi)]
-
-    if df.empty:
+    series = _prepare_oi_series(df, spot, metric, range_pct)
+    if series is None:
         return {
             "empty": True, "strikes_count": 0,
             "total_call": 0.0, "total_put": 0.0,
@@ -1632,65 +1755,17 @@ def _render_oi_panel(
             "fmt_total": lambda v: str(v), "fmt_point": lambda v: str(v),
         }
 
-    calls = (
-        df[df["option_type"].str.upper() == "CALL"]
-        .groupby("strike_price")["metric_value"].sum()
-    )
-    puts = (
-        df[df["option_type"].str.upper() == "PUT"]
-        .groupby("strike_price")["metric_value"].sum()
-    )
-    strikes = sorted(set(calls.index) | set(puts.index))
-    call_vals = [float(calls.get(k, 0.0)) for k in strikes]
-    put_vals_positive = [float(puts.get(k, 0.0)) for k in strikes]
-    put_vals_negative = [-v for v in put_vals_positive]
+    style = _oi_metric_style(metric, ticker, expiration, scope)
+    strikes = series["strikes"]
+    call_vals = series["call_vals"]
+    put_vals_positive = series["put_vals_positive"]
+    put_vals_negative = series["put_vals_negative"]
+    total_call = series["total_call"]
+    total_put = series["total_put"]
+    fmt_total = style["fmt_total"]
+    fmt_point = style["fmt_point"]
 
-    total_call = sum(call_vals)
-    total_put = sum(put_vals_positive)
-
-    strike_step = (
-        float(np.min(np.diff(strikes))) if len(strikes) > 1 else 1.0
-    )
-    if strike_step <= 0:
-        strike_step = 1.0
-    bar_width = strike_step * 0.8
-
-    if metric == "dollars":
-        y_fmt_signed = plt.FuncFormatter(lambda x, _: f"${x/1e6:,.1f}M")
-        y_fmt_abs = plt.FuncFormatter(lambda x, _: f"${abs(x)/1e6:,.1f}M")
-
-        def fmt_total(v: float) -> str:
-            return f"${v/1e6:,.1f}M"
-
-        def fmt_point(v: float) -> str:
-            return f"${v/1e6:,.2f}M"
-
-        y_label_bar = "Market Price × OI × 100  ($, puts shown negative)"
-        y_label_cum = "Cumulative Market Price × OI × 100  ($)"
-        title_bar = f"{ticker} {expiration} — Dollar OI per strike  ({scope})"
-        title_cum = (
-            f"{ticker} {expiration} — Cumulative Dollar OI  "
-            f"(calls low→high, puts high→low)  ({scope})"
-        )
-    else:
-        y_fmt_signed = plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
-        y_fmt_abs = plt.FuncFormatter(lambda x, _: f"{abs(x):,.0f}")
-
-        def fmt_total(v: float) -> str:
-            return f"{v:,.0f} contracts"
-
-        def fmt_point(v: float) -> str:
-            return f"{v:,.0f}"
-
-        y_label_bar = "Open Interest  (contracts, puts shown negative)"
-        y_label_cum = "Cumulative Open Interest  (contracts)"
-        title_bar = (
-            f"{ticker} {expiration} — Open Interest per strike  ({scope})"
-        )
-        title_cum = (
-            f"{ticker} {expiration} — Cumulative Open Interest  "
-            f"(calls low→high, puts high→low)  ({scope})"
-        )
+    bar_width, _ = _bar_width(strikes)
 
     crossing_x, crossing_y = None, None
     if cumulative:
@@ -1736,10 +1811,12 @@ def _render_oi_panel(
                 fontsize=10, fontweight="bold", color="#1f77b4",
             )
         ax.set_xlabel("Strike price ($)")
-        ax.set_ylabel(y_label_cum)
+        ax.set_ylabel(style["y_label_cum"])
         if show_title:
-            ax.set_title(f"{title_cum}\nSpot ${spot:.2f}   ·   {as_of}")
-        ax.yaxis.set_major_formatter(y_fmt_signed)
+            ax.set_title(
+                f"{style['title_cum']}\nSpot ${spot:.2f}   ·   {as_of}"
+            )
+        ax.yaxis.set_major_formatter(style["y_fmt_signed"])
     else:
         ax.bar(
             strikes, call_vals,
@@ -1757,10 +1834,12 @@ def _render_oi_panel(
         )
         ax.axhline(0, color="black", linewidth=0.6)
         ax.set_xlabel("Strike price ($)")
-        ax.set_ylabel(y_label_bar)
+        ax.set_ylabel(style["y_label_bar"])
         if show_title:
-            ax.set_title(f"{title_bar}\nSpot ${spot:.2f}   ·   {as_of}")
-        ax.yaxis.set_major_formatter(y_fmt_abs)
+            ax.set_title(
+                f"{style['title_bar']}\nSpot ${spot:.2f}   ·   {as_of}"
+            )
+        ax.yaxis.set_major_formatter(style["y_fmt_abs"])
 
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
@@ -1772,6 +1851,207 @@ def _render_oi_panel(
         "total_put": total_put,
         "crossing_x": crossing_x,
         "crossing_y": crossing_y,
+        "fmt_total": fmt_total,
+        "fmt_point": fmt_point,
+    }
+
+
+def _render_oi_diff_panel(
+    ax,
+    *,
+    df_old,
+    df_new,
+    ticker,
+    expiration,
+    spot_old,
+    spot_new,
+    old_label,
+    new_label,
+    metric,
+    cumulative,
+    range_pct,
+    scope,
+    show_title=True,
+):
+    """Overlay two snapshots into one panel: old (faded) + new (bold).
+
+    Cumulative panels overlay call/put curves (dashed = old, solid = new).
+    Bar panels use grouped bars — old on the left of each strike center,
+    new on the right — so per-strike deltas are directly visible.
+
+    Returns a dict summarizing both snapshots plus the crossing shift.
+    """
+    # For per-strike alignment we compute both series against the *newer*
+    # spot's window (so both panels show the same strike set). This keeps
+    # the x-axis consistent across old/new even if spot moved a lot.
+    old_series = _prepare_oi_series(df_old, spot_new, metric, range_pct)
+    new_series = _prepare_oi_series(df_new, spot_new, metric, range_pct)
+    if old_series is None or new_series is None:
+        return {"empty": True}
+
+    style = _oi_metric_style(metric, ticker, expiration, scope)
+    fmt_total = style["fmt_total"]
+    fmt_point = style["fmt_point"]
+
+    strikes_union = sorted(
+        set(old_series["strikes"]) | set(new_series["strikes"])
+    )
+    old_calls = old_series["calls_by_strike"]
+    new_calls = new_series["calls_by_strike"]
+    old_puts = old_series["puts_by_strike"]
+    new_puts = new_series["puts_by_strike"]
+
+    old_total_c = old_series["total_call"]
+    old_total_p = old_series["total_put"]
+    new_total_c = new_series["total_call"]
+    new_total_p = new_series["total_put"]
+
+    call_color = "#2ca02c"
+    put_color = "#d62728"
+
+    crossing_old = crossing_new = (None, None)
+
+    if cumulative:
+        call_cum_old = np.cumsum([old_calls.get(k, 0.0) for k in strikes_union])
+        call_cum_new = np.cumsum([new_calls.get(k, 0.0) for k in strikes_union])
+        put_arr_old = np.array(
+            [old_puts.get(k, 0.0) for k in strikes_union]
+        )
+        put_arr_new = np.array(
+            [new_puts.get(k, 0.0) for k in strikes_union]
+        )
+        put_cum_old = np.cumsum(put_arr_old[::-1])[::-1]
+        put_cum_new = np.cumsum(put_arr_new[::-1])[::-1]
+
+        crossing_old = _find_curve_crossing(
+            strikes_union, call_cum_old, put_cum_old
+        )
+        crossing_new = _find_curve_crossing(
+            strikes_union, call_cum_new, put_cum_new
+        )
+
+        ax.step(
+            strikes_union, call_cum_old, where="post", color=call_color,
+            linewidth=1.6, linestyle="--", alpha=0.55,
+            label=(
+                f"Call cum · {old_label}  ({fmt_total(old_total_c)})"
+            ),
+        )
+        ax.step(
+            strikes_union, put_cum_old, where="post", color=put_color,
+            linewidth=1.6, linestyle="--", alpha=0.55,
+            label=(
+                f"Put  cum · {old_label}  ({fmt_total(old_total_p)})"
+            ),
+        )
+        ax.step(
+            strikes_union, call_cum_new, where="post", color=call_color,
+            linewidth=2.4,
+            label=(
+                f"Call cum · {new_label}  ({fmt_total(new_total_c)})"
+            ),
+        )
+        ax.step(
+            strikes_union, put_cum_new, where="post", color=put_color,
+            linewidth=2.4,
+            label=(
+                f"Put  cum · {new_label}  ({fmt_total(new_total_p)})"
+            ),
+        )
+        ax.axvline(
+            spot_old, color="gray", linestyle=":", linewidth=1.2,
+            alpha=0.7,
+            label=f"Spot (old) ${spot_old:.2f}",
+        )
+        ax.axvline(
+            spot_new, color="black", linestyle="--", linewidth=1.4,
+            label=f"Spot (new) ${spot_new:.2f}",
+        )
+        if crossing_new[0] is not None:
+            cx, cy = crossing_new
+            ax.plot(
+                [cx], [cy], marker="o", markersize=8,
+                markerfacecolor="#1f77b4", markeredgecolor="white",
+                markeredgewidth=1.5, zorder=5,
+            )
+            ax.annotate(
+                f"${cx:.2f}",
+                xy=(cx, cy),
+                xytext=(8, 10), textcoords="offset points",
+                fontsize=10, fontweight="bold", color="#1f77b4",
+            )
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel(style["y_label_cum"])
+        if show_title:
+            ax.set_title(
+                f"{style['title_cum']}\n"
+                f"{old_label} → {new_label}"
+            )
+        ax.yaxis.set_major_formatter(style["y_fmt_signed"])
+    else:
+        # Grouped bars: shift old left, new right, each half-width.
+        bar_width, step = _bar_width(strikes_union)
+        half = bar_width / 2.0
+        x = np.array(strikes_union, dtype=float)
+
+        old_call_vals = np.array([old_calls.get(k, 0.0) for k in strikes_union])
+        new_call_vals = np.array([new_calls.get(k, 0.0) for k in strikes_union])
+        old_put_vals = -np.array([old_puts.get(k, 0.0) for k in strikes_union])
+        new_put_vals = -np.array([new_puts.get(k, 0.0) for k in strikes_union])
+
+        ax.bar(
+            x - half / 2, old_call_vals,
+            width=half, color=call_color, alpha=0.35,
+            label=f"Call · {old_label}  ({fmt_total(old_total_c)})",
+        )
+        ax.bar(
+            x + half / 2, new_call_vals,
+            width=half, color=call_color, alpha=0.9,
+            label=f"Call · {new_label}  ({fmt_total(new_total_c)})",
+        )
+        ax.bar(
+            x - half / 2, old_put_vals,
+            width=half, color=put_color, alpha=0.35,
+            label=f"Put · {old_label}  ({fmt_total(old_total_p)})",
+        )
+        ax.bar(
+            x + half / 2, new_put_vals,
+            width=half, color=put_color, alpha=0.9,
+            label=f"Put · {new_label}  ({fmt_total(new_total_p)})",
+        )
+        ax.axvline(
+            spot_old, color="gray", linestyle=":", linewidth=1.2,
+            alpha=0.7,
+            label=f"Spot (old) ${spot_old:.2f}",
+        )
+        ax.axvline(
+            spot_new, color="black", linestyle="--", linewidth=1.4,
+            label=f"Spot (new) ${spot_new:.2f}",
+        )
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_xlabel("Strike price ($)")
+        ax.set_ylabel(style["y_label_bar"])
+        if show_title:
+            ax.set_title(
+                f"{style['title_bar']}\n"
+                f"{old_label} → {new_label}"
+            )
+        ax.yaxis.set_major_formatter(style["y_fmt_abs"])
+
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    return {
+        "empty": False,
+        "strikes_count": len(strikes_union),
+        "old_total_call": old_total_c,
+        "old_total_put": old_total_p,
+        "new_total_call": new_total_c,
+        "new_total_put": new_total_p,
+        "delta_total_call": new_total_c - old_total_c,
+        "delta_total_put": new_total_p - old_total_p,
+        "crossing_old": crossing_old,
+        "crossing_new": crossing_new,
         "fmt_total": fmt_total,
         "fmt_point": fmt_point,
     }
@@ -1804,9 +2084,14 @@ def _render_oi_panel(
     "--refresh-cache", is_flag=True,
     help="Force refresh options-chain cache",
 )
+@click.option(
+    "--no-snapshot", is_flag=True,
+    help="Skip persisting this run to the snapshot DB (default: auto-snapshot).",
+)
 @ensure_logged_in
 def oi_dashboard(
     ticker, expiration, rate, range_pct, out, no_open, no_cache, refresh_cache,
+    no_snapshot,
 ):
     """Three-panel OI dashboard for a single expiration, stacked vertically.
 
@@ -1818,6 +2103,10 @@ def oi_dashboard(
     Same underlying data as three separate `lia oi-value` calls, but
     rendered into one PNG so you can eyeball dollars vs contracts vs
     cumulative pin lines side-by-side.
+
+    Each run is automatically persisted to the snapshot DB so you can
+    later diff two runs with `lia oi-dashboard-diff`. Pass `--no-snapshot`
+    to skip.
     """
     try:
         datetime.strptime(expiration, "%Y-%m-%d")
@@ -1849,6 +2138,10 @@ def oi_dashboard(
     if spot <= 0:
         click.echo("Could not determine spot price.")
         return
+
+    # Propagate the fresh spot back into df.attrs so the snapshot writer
+    # (which reads df.attrs["stock_price"]) records the right value.
+    df.attrs["stock_price"] = spot
 
     cached_at_iso = df.attrs.get("cached_calculated_at")
     cache_age_min = None
@@ -1934,6 +2227,211 @@ def oi_dashboard(
             f"    OI/premium data age: {cache_age_min:,.0f} min "
             f"(cached at {data_as_of_local}){stale_hint}"
         )
+
+    if not no_snapshot:
+        try:
+            sid = _record_greeks_snapshot(df, ticker, expiration, rate)
+            click.echo(f"    📸 Snapshot recorded: {sid}")
+        except Exception as e:
+            click.echo(f"    ⚠️  Snapshot failed: {e}")
+
+    if not no_open:
+        try:
+            import subprocess
+            subprocess.run(["open", out], check=False)
+        except Exception:
+            pass
+
+
+@cli.command("oi-dashboard-diff")
+@click.option(
+    "--ticker", default="SPY", help="Ticker symbol (default: SPY)"
+)
+@click.option(
+    "--expiration", required=True,
+    help="Expiration date YYYY-MM-DD (required)",
+)
+@click.option(
+    "--from", "from_ref", default=None,
+    help="Older snapshot ref: ULID, 'first', 'latest', or N-th-most-recent "
+    "(e.g. 2 = second-most-recent). Defaults to the second-most-recent.",
+)
+@click.option(
+    "--to", "to_ref", default=None,
+    help="Newer snapshot ref (same syntax as --from). Defaults to 'latest'.",
+)
+@click.option(
+    "--range", "range_pct", default=5.0, type=float,
+    help="Only include strikes within +/- N percent of the newer spot "
+    "(default: 5). Pass 0 to include the whole chain.",
+)
+@click.option(
+    "--out", default=None,
+    help="Output PNG path "
+    "(default: plots/oi-dashboard-diff-{ticker}-{expiration}.png)",
+)
+@click.option(
+    "--no-open", is_flag=True, help="Don't auto-open the PNG when done",
+)
+def oi_dashboard_diff(ticker, expiration, from_ref, to_ref, range_pct, out, no_open):
+    """Overlay two `oi-dashboard` snapshots to see what shifted between them.
+
+    Same three panels as `oi-dashboard`, but each panel overlays two
+    point-in-time snapshots:
+
+      • Older = faded (dashed lines / translucent bars)
+      • Newer = bold (solid lines / opaque bars)
+
+    Defaults to comparing the two most recent snapshots for the given
+    (ticker, expiration). Use `--from` and `--to` to pin a specific pair
+    (accepts ULIDs, 'first', 'latest', or N-th-most-recent integers).
+
+    Snapshots come from the DB written by `lia oi-dashboard` and
+    `lia greeks --show-gex`. Run `lia greeks-history` to inspect them.
+    """
+    try:
+        datetime.strptime(expiration, "%Y-%m-%d")
+    except ValueError:
+        click.echo(f"❌ Invalid --expiration '{expiration}'. Use YYYY-MM-DD.")
+        return
+
+    if from_ref is None and to_ref is None:
+        older, newer = gex_store.latest_two(
+            ticker=ticker, expiration_date=expiration
+        )
+        if older is None or newer is None:
+            click.echo(
+                f"❌ Need at least two snapshots for {ticker} {expiration}. "
+                f"Run `lia oi-dashboard` twice first."
+            )
+            return
+    else:
+        newer = _resolve_snapshot_ref(
+            to_ref or "latest", ticker=ticker, expiration=expiration
+        )
+        older = _resolve_snapshot_ref(
+            from_ref or "2", ticker=ticker, expiration=expiration
+        )
+        if newer is None:
+            click.echo(f"❌ Could not resolve --to '{to_ref or 'latest'}'.")
+            return
+        if older is None:
+            click.echo(f"❌ Could not resolve --from '{from_ref or '2'}'.")
+            return
+
+    if older["id"] == newer["id"]:
+        click.echo("❌ --from and --to resolve to the same snapshot.")
+        return
+
+    # Order: older = earlier captured_at, newer = later.
+    if older["captured_at"] > newer["captured_at"]:
+        older, newer = newer, older
+
+    df_old = _load_oi_snapshot_df(older)
+    df_new = _load_oi_snapshot_df(newer)
+    if df_old is None or df_new is None:
+        click.echo("❌ One of the snapshots has no strike rows.")
+        return
+
+    spot_old = float(older["spot_price"])
+    spot_new = float(newer["spot_price"])
+    old_label = f"as of {_local_ts(older['captured_at'])}"
+    new_label = f"as of {_local_ts(newer['captured_at'])}"
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    scope = f"±{range_pct:.0f}% of spot" if range_pct > 0 else "full chain"
+
+    panels = [
+        {"metric": "dollars", "cumulative": True},
+        {"metric": "contracts", "cumulative": False},
+        {"metric": "dollars", "cumulative": False},
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 20), sharex=True)
+    results = []
+    any_empty = False
+    for ax, panel in zip(axes, panels):
+        result = _render_oi_diff_panel(
+            ax, df_old=df_old, df_new=df_new,
+            ticker=ticker, expiration=expiration,
+            spot_old=spot_old, spot_new=spot_new,
+            old_label=old_label, new_label=new_label,
+            metric=panel["metric"], cumulative=panel["cumulative"],
+            range_pct=range_pct, scope=scope, show_title=True,
+        )
+        results.append(result)
+        if result.get("empty"):
+            any_empty = True
+
+    if any_empty:
+        click.echo(
+            f"No strikes within ±{range_pct}% of ${spot_new:.2f}. "
+            "Try a larger --range."
+        )
+        plt.close(fig)
+        return
+
+    minutes_between = _iso_diff_minutes(
+        older["captured_at"], newer["captured_at"]
+    )
+    span = ""
+    if minutes_between is not None:
+        if minutes_between >= 60 * 24:
+            span = f" ({minutes_between / (60 * 24):,.1f} days apart)"
+        elif minutes_between >= 60:
+            span = f" ({minutes_between / 60:,.1f} hours apart)"
+        else:
+            span = f" ({minutes_between:,.0f} min apart)"
+
+    fig.suptitle(
+        f"{ticker} {expiration} — OI Dashboard Diff   ·   "
+        f"{_local_ts(older['captured_at'])} → "
+        f"{_local_ts(newer['captured_at'])}{span}",
+        fontsize=14, fontweight="bold", y=0.995,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.985))
+
+    if not out:
+        os.makedirs("plots", exist_ok=True)
+        out = f"plots/oi-dashboard-diff-{ticker}-{expiration}.png"
+    plt.savefig(out, dpi=120)
+    plt.close(fig)
+
+    click.echo(f"📊 Saved: {out}")
+    click.echo(
+        f"    Old: {older['id']}  ({_local_ts(older['captured_at'])})  "
+        f"spot ${spot_old:.2f}"
+    )
+    click.echo(
+        f"    New: {newer['id']}  ({_local_ts(newer['captured_at'])})  "
+        f"spot ${spot_new:.2f}   Δspot {spot_new - spot_old:+.2f}"
+    )
+    labels = ["Dollar cum", "Contracts bar", "Dollar bar"]
+    for label, result in zip(labels, results):
+        fmt = result["fmt_total"]
+        click.echo(
+            f"    {label:<14} | "
+            f"Call {fmt(result['old_total_call'])} → "
+            f"{fmt(result['new_total_call'])} "
+            f"(Δ {fmt(result['delta_total_call'])})   |   "
+            f"Put  {fmt(result['old_total_put'])} → "
+            f"{fmt(result['new_total_put'])} "
+            f"(Δ {fmt(result['delta_total_put'])})"
+        )
+
+    cum_res = results[0]
+    old_cx, old_cy = cum_res["crossing_old"]
+    new_cx, new_cy = cum_res["crossing_new"]
+    if old_cx is not None and new_cx is not None:
+        click.echo(
+            f"    Crossing strike (dollar cum): "
+            f"${old_cx:.2f} → ${new_cx:.2f}   "
+            f"(Δ {new_cx - old_cx:+.2f})"
+        )
+
     if not no_open:
         try:
             import subprocess

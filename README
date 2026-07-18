@@ -67,5 +67,20 @@ UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14
 # Wider range on the cumulative
 UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --cumulative --range 10
 
+
+UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-14 --cumulative
 UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-20 --metric contracts
 UV_NATIVE_TLS=true uv run lia oi-value --ticker SPY --expiration 2026-07-20 --metric dollars
+
+
+UV_NATIVE_TLS=true uv run lia oi-dashboard --ticker SPY --expiration 2026-07-24
+
+
+# Now (Saturday-ish):
+UV_NATIVE_TLS=true uv run lia oi-dashboard --ticker SPY --expiration 2026-07-24
+
+# ...market moves Mon-Wed, run whenever...
+UV_NATIVE_TLS=true uv run lia oi-dashboard --ticker SPY --expiration 2026-07-24 --refresh-cache
+
+# Compare the two:
+UV_NATIVE_TLS=true uv run lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
