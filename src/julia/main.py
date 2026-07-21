@@ -1687,6 +1687,33 @@ def _bar_width(strikes, fraction=0.8):
     return step * fraction, step
 
 
+def _apply_strike_ticks(ax, strikes):
+    """Set finer x-axis ticks so individual strikes are easy to read.
+
+    Chooses major/minor tick intervals based on the strike step so any
+    strike price can be located without counting bars. Draws a faint
+    dotted grid at the minor gridlines so the chart still reads clean.
+    """
+    from matplotlib.ticker import MultipleLocator
+
+    if len(strikes) < 2:
+        return
+    step = float(np.min(np.diff(strikes)))
+    if step <= 0:
+        return
+    if step <= 1:
+        major, minor = 5, 1
+    elif step <= 2.5:
+        major, minor = 10, step
+    else:
+        major, minor = step * 5, step
+    ax.xaxis.set_major_locator(MultipleLocator(major))
+    ax.xaxis.set_minor_locator(MultipleLocator(minor))
+    ax.grid(True, which="major", alpha=0.3)
+    ax.grid(True, which="minor", alpha=0.15, linestyle=":")
+    ax.tick_params(axis="x", which="minor", length=3)
+
+
 def _load_oi_snapshot_df(snapshot_row):
     """Reconstruct a DataFrame from a stored snapshot.
 
@@ -1842,7 +1869,7 @@ def _render_oi_panel(
         ax.yaxis.set_major_formatter(style["y_fmt_abs"])
 
     ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
+    _apply_strike_ticks(ax, strikes)
 
     return {
         "empty": False,
@@ -2039,7 +2066,7 @@ def _render_oi_diff_panel(
         ax.yaxis.set_major_formatter(style["y_fmt_abs"])
 
     ax.legend(loc="upper left", fontsize=8)
-    ax.grid(True, alpha=0.3)
+    _apply_strike_ticks(ax, strikes_union)
 
     return {
         "empty": False,

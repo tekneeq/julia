@@ -46,6 +46,9 @@ ENV/
 # Options cache
 .options_cache/
 
+# Batch job logs (scripts/oi_batch.py etc.)
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

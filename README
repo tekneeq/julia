@@ -113,9 +113,11 @@ lia oi-dashboard --ticker SPY --expiration 2026-07-24
 
 # Monday close — records snapshot B
 lia oi-dashboard --ticker SPY --expiration 2026-07-24 --refresh-cache
+UV_NATIVE_TLS=true uv run lia oi-dashboard --ticker SPY --expiration 2026-07-24 --refresh-cache
 
 # Default diff = B vs A, no flags needed:
 lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
+UV_NATIVE_TLS=true uv run lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24 
 
 
 --from / --to ref types accepted by oi-dashboard-diff:
@@ -126,3 +128,18 @@ lia oi-dashboard-diff --ticker SPY --expiration 2026-07-24
 | first           | The oldest snapshot ever recorded for that ticker+expiration          |
 | A number (N)    | N-th most recent (1 = latest, 2 = second-most-recent, ...)            |
 | A full ULID     | Direct lookup by ID (copy from `greeks-history`)                      |
+
+
+# Batch oi-dashboard across a date range (skips weekends, runs in parallel)
+# Every business day in the range, SPY only, 4 workers
+./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31
+
+# Multiple tickers, more workers, custom flags forwarded to lia
+./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31 \
+    --tickers SPY,QQQ,IWM --workers 6 --extra "--range 10"
+
+# Preview commands without executing
+./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31 --dry-run
+
+# Skip --refresh-cache if you just want to (re)plot from cached chain
+./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31 --no-refresh-cache
