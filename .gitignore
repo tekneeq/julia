@@ -49,6 +49,9 @@ ENV/
 # Batch job logs (scripts/oi_batch.py etc.)
 logs/
 
+# Generated chart output (oi-value, oi-dashboard, oi-dashboard-diff, ...)
+plots/
+
 # OS
 .DS_Store
 Thumbs.db

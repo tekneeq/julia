@@ -156,7 +156,10 @@ def main() -> int:
     args = p.parse_args()
 
     if args.start > args.end:
-        p.error("--from must be <= --to")
+        p.error(
+            f"--from ({args.start.isoformat()}) must be <= "
+            f"--to ({args.end.isoformat()}). Check for a year typo."
+        )
 
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     dates = list(
