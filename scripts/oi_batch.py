@@ -80,7 +80,7 @@ def _run_one(
     refresh_cache: bool,
     extra: list[str],
     log_dir: str | None,
-) -> tuple[str, date, int, float, str]:
+) -> tuple[str, date, int, float, str, str | None]:
     cmd = _build_cmd(ticker, exp, refresh_cache, extra)
     env = os.environ.copy()
     env.setdefault("UV_NATIVE_TLS", "true")
@@ -97,7 +97,18 @@ def _run_one(
             f.write(f"$ {' '.join(shlex.quote(x) for x in cmd)}\n\n")
             f.write(combined)
 
-    return ticker, exp, result.returncode, elapsed, combined
+    saved_path = _extract_saved_path(combined)
+    return ticker, exp, result.returncode, elapsed, combined, saved_path
+
+
+def _extract_saved_path(text: str) -> str | None:
+    """Pull the PNG path out of a `📊 Saved: plots/...png` line."""
+    marker = "Saved:"
+    for line in text.splitlines():
+        idx = line.find(marker)
+        if idx != -1:
+            return line[idx + len(marker):].strip()
+    return None
 
 
 def _last_meaningful_line(text: str) -> str:
@@ -208,9 +219,12 @@ def main() -> int:
             for t, d in jobs
         }
         for fut in concurrent.futures.as_completed(futures):
-            ticker, exp, rc, elapsed, out = fut.result()
+            ticker, exp, rc, elapsed, out, saved_path = fut.result()
             status = "OK  " if rc == 0 else f"FAIL({rc})"
-            summary = _last_meaningful_line(out)
+            if rc == 0 and saved_path:
+                summary = f"→ {saved_path}"
+            else:
+                summary = _last_meaningful_line(out)
             print(
                 f"[{status}] {ticker} {exp}  "
                 f"({elapsed:5.1f}s)  {summary}"
