@@ -216,7 +216,7 @@ newgrp docker                       # activate the group in THIS shell now
 docker ps                           # should work without sudo
 
 git pull
-docker build -t julia-dashboard:latest .
+sudo docker build -t julia-dashboard:latest .
 
 sudo docker rm -f julia-dashboard 2>/dev/null
 sudo docker run -d \
@@ -234,3 +234,44 @@ sudo docker logs -f julia-dashboard
 sudo docker stop julia-dashboard
 # Full restart
 sudo docker restart julia-dashboard
+
+
+
+
+cd ~/julia
+git pull                                        # get the file change
+sudo docker build -t julia-dashboard:latest .   # rebuild image
+sudo docker rm -f julia-dashboard               # stop old container
+sudo docker run -d --name julia-dashboard --restart unless-stopped \
+    -p 8501:8501 \
+    -v $(pwd)/.options_cache:/app/.options_cache \
+    -v $(pwd)/plots:/app/plots \
+    -v $(pwd)/logs:/app/logs \
+    -v $(pwd)/.tokens:/root/.tokens \
+    --env-file .env \
+    julia-dashboard:latest
+
+http://54.91.65.71:8501/
+
+
+sudo docker exec julia-dashboard uv run lia oi-dashboard --ticker SPY --expiration 2026-07-27
+sudo docker exec julia-dashboard uv run python scripts/oi_batch.py --rolling-days 5 --tickers SPY --refresh-cache
+
++++
+sudo crontab -e
+
+
+TZ=America/New_York
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Every 30 min, market hours, weekdays. Fresh Robinhood pull every time.
+0,30 9-16 * * 1-5  cd /home/ec2-user/julia && /usr/bin/docker exec julia-dashboard uv run python scripts/oi_batch.py --rolling-days 5 --tickers SPY >> /home/ec2-user/julia/logs/cron-oi-batch.log 2>&1
+
+# One extra run 5 min after close (redundant flag, but explicit)
+5 16 * * 1-5       cd /home/ec2-user/julia && /usr/bin/docker exec julia-dashboard uv run python scripts/oi_batch.py --rolling-days 5 --tickers SPY --refresh-cache >> /home/ec2-user/julia/logs/cron-oi-batch.log 2>&1
+
+
+sudo crontab -l                    # should show the entries above
+ls -la /home/ec2-user/julia/logs/  # cron-oi-batch.log will appear after the first fire
++++
