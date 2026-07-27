@@ -153,36 +153,30 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
             "Run **oi-dashboard** at least once to seed the history."
         )
         return
-    if len(history) < 2:
-        h = history[0]
-        st.info(
-            f"Only 1 snapshot so far for {ticker} {expiration.isoformat()} "
-            f"(crossing $ {h['crossing_strike']:.2f} at "
-            f"{h['captured_at_local'].strftime('%Y-%m-%d %H:%M')}). "
-            f"Run oi-dashboard again to plot movement."
-        )
-        return
 
     ts = [h["captured_at_local"] for h in history]
     cross = [h["crossing_strike"] for h in history]
     spot = [h["spot_price"] for h in history]
+    single = len(history) == 1
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=ts, y=cross, mode="lines+markers",
+        x=ts, y=cross,
+        mode="markers" if single else "lines+markers",
         name="Crossing strike",
         line=dict(color="#1f77b4", width=2.5),
-        marker=dict(size=8),
+        marker=dict(size=12 if single else 8, color="#1f77b4"),
         hovertemplate=(
             "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
             "Crossing: <b>$%{y:.2f}</b><extra></extra>"
         ),
     ))
     fig.add_trace(go.Scatter(
-        x=ts, y=spot, mode="lines+markers",
+        x=ts, y=spot,
+        mode="markers" if single else "lines+markers",
         name="Spot",
         line=dict(color="#111", dash="dash", width=1.5),
-        marker=dict(size=6, symbol="circle-open"),
+        marker=dict(size=10 if single else 6, symbol="circle-open", color="#111"),
         hovertemplate=(
             "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
             "Spot: <b>$%{y:.2f}</b><extra></extra>"
@@ -193,16 +187,24 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
     delta_cross = last["crossing_strike"] - first["crossing_strike"]
     delta_spot = last["spot_price"] - first["spot_price"]
     span_min = (last["captured_at_utc"] - first["captured_at_utc"]).total_seconds() / 60
-    span_str = (
-        f"{span_min / 60 / 24:.1f} days" if span_min >= 60 * 24
-        else f"{span_min / 60:.1f} hours" if span_min >= 60
-        else f"{span_min:.0f} min"
-    )
+    if single:
+        span_str = "single snapshot"
+    else:
+        span_str = (
+            f"{span_min / 60 / 24:.1f} days" if span_min >= 60 * 24
+            else f"{span_min / 60:.1f} hours" if span_min >= 60
+            else f"{span_min:.0f} min"
+        )
 
-    fig.update_layout(
+    # With a single point, Plotly's autorange picks a tiny window and the
+    # dot floats in the middle of nowhere. Pad the y-axis so the dot + spot
+    # sit at a sensible scale, and widen the x-axis so it doesn't look like
+    # the chart is broken.
+    layout_kwargs: dict = dict(
         title=(
             f"{ticker} {expiration.isoformat()} — crossing strike over time  "
-            f"·  {len(history)} snapshots over {span_str}"
+            f"·  {len(history)} snapshot{'s' if len(history) != 1 else ''} "
+            f"over {span_str}"
         ),
         xaxis_title="Snapshot time (local)",
         yaxis_title="Strike ($)",
@@ -211,21 +213,33 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
         legend=dict(orientation="h", y=1.08, x=0),
         margin=dict(t=60, l=60, r=20, b=40),
     )
+    if single:
+        t0 = ts[0]
+        layout_kwargs["xaxis"] = dict(
+            range=[t0 - timedelta(hours=6), t0 + timedelta(hours=6)],
+        )
+        lo = min(cross[0], spot[0])
+        hi = max(cross[0], spot[0])
+        pad = max((hi - lo) * 2.0, 2.0)
+        layout_kwargs["yaxis"] = dict(range=[lo - pad, hi + pad])
+
+    fig.update_layout(**layout_kwargs)
     fig.update_yaxes(tickformat="$.2f")
 
     st.plotly_chart(fig, use_container_width=True)
+
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         st.metric(
             "Latest crossing",
             f"${last['crossing_strike']:.2f}",
-            f"{delta_cross:+.2f} vs first",
+            None if single else f"{delta_cross:+.2f} vs first",
         )
     with col_b:
         st.metric(
             "Latest spot",
             f"${last['spot_price']:.2f}",
-            f"{delta_spot:+.2f} vs first",
+            None if single else f"{delta_spot:+.2f} vs first",
         )
     with col_c:
         gap = last["crossing_strike"] - last["spot_price"]
@@ -236,6 +250,11 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
                 "Positive = the pin/max-pain magnet is above spot; "
                 "negative = below."
             ),
+        )
+    if single:
+        st.caption(
+            "Only one snapshot so far — run `oi-dashboard` again "
+            "(or the batch) to start seeing movement over time."
         )
 
 
