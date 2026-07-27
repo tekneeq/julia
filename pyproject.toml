@@ -22,35 +22,60 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "chromadb>=1.3.4",
     "click>=8.1.8",
-    "discord>=2.3.2",
     "markupsafe==3.0.2",
     "matplotlib>=3.11.0",
     "numpy>=2.0.2",
-    "openai>=2.7.2",
     "pandas>=2.2.3",
-    "praw>=7.8.1",
-    "pydub>=0.25.1",
     "python-dotenv>=1.1.0",
     "robin-stocks>=3.4.0",
     "ruff>=0.11.11",
     "scipy>=1.13.1",
-    "simpleaudio>=1.0.4",
     "sk>=0.0.1",
     "streamlit>=1.60.0",
     "streamlit-autorefresh>=1.0.1",
     "ulid-py>=1.1.0",
 ]
 
+# Optional dep groups — the `lia` CLI + Streamlit dashboard core need
+# none of these. Install locally with `uv sync --extra <group>` (or
+# `--all-extras`). Kept optional so servers on older glibc (Amazon
+# Linux 2, etc.) can install a slim core without hitting native-wheel
+# platform mismatches.
 [project.optional-dependencies]
-# `torcher_knn.py` / `torcher_linear.py` — experimental ML scripts only.
-# The `lia` CLI and Streamlit dashboard do NOT need these.
-# Install locally with:  uv sync --extra ml
+# torcher_knn.py / torcher_linear.py — experimental ML scripts.
 ml = [
     "torch>=2.9.0",
     "torchaudio>=2.9.0",
     "torchvision>=0.24.0",
+]
+# openaier.py — LLM/RAG features (chromadb pulls onnxruntime, which
+# needs glibc >= 2.27).
+llm = [
+    "chromadb>=1.3.4",
+    "openai>=2.7.2",
+]
+# song_maker.py / bass_song_maker.py — audio synthesis.
+audio = [
+    "pydub>=0.25.1",
+    "simpleaudio>=1.0.4",
+]
+# discorder.py / redder.py — Discord + Reddit bot integrations.
+chat = [
+    "discord>=2.3.2",
+    "praw>=7.8.1",
+]
+# Convenience — pull everything in one go.
+all = [
+    "torch>=2.9.0",
+    "torchaudio>=2.9.0",
+    "torchvision>=0.24.0",
+    "chromadb>=1.3.4",
+    "openai>=2.7.2",
+    "pydub>=0.25.1",
+    "simpleaudio>=1.0.4",
+    "discord>=2.3.2",
+    "praw>=7.8.1",
 ]
 
 [project.scripts]
