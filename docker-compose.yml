@@ -1,0 +1,15 @@
+services:
+  dashboard:
+    build: .
+    image: julia-dashboard:latest
+    container_name: julia-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persist SQLite DB, generated PNGs, and batch logs on the host.
+      - ./.options_cache:/app/.options_cache
+      - ./plots:/app/plots
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    restart: unless-stopped

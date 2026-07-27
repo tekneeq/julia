@@ -159,5 +159,49 @@ UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 # Then open http://localhost:8501 in your browser.
 
+
+# -----------------------------------------------------------------------------
+# Docker (recommended for EC2 / older-glibc hosts)
+# -----------------------------------------------------------------------------
+# Amazon Linux 2 (glibc 2.26) doesn't have wheels for modern pyarrow, torch,
+# onnxruntime, etc. Running the dashboard in a Docker container sidesteps the
+# host glibc entirely. The image is based on Debian 12 (glibc 2.36).
+
+# One-time install of Docker on Amazon Linux 2:
+sudo yum update -y
+sudo amazon-linux-extras install docker -y
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+# log out & back in so the group takes effect
+
+# Build & run with docker compose (uses ./docker-compose.yml)
+docker compose up --build -d
+
+# Or plain docker (equivalent):
+docker build -t julia-dashboard:latest .
+docker run --rm -it \
+    -p 8501:8501 \
+    -v $(pwd)/.options_cache:/app/.options_cache \
+    -v $(pwd)/plots:/app/plots \
+    -v $(pwd)/logs:/app/logs \
+    --env-file .env \
+    julia-dashboard:latest
+
+# Then open http://<ec2-public-ip>:8501/ in your browser.
+# Don't forget to allow TCP 8501 in the EC2 security group inbound rules.
+
+# Tail dashboard logs
+docker compose logs -f dashboard
+
+# Stop & remove container
+docker compose down
+
+# One-off CLI inside the container (e.g., check history)
+docker compose exec dashboard uv run lia greeks-history --ticker SPY --limit 10
+
+# Force a fresh batch run inside the container (bypassing the button)
+docker compose exec dashboard ./scripts/oi_batch.py \
+    --from 2026-07-27 --to 2026-07-31 --tickers SPY
+
 UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py \
     --server.address 0.0.0.0 --server.port 8501
