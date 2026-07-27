@@ -1241,10 +1241,14 @@ dependencies = [
     { name = "sk" },
     { name = "streamlit" },
     { name = "streamlit-autorefresh" },
+    { name = "ulid-py" },
+]
+
+[package.optional-dependencies]
+ml = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
-    { name = "ulid-py" },
 ]
 
 [package.metadata]
@@ -1267,11 +1271,12 @@ requires-dist = [
     { name = "sk", specifier = ">=0.0.1" },
     { name = "streamlit", specifier = ">=1.60.0" },
     { name = "streamlit-autorefresh", specifier = ">=1.0.1" },
-    { name = "torch", specifier = ">=2.9.0" },
-    { name = "torchaudio", specifier = ">=2.9.0" },
-    { name = "torchvision", specifier = ">=0.24.0" },
+    { name = "torch", marker = "extra == 'ml'", specifier = ">=2.9.0" },
+    { name = "torchaudio", marker = "extra == 'ml'", specifier = ">=2.9.0" },
+    { name = "torchvision", marker = "extra == 'ml'", specifier = ">=0.24.0" },
     { name = "ulid-py", specifier = ">=1.1.0" },
 ]
+provides-extras = ["ml"]
 
 [[package]]
 name = "kiwisolver"

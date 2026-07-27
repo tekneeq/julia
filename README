@@ -158,3 +158,6 @@ lia oi-dashboard-diff --ticker SPY --expiration 2026-07-28
 UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 # Then open http://localhost:8501 in your browser.
+
+UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py \
+    --server.address 0.0.0.0 --server.port 8501

@@ -40,10 +40,17 @@ dependencies = [
     "sk>=0.0.1",
     "streamlit>=1.60.0",
     "streamlit-autorefresh>=1.0.1",
+    "ulid-py>=1.1.0",
+]
+
+[project.optional-dependencies]
+# `torcher_knn.py` / `torcher_linear.py` — experimental ML scripts only.
+# The `lia` CLI and Streamlit dashboard do NOT need these.
+# Install locally with:  uv sync --extra ml
+ml = [
     "torch>=2.9.0",
     "torchaudio>=2.9.0",
     "torchvision>=0.24.0",
-    "ulid-py>=1.1.0",
 ]
 
 [project.scripts]
