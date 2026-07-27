@@ -152,9 +152,11 @@ UV_NATIVE_TLS=true uv run lia oi-dashboard-diff --ticker SPY --expiration 2026-0
 lia oi-dashboard-diff --ticker SPY --expiration 2026-07-28
 
 
-# Live Streamlit dashboard: auto-computes today → +5 business days,
-# auto-refreshes every 30s, "Run batch now" button spawns oi_batch in
-# the background so PNGs appear as each date finishes.
+# Live Streamlit dashboard:
+#   • Interactive Plotly time series of the crossing strike per expiration
+#     (see how the positioning "pin" drifts over time as new snapshots arrive)
+#   • Latest 3-panel oi-dashboard PNGs
+#   • Auto-refresh every 30s, or manual "▶ Run batch" button in the sidebar
 UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 # Then open http://localhost:8501 in your browser.

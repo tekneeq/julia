@@ -18,16 +18,29 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLOTS_DIR = REPO_ROOT / "plots"
 BATCH_SCRIPT = REPO_ROOT / "scripts" / "oi_batch.py"
+
+# Reuse the private helpers from `julia.main` so the crossing math
+# matches exactly what the PNG dashboard shows.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from julia import gex_store  # noqa: E402
+from julia.main import (  # noqa: E402
+    _find_curve_crossing,
+    _load_oi_snapshot_df,
+    _prepare_oi_series,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,148 @@ def _age_str(path: Path) -> str:
     if secs < 86400:
         return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
     return f"{secs // 86400}d ago"
+
+
+# ---------------------------------------------------------------------------
+# Crossing-strike time series
+# ---------------------------------------------------------------------------
+
+def _parse_utc(iso_ts: str) -> datetime:
+    return datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+
+
+def _crossing_history(ticker: str, expiration: date) -> list[dict]:
+    """For each snapshot of (ticker, expiration), compute the cumulative
+    dollar-OI crossing strike and pair it with the spot at that moment.
+
+    Returns a list of dicts sorted oldest → newest so plotting is a
+    straight time series. Skips snapshots that don't have enough data to
+    compute a crossing (e.g. one-sided chains).
+    """
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration.isoformat(), limit=500
+    )
+    if not rows:
+        return []
+
+    history: list[dict] = []
+    for r in rows:
+        df = _load_oi_snapshot_df(r)
+        if df is None or df.empty:
+            continue
+        spot = float(r["spot_price"])
+        series = _prepare_oi_series(df, spot=spot, metric="dollars", range_pct=0)
+        if series is None:
+            continue
+        call_cum = np.cumsum(series["call_vals"])
+        put_arr = np.array(series["put_vals_positive"])
+        put_cum = np.cumsum(put_arr[::-1])[::-1]
+        cx, cy = _find_curve_crossing(series["strikes"], call_cum, put_cum)
+        if cx is None:
+            continue
+        history.append({
+            "captured_at_utc": _parse_utc(r["captured_at"]),
+            "captured_at_local": _parse_utc(r["captured_at"]).astimezone(),
+            "crossing_strike": float(cx),
+            "crossing_dollars": float(cy) if cy is not None else None,
+            "spot_price": spot,
+        })
+
+    history.sort(key=lambda h: h["captured_at_utc"])
+    return history
+
+
+def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -> None:
+    if not history:
+        st.info(
+            f"No snapshots yet for {ticker} {expiration.isoformat()}. "
+            "Run **oi-dashboard** at least once to seed the history."
+        )
+        return
+    if len(history) < 2:
+        h = history[0]
+        st.info(
+            f"Only 1 snapshot so far for {ticker} {expiration.isoformat()} "
+            f"(crossing $ {h['crossing_strike']:.2f} at "
+            f"{h['captured_at_local'].strftime('%Y-%m-%d %H:%M')}). "
+            f"Run oi-dashboard again to plot movement."
+        )
+        return
+
+    ts = [h["captured_at_local"] for h in history]
+    cross = [h["crossing_strike"] for h in history]
+    spot = [h["spot_price"] for h in history]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ts, y=cross, mode="lines+markers",
+        name="Crossing strike",
+        line=dict(color="#1f77b4", width=2.5),
+        marker=dict(size=8),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "Crossing: <b>$%{y:.2f}</b><extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=ts, y=spot, mode="lines+markers",
+        name="Spot",
+        line=dict(color="#111", dash="dash", width=1.5),
+        marker=dict(size=6, symbol="circle-open"),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "Spot: <b>$%{y:.2f}</b><extra></extra>"
+        ),
+    ))
+
+    first, last = history[0], history[-1]
+    delta_cross = last["crossing_strike"] - first["crossing_strike"]
+    delta_spot = last["spot_price"] - first["spot_price"]
+    span_min = (last["captured_at_utc"] - first["captured_at_utc"]).total_seconds() / 60
+    span_str = (
+        f"{span_min / 60 / 24:.1f} days" if span_min >= 60 * 24
+        else f"{span_min / 60:.1f} hours" if span_min >= 60
+        else f"{span_min:.0f} min"
+    )
+
+    fig.update_layout(
+        title=(
+            f"{ticker} {expiration.isoformat()} — crossing strike over time  "
+            f"·  {len(history)} snapshots over {span_str}"
+        ),
+        xaxis_title="Snapshot time (local)",
+        yaxis_title="Strike ($)",
+        height=380,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(t=60, l=60, r=20, b=40),
+    )
+    fig.update_yaxes(tickformat="$.2f")
+
+    st.plotly_chart(fig, use_container_width=True)
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric(
+            "Latest crossing",
+            f"${last['crossing_strike']:.2f}",
+            f"{delta_cross:+.2f} vs first",
+        )
+    with col_b:
+        st.metric(
+            "Latest spot",
+            f"${last['spot_price']:.2f}",
+            f"{delta_spot:+.2f} vs first",
+        )
+    with col_c:
+        gap = last["crossing_strike"] - last["spot_price"]
+        st.metric(
+            "Crossing − spot (now)",
+            f"{gap:+.2f}",
+            help=(
+                "Positive = the pin/max-pain magnet is above spot; "
+                "negative = below."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +379,40 @@ elif batch_state == "failed":
 st.caption(
     f"Dashboard view refreshed at "
     f"**{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}** "
-    f"(local). PNGs are re-read from disk on every refresh."
+    f"(local). Charts + PNGs are re-read from the DB / disk on every refresh."
 )
 
 # ---------------------------------------------------------------------------
-# PNG grid
+# Crossing-strike time series (interactive, one per ticker × expiration)
 # ---------------------------------------------------------------------------
+st.divider()
+st.header("📈 Crossing strike over time")
+st.caption(
+    "Where the cumulative-dollar call and put curves cross — the "
+    "positioning-weighted 'pin' strike. Each `oi-dashboard` run adds a "
+    "point. Watch for drift: crossing moving toward or away from spot."
+)
+
+for ticker in tickers:
+    if not exps:
+        continue
+    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
+    for tab, exp in zip(tabs, exps):
+        with tab:
+            st.markdown(f"**{ticker} · {exp.isoformat()}**")
+            history = _crossing_history(ticker, exp)
+            _render_crossing_chart(ticker, exp, history)
+
+# ---------------------------------------------------------------------------
+# PNG grid (the three-panel dashboard as static images for now)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🖼 Latest dashboard PNGs")
+st.caption(
+    "The full 3-panel `oi-dashboard` snapshots as generated by `oi_batch.py`. "
+    "Interactive Plotly versions of these panels are a natural next step."
+)
+
 for ticker in tickers:
     st.subheader(f"{ticker}")
     if not exps:
