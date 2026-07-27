@@ -10,6 +10,9 @@ Examples
     # Every business day, Mon 07/27 → Fri 07/31, SPY only, refresh cache
     ./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31
 
+    # Rolling next-5-business-days window (great for cron — no hard-coded dates)
+    ./scripts/oi_batch.py --rolling-days 5 --tickers SPY
+
     # Multiple tickers, same date range, more parallelism
     ./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31 \\
         --tickers SPY,QQQ,IWM --workers 8
@@ -57,6 +60,21 @@ def _daterange(start: date, end: date, *, include_weekends: bool):
         if include_weekends or d.weekday() < 5:  # Mon=0..Fri=4
             yield d
         d += timedelta(days=1)
+
+
+def _next_business_day(d: date) -> date:
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _add_business_days(d: date, n: int) -> date:
+    """Return the date `n` business days after `d` (n=0 → d itself)."""
+    while n > 0:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n -= 1
+    return d
 
 
 def _build_cmd(
@@ -125,12 +143,20 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--from", dest="start", type=_parse_date, required=True,
-        help="Start expiration date, YYYY-MM-DD (inclusive).",
+        "--from", dest="start", type=_parse_date,
+        help="Start expiration date, YYYY-MM-DD (inclusive). "
+             "Required unless --rolling-days is given.",
     )
     p.add_argument(
-        "--to", dest="end", type=_parse_date, required=True,
-        help="End expiration date, YYYY-MM-DD (inclusive).",
+        "--to", dest="end", type=_parse_date,
+        help="End expiration date, YYYY-MM-DD (inclusive). "
+             "Required unless --rolling-days is given.",
+    )
+    p.add_argument(
+        "--rolling-days", type=int, default=None,
+        help="Auto-compute the date range as [today (or next business "
+             "day if weekend), + N business days]. Ideal for cron so you "
+             "never hard-code dates. Overrides --from/--to.",
     )
     p.add_argument(
         "--tickers", default="SPY",
@@ -165,6 +191,18 @@ def main() -> int:
              "e.g. --extra '--range 10 --rate 0.03'",
     )
     args = p.parse_args()
+
+    if args.rolling_days is not None:
+        if args.rolling_days < 1:
+            p.error("--rolling-days must be >= 1.")
+        args.start = _next_business_day(date.today())
+        args.end = _add_business_days(args.start, args.rolling_days - 1)
+        print(
+            f"Rolling window: --rolling-days {args.rolling_days} → "
+            f"{args.start.isoformat()} .. {args.end.isoformat()}"
+        )
+    elif args.start is None or args.end is None:
+        p.error("Either --rolling-days N, or both --from and --to, are required.")
 
     if args.start > args.end:
         p.error(
