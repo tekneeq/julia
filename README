@@ -143,3 +143,18 @@ UV_NATIVE_TLS=true uv run lia oi-dashboard-diff --ticker SPY --expiration 2026-0
 
 # Skip --refresh-cache if you just want to (re)plot from cached chain
 ./scripts/oi_batch.py --from 2026-07-27 --to 2026-07-31 --no-refresh-cache
+
+
+# nightly, near market close
+./scripts/oi_batch.py --from $(date -j -f "%Y-%m-%d" "$(date +%Y-%m-%d)" +%Y-%m-%d) --to 2026-08-14
+
+# next morning, spot changes overnight
+lia oi-dashboard-diff --ticker SPY --expiration 2026-07-28
+
+
+# Live Streamlit dashboard: auto-computes today → +5 business days,
+# auto-refreshes every 30s, "Run batch now" button spawns oi_batch in
+# the background so PNGs appear as each date finishes.
+UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
+
+# Then open http://localhost:8501 in your browser.
