@@ -255,7 +255,7 @@ http://54.91.65.71:8501/
 
 
 sudo docker exec julia-dashboard uv run lia oi-dashboard --ticker SPY --expiration 2026-07-27
-sudo docker exec julia-dashboard uv run python scripts/oi_batch.py --rolling-days 5 --tickers SPY --refresh-cache
+sudo docker exec julia-dashboard uv run python scripts/oi_batch.py --rolling-days 5 --tickers SPY --workers 1 --refresh-cache
 
 +++
 sudo crontab -e
