@@ -105,9 +105,16 @@ def _parse_utc(iso_ts: str) -> datetime:
     return datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
 
 
-def _crossing_history(ticker: str, expiration: date) -> list[dict]:
+def _crossing_history(
+    ticker: str, expiration: date, range_pct: float = 5.0,
+) -> list[dict]:
     """For each snapshot of (ticker, expiration), compute the cumulative
     dollar-OI crossing strike and pair it with the spot at that moment.
+
+    ``range_pct`` MUST match what the PNG uses (default 5.0 = ±5% of
+    spot) or the values won't line up. Passing ``0`` includes the whole
+    chain — which lets deep-OTM long-tail OI dominate the crossing and
+    produces a wildly different (and much less meaningful) number.
 
     Returns a list of dicts sorted oldest → newest so plotting is a
     straight time series. Skips snapshots that don't have enough data to
@@ -125,7 +132,9 @@ def _crossing_history(ticker: str, expiration: date) -> list[dict]:
         if df is None or df.empty:
             continue
         spot = float(r["spot_price"])
-        series = _prepare_oi_series(df, spot=spot, metric="dollars", range_pct=0)
+        series = _prepare_oi_series(
+            df, spot=spot, metric="dollars", range_pct=range_pct,
+        )
         if series is None:
             continue
         call_cum = np.cumsum(series["call_vals"])
@@ -337,6 +346,19 @@ with st.sidebar:
             "every job pulls a live chain."
         ),
     )
+    range_pct = st.slider(
+        "Crossing range (± % of spot)",
+        min_value=1.0, max_value=25.0, value=5.0, step=0.5,
+        key="range_pct",
+        help=(
+            "Filter strikes to ±N% of spot when computing the cumulative-"
+            "dollar crossing. **Must match your PNG's --range** for the "
+            "dashboard number to line up with the PNG. Default 5% mirrors "
+            "`lia oi-dashboard`. Set to 25% for a chain-wide view; "
+            "extreme-OTM tail OI will dominate and the crossing loses "
+            "meaning below ~3%."
+        ),
+    )
 
     st.divider()
     st.subheader("Refresh")
@@ -418,8 +440,11 @@ for ticker in tickers:
     tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
     for tab, exp in zip(tabs, exps):
         with tab:
-            st.markdown(f"**{ticker} · {exp.isoformat()}**")
-            history = _crossing_history(ticker, exp)
+            st.markdown(
+                f"**{ticker} · {exp.isoformat()}**  "
+                f"_(crossing computed on ±{range_pct:.1f}% of spot)_"
+            )
+            history = _crossing_history(ticker, exp, range_pct=range_pct)
             _render_crossing_chart(ticker, exp, history)
 
 # ---------------------------------------------------------------------------

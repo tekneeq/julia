@@ -135,8 +135,10 @@ def _run_batch(
         "--tickers", tickers,
         "--workers", str(workers),
     ]
-    if refresh_cache:
-        cmd.append("--refresh-cache")
+    # oi_batch.py refreshes the Robinhood cache by default; opt out via
+    # its --no-refresh-cache flag when we want to reuse the cached chain.
+    if not refresh_cache:
+        cmd.append("--no-refresh-cache")
 
     banner = f"\n{'=' * 70}\n[{datetime.now():%Y-%m-%d %H:%M:%S}] firing: {' '.join(cmd)}\n{'=' * 70}\n"
     print(banner.rstrip())
@@ -273,7 +275,22 @@ def main() -> int:
                 log_dir=log_dir,
             )
             tag = "settlement" if is_settlement else "intraday"
-            print(f"[{datetime.now():%H:%M:%S}] {tag} batch finished  rc={rc}  ({elapsed:.1f}s)")
+            status = "OK" if rc == 0 else f"FAIL rc={rc}"
+            # A real batch takes 10s+ per ticker/date. Anything under a
+            # second means every job died before doing work — usually a
+            # bad CLI flag or a hard import error. Flag it loudly so it
+            # can't hide across many quiet cron cycles.
+            if elapsed < 1.0 and rc != 0:
+                print(
+                    f"[{datetime.now():%H:%M:%S}] ⚠️  {tag} batch died in "
+                    f"{elapsed:.1f}s with rc={rc} — likely a CLI/argparse "
+                    f"error. See {log_dir}/{datetime.now():%Y-%m-%d}.log"
+                )
+            else:
+                print(
+                    f"[{datetime.now():%H:%M:%S}] {tag} batch {status}  "
+                    f"({elapsed:.1f}s)"
+                )
         except Exception as e:  # noqa: BLE001
             print(f"[{datetime.now():%H:%M:%S}] batch raised: {e!r}")
 
