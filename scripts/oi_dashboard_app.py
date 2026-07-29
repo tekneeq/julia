@@ -166,6 +166,232 @@ def _crossing_history(
     return history
 
 
+# ---------------------------------------------------------------------------
+# Positioning totals time series (calls vs puts) — OI (daily) or Volume (intraday)
+# ---------------------------------------------------------------------------
+
+# Per-metric config used by the helper + renderer. Adding a new metric
+# (e.g. "gex") is a matter of extending this dict + a matching branch
+# in _positioning_history().
+_METRIC_CONFIG: dict[str, dict] = {
+    "oi": {
+        "label": "Open Interest",
+        "cadence": "daily",  # dedup snapshots by local date
+        "call_col": "call_oi",
+        "put_col": "put_oi",
+        "unit": "contracts",
+        "y_title": "Open interest (contracts)",
+        "hover_metric": "OI",
+        "ratio_label": "Put/Call OI ratio",
+        "ratio_help": (
+            "Total put OI ÷ total call OI. >1 = more puts than calls "
+            "outstanding (defensive positioning). <1 = call-heavy "
+            "(bullish or short-vol positioning)."
+        ),
+        "single_caption": (
+            "Only one day of data so far — OI settles daily, so this "
+            "chart fills in one point per trading session as snapshots "
+            "accumulate."
+        ),
+    },
+    "volume": {
+        "label": "Volume",
+        "cadence": "intraday",  # every snapshot, no dedup
+        "call_col": "call_volume",
+        "put_col": "put_volume",
+        "unit": "contracts",
+        "y_title": "Volume (contracts, cumulative for session)",
+        "hover_metric": "Volume",
+        "ratio_label": "Put/Call volume ratio",
+        "ratio_help": (
+            "Total put volume ÷ total call volume. >1 = more puts "
+            "traded today than calls (bearish flow). <1 = call-heavy "
+            "flow. Session volume is cumulative and resets each morning."
+        ),
+        "single_caption": (
+            "Only one snapshot so far — volume ticks continuously "
+            "during market hours, so this chart fills in with each "
+            "batch fire."
+        ),
+    },
+}
+
+
+def _positioning_history(
+    ticker: str, expiration: date, metric: str,
+) -> list[dict]:
+    """Total call/put positioning per snapshot for this expiration.
+
+    * ``metric='oi'`` → dedupe by local date (OI ticks daily; multiple
+      snapshots per day would just repeat the same value).
+    * ``metric='volume'`` → keep every snapshot (volume ticks continuously
+      during the session).
+
+    Returned dicts are pre-normalized so the renderer treats OI and
+    volume identically:
+        {"x": <date | datetime>, "call_val", "put_val", "pc_ratio",
+         "captured_at_utc", "captured_at_local", "spot_price"}
+    Sorted oldest → newest.
+    """
+    cfg = _METRIC_CONFIG[metric]
+    call_col = cfg["call_col"]
+    put_col = cfg["put_col"]
+
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration.isoformat(), limit=500
+    )
+    if not rows:
+        return []
+
+    def _entry(r) -> dict:
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        call_val = int(r[call_col])
+        put_val = int(r[put_col])
+        return {
+            "x": local_dt.date() if cfg["cadence"] == "daily" else local_dt,
+            "call_val": call_val,
+            "put_val": put_val,
+            "pc_ratio": (put_val / call_val) if call_val > 0 else None,
+            "captured_at_utc": _parse_utc(r["captured_at"]),
+            "captured_at_local": local_dt,
+            "spot_price": float(r["spot_price"]),
+        }
+
+    if cfg["cadence"] == "daily":
+        by_date: dict[date, dict] = {}
+        for r in rows:
+            e = _entry(r)
+            d = e["x"]
+            # Keep the *latest* snapshot per local day
+            if d not in by_date or e["captured_at_local"] > by_date[d]["captured_at_local"]:
+                by_date[d] = e
+        return sorted(by_date.values(), key=lambda h: h["x"])
+
+    # intraday
+    entries = [_entry(r) for r in rows]
+    entries.sort(key=lambda h: h["captured_at_utc"])
+    return entries
+
+
+def _render_positioning_chart(
+    ticker: str, expiration: date, history: list[dict], metric: str,
+) -> None:
+    cfg = _METRIC_CONFIG[metric]
+    if not history:
+        st.info(
+            f"No snapshots yet for {ticker} {expiration.isoformat()}. "
+            "Run **oi-dashboard** at least once to seed the history."
+        )
+        return
+
+    xs = [h["x"] for h in history]
+    call_vals = [h["call_val"] for h in history]
+    put_vals = [h["put_val"] for h in history]
+    single = len(history) == 1
+
+    hover_x_fmt = "%Y-%m-%d" if cfg["cadence"] == "daily" else "%Y-%m-%d %H:%M"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=call_vals,
+        mode="markers" if single else "lines+markers",
+        name=f"Call {cfg['hover_metric']} (total)",
+        line=dict(color="#2ca02c", width=2.5),
+        marker=dict(size=12 if single else 8, color="#2ca02c"),
+        hovertemplate=(
+            f"<b>%{{x|{hover_x_fmt}}}</b><br>"
+            f"Call {cfg['hover_metric']}: <b>%{{y:,.0f}}</b> "
+            f"{cfg['unit']}<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=xs, y=put_vals,
+        mode="markers" if single else "lines+markers",
+        name=f"Put {cfg['hover_metric']} (total)",
+        line=dict(color="#d62728", width=2.5),
+        marker=dict(size=12 if single else 8, color="#d62728"),
+        hovertemplate=(
+            f"<b>%{{x|{hover_x_fmt}}}</b><br>"
+            f"Put {cfg['hover_metric']}: <b>%{{y:,.0f}}</b> "
+            f"{cfg['unit']}<extra></extra>"
+        ),
+    ))
+
+    unit_desc = "day" if cfg["cadence"] == "daily" else "snapshot"
+    fig.update_layout(
+        title=(
+            f"{ticker} {expiration.isoformat()} — total {cfg['label'].lower()}  "
+            f"·  {len(history)} {unit_desc}{'s' if len(history) != 1 else ''}"
+        ),
+        xaxis_title=("Trading day" if cfg["cadence"] == "daily" else "Snapshot time (local)"),
+        yaxis_title=cfg["y_title"],
+        height=380,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(t=60, l=60, r=20, b=40),
+    )
+    fig.update_yaxes(tickformat=",.0f")
+    if single:
+        x0 = xs[0]
+        if cfg["cadence"] == "daily":
+            fig.update_xaxes(range=[x0 - timedelta(days=1), x0 + timedelta(days=1)])
+        else:
+            fig.update_xaxes(range=[x0 - timedelta(hours=6), x0 + timedelta(hours=6)])
+        lo = min(call_vals[0], put_vals[0])
+        hi = max(call_vals[0], put_vals[0])
+        pad = max((hi - lo) * 1.5, hi * 0.2, 1000)
+        fig.update_yaxes(range=[max(0, lo - pad), hi + pad])
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    first, last = history[0], history[-1]
+    d_call = last["call_val"] - first["call_val"]
+    d_put = last["put_val"] - first["put_val"]
+    vs_label = "vs first day" if cfg["cadence"] == "daily" else "vs first snapshot"
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        st.metric(
+            f"Latest call {cfg['hover_metric']}",
+            f"{last['call_val']:,}",
+            None if single else f"{d_call:+,} {vs_label}",
+        )
+    with col_b:
+        st.metric(
+            f"Latest put {cfg['hover_metric']}",
+            f"{last['put_val']:,}",
+            None if single else f"{d_put:+,} {vs_label}",
+        )
+    with col_c:
+        pc = last["pc_ratio"]
+        first_pc = first["pc_ratio"]
+        pc_str = f"{pc:.2f}" if pc is not None else "n/a"
+        if not single and pc is not None and first_pc is not None:
+            pc_delta = f"{pc - first_pc:+.2f} {vs_label}"
+        else:
+            pc_delta = None
+        st.metric(cfg["ratio_label"], pc_str, pc_delta, help=cfg["ratio_help"])
+    with col_d:
+        if cfg["cadence"] == "daily":
+            headline = last["x"].strftime("%b %d")
+            sub = _age_from_dt(last["captured_at_utc"])
+            help_txt = (
+                "Trading day of the freshest snapshot for this "
+                "expiration. Delta shows how long ago the snapshot was "
+                "captured."
+            )
+        else:
+            headline = _age_from_dt(last["captured_at_utc"])
+            sub = last["captured_at_local"].strftime("%H:%M:%S")
+            help_txt = (
+                "How long ago the batch persisted the freshest "
+                "snapshot. Sub-line shows the exact local capture time."
+            )
+        st.metric("Latest snapshot", headline, sub, help=help_txt)
+    if single:
+        st.caption(cfg["single_caption"])
+
+
 def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -> None:
     if not history:
         st.info(
@@ -469,6 +695,58 @@ for ticker in tickers:
             )
             history = _crossing_history(ticker, exp, range_pct=range_pct)
             _render_crossing_chart(ticker, exp, history)
+
+# ---------------------------------------------------------------------------
+# Positioning totals (calls vs puts) — toggle OI (daily) or Volume (intraday)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("📅 Positioning totals — calls vs puts")
+
+positioning_metric = st.radio(
+    "Metric",
+    options=["oi", "volume"],
+    format_func=lambda m: (
+        "Open Interest (daily — settles once per session)"
+        if m == "oi" else
+        "Volume (intraday — ticks continuously)"
+    ),
+    horizontal=True,
+    key="positioning_metric",
+    help=(
+        "OI = total contracts outstanding, settled EOD by OCC. Best "
+        "signal for **positioning shifts across days**. Volume = "
+        "contracts traded during the session, resets each morning. "
+        "Best for **intraday flow direction**."
+    ),
+)
+_metric_cfg = _METRIC_CONFIG[positioning_metric]
+st.caption(
+    f"Total {_metric_cfg['label'].lower()} across ALL strikes for each "
+    f"expiration, one point per "
+    f"{'trading day' if _metric_cfg['cadence'] == 'daily' else 'snapshot'}. "
+    + (
+        "Rising put line = defensive positioning being layered in; "
+        "rising call line = long/bullish or covered-call flow. "
+        "OI is settled once per day by the OCC."
+        if positioning_metric == "oi" else
+        "Volume shows what's changing hands *right now* — cumulative "
+        "from the morning bell. Rising put volume vs calls signals "
+        "hedging flow starting; rising call volume signals bullish "
+        "flow or short-vol writers."
+    )
+)
+
+for ticker in tickers:
+    if not exps:
+        continue
+    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
+    for tab, exp in zip(tabs, exps):
+        with tab:
+            st.markdown(f"**{ticker} · {exp.isoformat()}**")
+            hist = _positioning_history(ticker, exp, metric=positioning_metric)
+            _render_positioning_chart(
+                ticker, exp, hist, metric=positioning_metric,
+            )
 
 # ---------------------------------------------------------------------------
 # PNG grid (the three-panel dashboard as static images for now)
