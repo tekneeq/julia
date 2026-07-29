@@ -5,6 +5,16 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /app
 
+# Pin the container to US Eastern time so `oi_scheduler.py`'s market-hour
+# logic (MARKET_OPEN=09:30, MARKET_CLOSE=16:00, POST_CLOSE=16:05) means
+# NYSE hours, not UTC. Any host TZ can still be overridden at runtime
+# with `docker run -e TZ=...`.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && ln -fs /usr/share/zoneinfo/America/New_York /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && rm -rf /var/lib/apt/lists/*
+ENV TZ=America/New_York
+
 # Layer 1: install deps only. Cached unless pyproject.toml or uv.lock change.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
