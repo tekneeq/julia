@@ -82,12 +82,10 @@ def _png_for(ticker: str, exp: date) -> Path:
     return PLOTS_DIR / f"oi-dashboard-{ticker}-{exp.isoformat()}.png"
 
 
-def _age_str(path: Path) -> str:
-    if not path.exists():
-        return "not generated"
-    mtime = datetime.fromtimestamp(path.stat().st_mtime)
-    delta = datetime.now() - mtime
-    secs = int(delta.total_seconds())
+def _format_age(secs: int) -> str:
+    """Turn an integer number of seconds into a compact 'N ago' string."""
+    if secs < 0:
+        return "in the future?"
     if secs < 60:
         return f"{secs}s ago"
     if secs < 3600:
@@ -95,6 +93,19 @@ def _age_str(path: Path) -> str:
     if secs < 86400:
         return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
     return f"{secs // 86400}d ago"
+
+
+def _age_str(path: Path) -> str:
+    if not path.exists():
+        return "not generated"
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    return _format_age(int((datetime.now() - mtime).total_seconds()))
+
+
+def _age_from_dt(dt: datetime) -> str:
+    """Age of a timezone-aware datetime relative to 'now'."""
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    return _format_age(int((now - dt).total_seconds()))
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +248,7 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
 
     st.plotly_chart(fig, use_container_width=True)
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         st.metric(
             "Latest crossing",
@@ -258,6 +269,18 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
             help=(
                 "Positive = the pin/max-pain magnet is above spot; "
                 "negative = below."
+            ),
+        )
+    with col_d:
+        st.metric(
+            "Snapshot age",
+            _age_from_dt(last["captured_at_utc"]),
+            last["captured_at_local"].strftime("%H:%M:%S"),
+            help=(
+                "How long ago the batch persisted this snapshot to the "
+                "DB. If it's climbing past your batch cadence (30 min "
+                "by default) the scheduler is stuck — check "
+                "`journalctl -u oi-scheduler` or the batch log."
             ),
         )
     if single:
