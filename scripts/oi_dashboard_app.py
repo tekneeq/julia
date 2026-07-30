@@ -243,23 +243,52 @@ def _render_implied_move_chart(
     ts = [h["captured_at_local"] for h in history]
     single = len(history) == 1
     key = "move_pct" if unit == "pct" else "move_dollars"
-    y_suffix = "%" if unit == "pct" else "$"
-    y_fmt = ".2f" if unit == "pct" else "$,.2f"
 
     fig = go.Figure()
-    for conf, label, color in IMPLIED_MOVE_LEVELS:
+    for i, (conf, label, color) in enumerate(IMPLIED_MOVE_LEVELS):
         vals = [h[f"{key}_{conf}"] for h in history]
+        # customdata rows: [spot, low_bound, high_bound, iv_pct,
+        #                   move_pct, move_dollars, days]
+        customdata = [
+            [
+                h["spot"],
+                h["spot"] - h[f"move_dollars_{conf}"],
+                h["spot"] + h[f"move_dollars_{conf}"],
+                h["iv"] * 100,
+                h[f"move_pct_{conf}"],
+                h[f"move_dollars_{conf}"],
+                h["days"],
+            ]
+            for h in history
+        ]
+        # Only the first trace shows the shared context (spot, IV, days
+        # to expiry). Subsequent traces show only their specific move
+        # info, so `hovermode="x unified"` doesn't repeat spot 3 times.
+        if i == 0:
+            hover = (
+                "Spot at snapshot: <b>$%{customdata[0]:.2f}</b>  "
+                "·  ATM IV <b>%{customdata[3]:.1f}%</b>  "
+                "·  <b>%{customdata[6]}d</b> to exp<br>"
+                f"±{label}: <b>±%{{customdata[4]:.2f}}%</b>  "
+                "(±$%{customdata[5]:.2f})  →  "
+                "<b>$%{customdata[1]:.2f} / $%{customdata[2]:.2f}</b>"
+                "<extra></extra>"
+            )
+        else:
+            hover = (
+                f"±{label}: <b>±%{{customdata[4]:.2f}}%</b>  "
+                "(±$%{customdata[5]:.2f})  →  "
+                "<b>$%{customdata[1]:.2f} / $%{customdata[2]:.2f}</b>"
+                "<extra></extra>"
+            )
         fig.add_trace(go.Scatter(
             x=ts, y=vals,
             mode="markers" if single else "lines+markers",
             name=f"±{label}",
             line=dict(color=color, width=2.5),
             marker=dict(size=12 if single else 7, color=color),
-            hovertemplate=(
-                f"<b>%{{x|%Y-%m-%d %H:%M}}</b><br>"
-                f"±{label}: <b>%{{y:{y_fmt}}}{y_suffix if unit=='pct' else ''}</b>"
-                "<extra></extra>"
-            ),
+            customdata=customdata,
+            hovertemplate=hover,
         ))
 
     last = history[-1]
