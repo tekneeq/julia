@@ -23,9 +23,12 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import math
+
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -114,6 +117,213 @@ def _age_from_dt(dt: datetime) -> str:
 
 def _parse_utc(iso_ts: str) -> datetime:
     return datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+
+
+# ---------------------------------------------------------------------------
+# Implied-move time series (68% / 95% / 99.7%)
+# ---------------------------------------------------------------------------
+
+# Same three levels the `emove` CLI prints. Tuple: (confidence, label, color).
+IMPLIED_MOVE_LEVELS: list[tuple[float, str, str]] = [
+    (0.6827, "68% (1σ)", "#1f77b4"),
+    (0.9545, "95% (2σ)", "#ff7f0e"),
+    (0.9973, "99.7% (3σ)", "#d62728"),
+]
+Z_BY_CONF: dict[float, float] = {
+    conf: float(norm.ppf((1 + conf) / 2)) for conf, _, _ in IMPLIED_MOVE_LEVELS
+}
+
+
+def _business_days_between(start: date, end: date) -> int:
+    """Trading-day count between ``start`` (exclusive) and ``end`` (inclusive).
+
+    Matches the convention `emove` uses in ``sqrt(days / 252)``. Returns
+    0 if ``end`` <= ``start`` (same-day or already-expired snapshot).
+    """
+    if end <= start:
+        return 0
+    d, count = start, 0
+    while d < end:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # Mon=0..Fri=4
+            count += 1
+    return count
+
+
+def _atm_iv_from_strikes(strikes, spot: float) -> float | None:
+    """Average of call & put IV at the strike closest to spot.
+
+    Returns ``None`` if we can't find a usable IV (illiquid chain,
+    missing data). We snap to the nearest strike rather than
+    interpolating because the strike grid is dense enough (usually $1
+    for SPY) that interpolation adds noise, not accuracy.
+    """
+    if not strikes:
+        return None
+    # Find strike closest to spot
+    nearest = min(strikes, key=lambda r: abs(float(r["strike_price"]) - spot))
+    target_strike = float(nearest["strike_price"])
+
+    ivs: list[float] = []
+    for r in strikes:
+        if abs(float(r["strike_price"]) - target_strike) > 1e-9:
+            continue
+        iv = r["implied_vol"]
+        if iv is not None and iv > 0:
+            ivs.append(float(iv))
+    if not ivs:
+        return None
+    return sum(ivs) / len(ivs)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _implied_move_history(ticker: str, expiration_iso: str) -> list[dict]:
+    """For each snapshot of (ticker, expiration), compute implied moves
+    at 68%, 95%, and 99.7% confidence.
+
+    Cached (60s TTL) because this hits ``get_strikes`` once per snapshot
+    — non-trivial cost when the DB has hundreds of rows.
+
+    Returned dicts include both $ and % moves per confidence level,
+    plus the ATM IV that drove them (useful for the metric card).
+    Sorted oldest → newest.
+    """
+    exp = date.fromisoformat(expiration_iso)
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration_iso, limit=500
+    )
+    if not rows:
+        return []
+
+    history: list[dict] = []
+    for r in rows:
+        spot = float(r["spot_price"])
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        days = _business_days_between(local_dt.date(), exp)
+        if days <= 0:
+            continue  # expired / same-day
+        strikes = gex_store.get_strikes(r["id"])
+        iv = _atm_iv_from_strikes(strikes, spot)
+        if iv is None:
+            continue
+
+        entry = {
+            "captured_at_utc": _parse_utc(r["captured_at"]),
+            "captured_at_local": local_dt,
+            "spot": spot,
+            "iv": iv,
+            "days": days,
+        }
+        for conf, _, _ in IMPLIED_MOVE_LEVELS:
+            move_dollars = spot * iv * math.sqrt(days / 252.0) * Z_BY_CONF[conf]
+            entry[f"move_dollars_{conf}"] = move_dollars
+            entry[f"move_pct_{conf}"] = (move_dollars / spot) * 100.0
+        history.append(entry)
+
+    history.sort(key=lambda h: h["captured_at_utc"])
+    return history
+
+
+def _render_implied_move_chart(
+    ticker: str, expiration: date, history: list[dict], unit: str,
+) -> None:
+    """Render implied-move time series with 3 confidence bands.
+
+    ``unit`` is either ``"pct"`` (Y-axis in % of spot) or ``"dollars"``
+    (Y-axis in $). % is more comparable across expirations; $ is more
+    concrete when comparing to spot moves.
+    """
+    if not history:
+        st.info(
+            f"No snapshots yet for {ticker} {expiration.isoformat()}. "
+            "Run **oi-dashboard** at least once to seed the history."
+        )
+        return
+
+    ts = [h["captured_at_local"] for h in history]
+    single = len(history) == 1
+    key = "move_pct" if unit == "pct" else "move_dollars"
+    y_suffix = "%" if unit == "pct" else "$"
+    y_fmt = ".2f" if unit == "pct" else "$,.2f"
+
+    fig = go.Figure()
+    for conf, label, color in IMPLIED_MOVE_LEVELS:
+        vals = [h[f"{key}_{conf}"] for h in history]
+        fig.add_trace(go.Scatter(
+            x=ts, y=vals,
+            mode="markers" if single else "lines+markers",
+            name=f"±{label}",
+            line=dict(color=color, width=2.5),
+            marker=dict(size=12 if single else 7, color=color),
+            hovertemplate=(
+                f"<b>%{{x|%Y-%m-%d %H:%M}}</b><br>"
+                f"±{label}: <b>%{{y:{y_fmt}}}{y_suffix if unit=='pct' else ''}</b>"
+                "<extra></extra>"
+            ),
+        ))
+
+    last = history[-1]
+    days_note = f"{last['days']} trading day{'s' if last['days'] != 1 else ''} to expiry"
+    fig.update_layout(
+        title=(
+            f"{ticker} {expiration.isoformat()} — implied move  "
+            f"·  {len(history)} snapshot{'s' if len(history) != 1 else ''}  "
+            f"·  {days_note} (at latest snapshot)"
+        ),
+        xaxis_title="Snapshot time (local)",
+        yaxis_title=("Implied move (% of spot)" if unit == "pct" else "Implied move ($)"),
+        height=380,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(t=60, l=60, r=20, b=40),
+    )
+    if unit == "pct":
+        fig.update_yaxes(ticksuffix="%")
+    else:
+        fig.update_yaxes(tickprefix="$")
+    if single:
+        t0 = ts[0]
+        fig.update_xaxes(range=[t0 - timedelta(hours=6), t0 + timedelta(hours=6)])
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    first = history[0]
+    d_iv = last["iv"] - first["iv"]
+    col_a, col_b, col_c, col_d = st.columns(4)
+    for col, (conf, label, _color) in zip((col_a, col_b, col_c), IMPLIED_MOVE_LEVELS):
+        with col:
+            latest_val = last[f"{key}_{conf}"]
+            latest_dollars = last[f"move_dollars_{conf}"]
+            latest_pct = last[f"move_pct_{conf}"]
+            if unit == "pct":
+                headline = f"±{latest_val:.2f}%"
+                sub = f"±${latest_dollars:.2f}"
+            else:
+                headline = f"±${latest_val:.2f}"
+                sub = f"±{latest_pct:.2f}%"
+            if not single:
+                delta = latest_val - first[f"{key}_{conf}"]
+                sign = "+" if delta >= 0 else ""
+                sub = f"{sub}   ({sign}{delta:.2f} vs first)"
+            st.metric(f"Latest {label}", headline, sub)
+    with col_d:
+        st.metric(
+            "ATM IV (annualized)",
+            f"{last['iv']*100:.1f}%",
+            None if single else f"{d_iv*100:+.2f}pp vs first",
+            help=(
+                "Annualized at-the-money implied volatility, driving "
+                "the moves above. Rising = market pricing in more "
+                "uncertainty; falling = vol crush. Spikes into events "
+                "(FOMC, CPI, earnings), decays afterward."
+            ),
+        )
+    if single:
+        st.caption(
+            "Only one snapshot so far — as new snapshots arrive, this "
+            "will show how the market's own uncertainty is repricing "
+            "throughout the day."
+        )
 
 
 def _crossing_history(
@@ -671,6 +881,41 @@ st.caption(
     f"**{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}** "
     f"(local). Charts + PNGs are re-read from the DB / disk on every refresh."
 )
+
+# ---------------------------------------------------------------------------
+# Implied-move time series (68% / 95% / 99.7%) per expiration
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🎯 Implied move over time")
+
+move_unit = st.radio(
+    "Y-axis unit",
+    options=["pct", "dollars"],
+    format_func=lambda u: "% of spot" if u == "pct" else "Dollars",
+    horizontal=True,
+    key="move_unit",
+    help=(
+        "% is comparable across expirations and spot levels. $ is "
+        "concrete when comparing to spot moves you see intraday."
+    ),
+)
+st.caption(
+    "The `emove` bands (68% / 95% / 99.7%) plotted as time series. "
+    "Formula: **spot × ATM IV × √(days/252) × z**. All three inputs "
+    "move intraday — ATM IV especially — so the bands widen and "
+    "narrow as the market reprices its own uncertainty. Widening "
+    "into an event = fear being priced in; narrowing after = vol crush."
+)
+
+for ticker in tickers:
+    if not exps:
+        continue
+    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
+    for tab, exp in zip(tabs, exps):
+        with tab:
+            st.markdown(f"**{ticker} · {exp.isoformat()}**")
+            move_hist = _implied_move_history(ticker, exp.isoformat())
+            _render_implied_move_chart(ticker, exp, move_hist, unit=move_unit)
 
 # ---------------------------------------------------------------------------
 # Crossing-strike time series (interactive, one per ticker × expiration)
