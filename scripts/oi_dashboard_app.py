@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import math
@@ -63,6 +63,26 @@ def _add_business_days(d: date, n: int) -> date:
         if d.weekday() < 5:
             n -= 1
     return d
+
+
+def _prev_business_day(d: date) -> date:
+    """The last business day strictly before ``d``."""
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _past_business_days(end: date, n: int) -> list[date]:
+    """The ``n`` business days ending at ``end`` (inclusive), oldest first."""
+    days: list[date] = []
+    d = end
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    return days
 
 
 def _compute_range(days_ahead: int) -> tuple[date, date, list[date]]:
@@ -353,6 +373,255 @@ def _render_implied_move_chart(
             "will show how the market's own uncertainty is repricing "
             "throughout the day."
         )
+
+
+# ---------------------------------------------------------------------------
+# Implied vs actual daily moves (history of completed sessions)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _implied_vs_actual_history(
+    ticker: str, num_days: int, end_iso: str,
+) -> list[dict]:
+    """For each of the ``num_days`` business days ending at ``end_iso``
+    (inclusive), pair the implied move that was priced in *before* the
+    session with the move that actually happened.
+
+    Key convention (per the section's purpose): the implied numbers for
+    day D come from the **latest snapshot captured before D** — normally
+    the last batch fire of the prior session — NOT from anything captured
+    during D itself. Intraday repricing of D's own implied move lives in
+    the "Implied move over time" section above.
+
+    The actual move is measured against that same reference snapshot's
+    spot: (last spot captured on D − ref spot) / ref spot. Signed, so a
+    down day is negative. Uses the last snapshot of the session as the
+    "close", which is exact only if the batch runs near the close.
+
+    One dict per day, oldest → newest:
+        {"day", "implied" ({conf: pct} or None), "actual_pct" (or None),
+         "ref_spot", "close_spot", "iv", "days_to_exp",
+         "implied_captured_at_local", "close_captured_at_local"}
+    """
+    end = date.fromisoformat(end_iso)
+    days = _past_business_days(end, num_days)
+
+    out: list[dict] = []
+    for day in days:
+        rows = gex_store.recent_snapshots(
+            ticker=ticker, expiration_date=day.isoformat(), limit=500
+        )
+        # rows are newest → oldest, so the first match on each side of
+        # the day boundary is the latest one.
+        ref = None    # latest snapshot captured BEFORE day (prior session)
+        close = None  # latest snapshot captured ON day (session "close")
+        for r in rows:
+            local_dt = _parse_utc(r["captured_at"]).astimezone()
+            ld = local_dt.date()
+            if ld == day and close is None:
+                close = (r, local_dt)
+            elif ld < day and ref is None:
+                ref = (r, local_dt)
+            if ref is not None and close is not None:
+                break
+
+        entry: dict = {
+            "day": day,
+            "implied": None,
+            "actual_pct": None,
+            "ref_spot": None,
+            "close_spot": None,
+            "iv": None,
+            "days_to_exp": None,
+            "implied_captured_at_local": None,
+            "close_captured_at_local": None,
+        }
+        if ref is not None:
+            r, local_dt = ref
+            spot = float(r["spot_price"])
+            iv = _atm_iv_from_strikes(gex_store.get_strikes(r["id"]), spot)
+            days_to_exp = _business_days_between(local_dt.date(), day)
+            if iv is not None and days_to_exp > 0:
+                entry["implied"] = {
+                    conf: iv * math.sqrt(days_to_exp / 252.0) * Z_BY_CONF[conf] * 100.0
+                    for conf, _, _ in IMPLIED_MOVE_LEVELS
+                }
+                entry["ref_spot"] = spot
+                entry["iv"] = iv
+                entry["days_to_exp"] = days_to_exp
+                entry["implied_captured_at_local"] = local_dt
+        if close is not None and entry["ref_spot"] is not None:
+            rc, close_dt = close
+            close_spot = float(rc["spot_price"])
+            entry["close_spot"] = close_spot
+            entry["close_captured_at_local"] = close_dt
+            entry["actual_pct"] = (
+                (close_spot - entry["ref_spot"]) / entry["ref_spot"] * 100.0
+            )
+        out.append(entry)
+    return out
+
+
+def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
+    if not any(
+        h["implied"] is not None or h["actual_pct"] is not None for h in history
+    ):
+        st.info(
+            f"No history yet for {ticker} on these days. Each completed "
+            "session needs a snapshot from the prior day (for the implied "
+            "move) and one during the session itself (for the actual move)."
+        )
+        return
+
+    labels = [f"{h['day'].strftime('%b %d')} ({h['day'].strftime('%a')})" for h in history]
+
+    fig = go.Figure()
+
+    # Implied bands: symmetric ±σ lines. The negative twin shares a
+    # legend group so one legend click toggles both sides.
+    for i, (conf, label, color) in enumerate(IMPLIED_MOVE_LEVELS):
+        vals = [h["implied"][conf] if h["implied"] else None for h in history]
+        customdata = [
+            [
+                h["implied"][conf] if h["implied"] else 0.0,
+                h["ref_spot"] or 0.0,
+                (h["iv"] or 0.0) * 100,
+                h["implied_captured_at_local"].strftime("%b %d %H:%M")
+                if h["implied_captured_at_local"] else "n/a",
+            ]
+            for h in history
+        ]
+        if i == 0:
+            hover = (
+                "Priced from snapshot <b>%{customdata[3]}</b>  ·  "
+                "ref spot <b>$%{customdata[1]:.2f}</b>  ·  "
+                "ATM IV <b>%{customdata[2]:.1f}%</b><br>"
+                f"±{label} implied: <b>±%{{customdata[0]:.2f}}%</b>"
+                "<extra></extra>"
+            )
+        else:
+            hover = (
+                f"±{label} implied: <b>±%{{customdata[0]:.2f}}%</b>"
+                "<extra></extra>"
+            )
+        fig.add_trace(go.Scatter(
+            x=labels, y=vals,
+            mode="lines+markers",
+            name=f"±{label} implied",
+            legendgroup=f"sigma{i}",
+            line=dict(color=color, width=2, dash="dot"),
+            marker=dict(size=8, color=color),
+            connectgaps=False,
+            customdata=customdata,
+            hovertemplate=hover,
+        ))
+        fig.add_trace(go.Scatter(
+            x=labels,
+            y=[-v if v is not None else None for v in vals],
+            mode="lines+markers",
+            legendgroup=f"sigma{i}",
+            showlegend=False,
+            line=dict(color=color, width=2, dash="dot"),
+            marker=dict(size=8, color=color),
+            connectgaps=False,
+            hoverinfo="skip",
+        ))
+
+    actual_vals = [h["actual_pct"] for h in history]
+    bar_colors = [
+        "#2ca02c" if (v is not None and v >= 0) else "#d62728"
+        for v in actual_vals
+    ]
+    bar_customdata = [
+        [
+            h["ref_spot"] or 0.0,
+            h["close_spot"] or 0.0,
+            h["close_captured_at_local"].strftime("%b %d %H:%M")
+            if h["close_captured_at_local"] else "n/a",
+        ]
+        for h in history
+    ]
+    fig.add_trace(go.Bar(
+        x=labels, y=actual_vals,
+        name="Actual move",
+        marker_color=bar_colors,
+        opacity=0.75,
+        width=0.45,
+        customdata=bar_customdata,
+        hovertemplate=(
+            "Actual: <b>%{y:+.2f}%</b>  "
+            "($%{customdata[0]:.2f} → $%{customdata[1]:.2f}, "
+            "last snapshot %{customdata[2]})<extra></extra>"
+        ),
+    ))
+
+    fig.add_hline(y=0, line_color="#999", line_width=1)
+    fig.update_layout(
+        title=f"{ticker} — implied (from prior session) vs actual daily move",
+        xaxis_title="Session",
+        yaxis_title="Move (% of prior-session spot)",
+        height=420,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(t=60, l=60, r=20, b=40),
+        barmode="overlay",
+    )
+    fig.update_xaxes(type="category")
+    fig.update_yaxes(ticksuffix="%")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    scored = [
+        h for h in history
+        if h["actual_pct"] is not None and h["implied"] is not None
+    ]
+    col_a, col_b, col_c, col_d = st.columns(4)
+    conf1, conf2 = IMPLIED_MOVE_LEVELS[0][0], IMPLIED_MOVE_LEVELS[1][0]
+    with col_a:
+        if scored:
+            n1 = sum(1 for h in scored if abs(h["actual_pct"]) <= h["implied"][conf1])
+            st.metric(
+                "Days within ±1σ",
+                f"{n1}/{len(scored)}",
+                help=(
+                    "If the options market prices risk correctly, "
+                    "~68% of sessions should land inside the 1σ band."
+                ),
+            )
+        else:
+            st.metric("Days within ±1σ", "n/a")
+    with col_b:
+        if scored:
+            n2 = sum(1 for h in scored if abs(h["actual_pct"]) <= h["implied"][conf2])
+            st.metric(
+                "Days within ±2σ",
+                f"{n2}/{len(scored)}",
+                help="~95% of sessions should land inside the 2σ band.",
+            )
+        else:
+            st.metric("Days within ±2σ", "n/a")
+    with col_c:
+        if scored:
+            last = scored[-1]
+            st.metric(
+                f"Last scored day ({last['day'].strftime('%b %d')})",
+                f"{last['actual_pct']:+.2f}%",
+                f"±{last['implied'][conf1]:.2f}% was 1σ implied",
+                delta_color="off",
+            )
+        else:
+            st.metric("Last scored day", "n/a")
+    with col_d:
+        if scored:
+            big = max(scored, key=lambda h: abs(h["actual_pct"]))
+            st.metric(
+                "Biggest move",
+                f"{big['actual_pct']:+.2f}%",
+                big["day"].strftime("%b %d"),
+                delta_color="off",
+            )
+        else:
+            st.metric("Biggest move", "n/a")
 
 
 def _crossing_history(
@@ -945,6 +1214,33 @@ for ticker in tickers:
             st.markdown(f"**{ticker} · {exp.isoformat()}**")
             move_hist = _implied_move_history(ticker, exp.isoformat())
             _render_implied_move_chart(ticker, exp, move_hist, unit=move_unit)
+
+# ---------------------------------------------------------------------------
+# Implied vs actual daily moves (completed sessions)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("📏 Implied vs actual daily moves")
+
+iva_days = st.slider(
+    "Sessions of history",
+    min_value=3, max_value=15, value=5, key="iva_days",
+)
+_iva_end = _prev_business_day(date.today())
+st.caption(
+    f"Completed sessions only — the last {iva_days} trading days ending "
+    f"**{_iva_end.strftime('%b %d')}** (weekends skipped). Dotted lines are "
+    "the ±1σ / ±2σ / ±3σ implied moves **as priced before each session "
+    "opened** (latest snapshot from the prior day — intraday repricing of "
+    "the day itself is deliberately excluded; that lives in the section "
+    "above). Bars are the actual move vs that same prior-day spot: green "
+    "up, red down. A bar poking outside a dotted band = the market moved "
+    "more than options had priced in."
+)
+
+for ticker in tickers:
+    st.markdown(f"**{ticker}**")
+    iva_hist = _implied_vs_actual_history(ticker, iva_days, _iva_end.isoformat())
+    _render_implied_vs_actual_chart(ticker, iva_hist)
 
 # ---------------------------------------------------------------------------
 # Crossing-strike time series (interactive, one per ticker × expiration)
