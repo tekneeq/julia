@@ -39,7 +39,7 @@ BATCH_SCRIPT = REPO_ROOT / "scripts" / "oi_batch.py"
 # Reuse the private helpers from `julia.main` so the crossing math
 # matches exactly what the PNG dashboard shows.
 sys.path.insert(0, str(REPO_ROOT / "src"))
-from julia import gex_store  # noqa: E402
+from julia import daily_moves_store, gex_store  # noqa: E402
 from julia.main import (  # noqa: E402
     _find_curve_crossing,
     _load_oi_snapshot_df,
@@ -1560,6 +1560,447 @@ def _poll_batch() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Daily move twin — today vs best historical match
+# ---------------------------------------------------------------------------
+
+_SESSION_MINUTES = (
+    daily_moves_store.MARKET_CLOSE.hour * 60
+    + daily_moves_store.MARKET_CLOSE.minute
+    - (daily_moves_store.MARKET_OPEN.hour * 60
+       + daily_moves_store.MARKET_OPEN.minute)
+)  # 390 for a regular session
+
+
+def _prior_close_spot(ticker: str, session: date) -> float | None:
+    """Last known spot strictly before ``session`` — prior-session close."""
+    rows = gex_store.recent_snapshots(ticker=ticker, limit=10000)
+    best: tuple[datetime, float] | None = None
+    for r in rows:
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        if local_dt.date() >= session:
+            continue
+        if best is None or local_dt > best[0]:
+            best = (local_dt, float(r["spot_price"]))
+    return best[1] if best else None
+
+
+def _ingest_snapshot_paths(ticker: str, lookback_calendar_days: int = 60) -> None:
+    """Upsert daily paths from gex_snapshots spot stamps."""
+    cutoff = date.today() - timedelta(days=lookback_calendar_days)
+    rows = gex_store.recent_snapshots(ticker=ticker, limit=10000)
+    # local_date → {minutes_from_open: (captured_at, spot)}  (latest wins)
+    by_day: dict[date, dict[int, tuple[datetime, float]]] = {}
+    # Also track last spot per day for prior-close lookup.
+    last_spot_by_day: dict[date, tuple[datetime, float]] = {}
+    for r in rows:
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        d = local_dt.date()
+        spot = float(r["spot_price"])
+        prev_last = last_spot_by_day.get(d)
+        if prev_last is None or local_dt > prev_last[0]:
+            last_spot_by_day[d] = (local_dt, spot)
+        if d < cutoff or d.weekday() >= 5:
+            continue
+        m = daily_moves_store.minutes_from_open(local_dt)
+        # Keep points inside the regular session (± a few min of open/close).
+        if m < -5 or m > _SESSION_MINUTES + 15:
+            continue
+        m = max(0, min(m, _SESSION_MINUTES))
+        day_map = by_day.setdefault(d, {})
+        prev = day_map.get(m)
+        if prev is None or local_dt > prev[0]:
+            day_map[m] = (local_dt, spot)
+
+    prior_days = sorted(last_spot_by_day)
+    for d in sorted(by_day):
+        # Prior close = last spot of the most recent earlier session day.
+        ref = None
+        for pd in reversed(prior_days):
+            if pd < d:
+                ref = last_spot_by_day[pd][1]
+                break
+        if ref is None or ref <= 0:
+            continue
+        daily_moves_store.upsert_session(
+            ticker=ticker, session_date=d, ref_spot=ref,
+        )
+        points = [
+            (m, spot, (spot - ref) / ref * 100.0, "snapshot")
+            for m, (_ts, spot) in sorted(by_day[d].items())
+        ]
+        daily_moves_store.upsert_points(
+            ticker=ticker, session_date=d, points=points,
+        )
+
+
+def _ingest_market_paths(ticker: str) -> None:
+    """Densify today + recent days with Robinhood 5-minute bars when possible.
+
+    ``span='week'`` is the longest window RH serves at 5-minute resolution;
+    older sessions stay on the snapshot-derived path. No-op when auth fails.
+    """
+    if not _rh_market_data_ready():
+        return
+    import robin_stocks.robinhood as rh
+
+    try:
+        candles = rh.stocks.get_stock_historicals(
+            ticker, interval="5minute", span="week", bounds="regular",
+        ) or []
+    except Exception:
+        return
+    if not candles:
+        return
+
+    by_day: dict[date, list[tuple[int, float]]] = {}
+    for c in candles:
+        begins = c.get("begins_at") or ""
+        close = c.get("close_price")
+        if not begins or close is None:
+            continue
+        try:
+            # begins_at is UTC; convert to local (ET in the container).
+            utc_dt = _parse_utc(begins)
+            local_dt = utc_dt.astimezone()
+            spot = float(close)
+        except (TypeError, ValueError):
+            continue
+        d = local_dt.date()
+        if d.weekday() >= 5:
+            continue
+        m = daily_moves_store.minutes_from_open(local_dt)
+        if m < 0 or m > _SESSION_MINUTES:
+            continue
+        by_day.setdefault(d, []).append((m, spot))
+
+    for d, pts in by_day.items():
+        # Prefer an existing session ref (from snapshot ingest); else
+        # fall back to the first bar of the day as a rough open-proxy
+        # only when we have no prior-close at all.
+        sessions = {
+            r["session_date"]: float(r["ref_spot"])
+            for r in daily_moves_store.list_sessions(ticker)
+        }
+        ref = sessions.get(d.isoformat())
+        if ref is None:
+            ref = _prior_close_spot(ticker, d)
+        if ref is None or ref <= 0:
+            continue
+        daily_moves_store.upsert_session(
+            ticker=ticker, session_date=d, ref_spot=ref,
+        )
+        # One point per minute bucket (last bar wins).
+        by_min: dict[int, float] = {}
+        for m, spot in pts:
+            by_min[m] = spot
+        points = [
+            (m, spot, (spot - ref) / ref * 100.0, "market")
+            for m, spot in sorted(by_min.items())
+        ]
+        daily_moves_store.upsert_points(
+            ticker=ticker, session_date=d, points=points,
+        )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
+    """Refresh the 30-session library and return a small status dict."""
+    _ingest_snapshot_paths(ticker)
+    _ingest_market_paths(ticker)
+    today = date.fromisoformat(today_iso)
+    deleted = daily_moves_store.prune(
+        ticker, keep=daily_moves_store.KEEP_SESSIONS, today=today,
+    )
+    sessions = daily_moves_store.list_sessions(ticker)
+    return {
+        "n_sessions": len(sessions),
+        "pruned": deleted,
+        "dates": [r["session_date"] for r in sessions],
+    }
+
+
+def _interpolate_pct(path: list[dict], minute: int) -> float | None:
+    """Linear interp of pct at ``minute``; None if outside the path span."""
+    if not path:
+        return None
+    xs = [p["minutes_from_open"] for p in path]
+    ys = [p["pct"] for p in path]
+    if minute < xs[0] or minute > xs[-1]:
+        return None
+    if minute in xs:
+        return ys[xs.index(minute)]
+    # Find bracketing points
+    for i in range(1, len(xs)):
+        if xs[i] >= minute:
+            x0, x1 = xs[i - 1], xs[i]
+            y0, y1 = ys[i - 1], ys[i]
+            if x1 == x0:
+                return y0
+            t = (minute - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return None
+
+
+def _path_rmse(today_path: list[dict], hist_path: list[dict]) -> float | None:
+    """Recency-weighted RMSE of % move on today's sample minutes.
+
+    Later points weigh more (linear in minutes from open, floored at 1),
+    so a mid-day reversal can switch the twin away from whatever matched
+    the open. Needs ≥2 overlapping points.
+    """
+    if len(today_path) < 2:
+        return None
+    weighted: list[tuple[float, float]] = []  # (weight, error)
+    for p in today_path:
+        h = _interpolate_pct(hist_path, p["minutes_from_open"])
+        if h is None:
+            continue
+        w = max(float(p["minutes_from_open"]), 1.0)
+        weighted.append((w, p["pct"] - h))
+    if len(weighted) < 2:
+        return None
+    wsum = sum(w for w, _e in weighted)
+    return math.sqrt(sum(w * e * e for w, e in weighted) / wsum)
+
+
+def _find_daily_twins(
+    ticker: str, today: date, *, top_n: int = 3,
+) -> dict:
+    """Today's path + the closest completed sessions by RMSE so far."""
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    sessions = daily_moves_store.list_sessions(ticker)
+    candidates: list[dict] = []
+    for s in sessions:
+        d = date.fromisoformat(s["session_date"])
+        if d >= today:
+            continue
+        hist = daily_moves_store.get_session_path(ticker, d)
+        rmse = _path_rmse(today_path, hist)
+        if rmse is None:
+            continue
+        candidates.append({
+            "day": d,
+            "ref_spot": float(s["ref_spot"]),
+            "path": hist,
+            "rmse": rmse,
+            "final_pct": hist[-1]["pct"] if hist else None,
+        })
+    candidates.sort(key=lambda c: c["rmse"])
+    today_ref = next(
+        (float(s["ref_spot"]) for s in sessions
+         if s["session_date"] == today.isoformat()),
+        None,
+    )
+    return {
+        "today": today,
+        "today_path": today_path,
+        "today_ref": today_ref,
+        "twins": candidates[:top_n],
+        "library_size": sum(
+            1 for s in sessions
+            if s["session_date"] != today.isoformat()
+        ),
+    }
+
+
+def _render_daily_move_twin(ticker: str) -> None:
+    today = date.today()
+    if today.weekday() >= 5:
+        st.info("Weekend — the daily-move twin overlay resumes next session.")
+        return
+
+    status = _sync_daily_move_library(ticker, today.isoformat())
+    result = _find_daily_twins(ticker, today)
+    today_path = result["today_path"]
+
+    if not today_path:
+        st.info(
+            f"No path yet for {ticker} today. Once the scheduler fires "
+            "(or market data is available), today's % move will appear "
+            f"here against the last {daily_moves_store.KEEP_SESSIONS} "
+            "sessions."
+        )
+        return
+
+    fig = go.Figure()
+    # Today — solid, thick
+    fig.add_trace(go.Scatter(
+        x=[p["minutes_from_open"] for p in today_path],
+        y=[p["pct"] for p in today_path],
+        mode="lines+markers",
+        name=f"Today ({today:%b %d})",
+        line=dict(color="#111", width=3),
+        marker=dict(size=6, color="#111"),
+        hovertemplate=(
+            f"Today ({today:%b %d}): <b>%{{y:+.2f}}%</b><br>"
+            "%{x} min from open<extra></extra>"
+        ),
+    ))
+
+    twin_colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    for i, twin in enumerate(result["twins"]):
+        # Only draw the historical path up to "now" (today's latest
+        # minute) as the solid match, then ghost the rest of that day
+        # so you can see where the twin went afterward.
+        now_m = today_path[-1]["minutes_from_open"]
+        matched = [
+            p for p in twin["path"] if p["minutes_from_open"] <= now_m
+        ]
+        rest = [
+            p for p in twin["path"] if p["minutes_from_open"] >= now_m
+        ]
+        color = twin_colors[i % len(twin_colors)]
+        label = (
+            f"{twin['day']:%b %d}  (RMSE {twin['rmse']:.2f}pp"
+            + (
+                f", closed {twin['final_pct']:+.2f}%"
+                if twin["final_pct"] is not None else ""
+            )
+            + ")"
+        )
+        fig.add_trace(go.Scatter(
+            x=[p["minutes_from_open"] for p in matched],
+            y=[p["pct"] for p in matched],
+            mode="lines",
+            name=label if i == 0 else f"#{i + 1} {label}",
+            line=dict(
+                color=color,
+                width=2.5 if i == 0 else 1.5,
+                dash="solid" if i == 0 else "dot",
+            ),
+            hovertemplate=(
+                f"{twin['day']:%b %d}: <b>%{{y:+.2f}}%</b><br>"
+                "%{x} min from open<extra></extra>"
+            ),
+        ))
+        if len(rest) >= 2 and i == 0:
+            fig.add_trace(go.Scatter(
+                x=[p["minutes_from_open"] for p in rest],
+                y=[p["pct"] for p in rest],
+                mode="lines",
+                name=f"{twin['day']:%b %d} — rest of day",
+                line=dict(color=color, width=2, dash="dash"),
+                opacity=0.45,
+                hovertemplate=(
+                    f"{twin['day']:%b %d} (after now): "
+                    f"<b>%{{y:+.2f}}%</b><br>"
+                    "%{x} min from open<extra></extra>"
+                ),
+            ))
+
+    fig.add_hline(y=0, line_color="#999", line_width=1)
+    # X-axis as clock labels
+    tick_vals = list(range(0, _SESSION_MINUTES + 1, 60))
+    tick_text = []
+    for m in tick_vals:
+        total = 9 * 60 + 30 + m  # minutes since midnight
+        h24, mm = divmod(total, 60)
+        ampm = "am" if h24 < 12 else "pm"
+        h12 = h24 % 12 or 12
+        tick_text.append(f"{h12}:{mm:02d}{ampm}")
+
+    fig.update_layout(
+        title=(
+            f"{ticker} — today's move vs closest historical twin  "
+            f"·  library {result['library_size']} sessions"
+        ),
+        xaxis_title="Session time (ET)",
+        yaxis_title="% vs prior close",
+        height=420,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.12, x=0),
+        margin=dict(t=70, l=60, r=20, b=40),
+        xaxis=dict(
+            tickmode="array",
+            tickvals=tick_vals,
+            ticktext=tick_text,
+            range=[0, _SESSION_MINUTES],
+        ),
+    )
+    fig.update_yaxes(ticksuffix="%")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Verdict cards
+    last_pct = today_path[-1]["pct"]
+    last_spot = today_path[-1]["spot"]
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        st.metric(
+            "Today so far",
+            f"{last_pct:+.2f}%",
+            (
+                f"${last_spot:.2f}"
+                + (
+                    f"  vs prior ${result['today_ref']:.2f}"
+                    if result["today_ref"] else ""
+                )
+            ),
+            delta_color="off",
+        )
+    if result["twins"]:
+        best = result["twins"][0]
+        with col_b:
+            st.metric(
+                "Best twin",
+                f"{best['day']:%b %d (%a)}",
+                f"RMSE {best['rmse']:.2f}pp so far",
+                delta_color="off",
+                help=(
+                    "Completed session whose % path is closest to "
+                    "today's path so far (root-mean-square error on "
+                    "today's sample times). Recomputed on every refresh "
+                    "as new points land — the twin can switch."
+                ),
+            )
+        with col_c:
+            st.metric(
+                "Twin closed",
+                (
+                    f"{best['final_pct']:+.2f}%"
+                    if best["final_pct"] is not None else "n/a"
+                ),
+                "where that day ended",
+                delta_color="off",
+            )
+        with col_d:
+            # Where the twin was at the same minute of day
+            twin_now = _interpolate_pct(
+                best["path"], today_path[-1]["minutes_from_open"]
+            )
+            st.metric(
+                "Twin at this time",
+                f"{twin_now:+.2f}%" if twin_now is not None else "n/a",
+                (
+                    f"today − twin = {last_pct - twin_now:+.2f}pp"
+                    if twin_now is not None else None
+                ),
+                delta_color="off",
+            )
+    else:
+        with col_b:
+            st.metric(
+                "Best twin",
+                "n/a",
+                f"library has {result['library_size']} sessions "
+                f"(need a longer overlapping path)",
+            )
+        with col_c:
+            st.metric("Twin closed", "n/a")
+        with col_d:
+            st.metric("Twin at this time", "n/a")
+
+    st.caption(
+        f"Library: {status['n_sessions']} session"
+        f"{'s' if status['n_sessions'] != 1 else ''} retained "
+        f"(today + last {daily_moves_store.KEEP_SESSIONS} completed). "
+        "Paths come from scheduler spot stamps, densified with Robinhood "
+        "5-minute bars when authenticated. Match score = RMSE of % vs "
+        "prior close on today's sample times; as today evolves the best "
+        "twin is recomputed and can change."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -1665,6 +2106,22 @@ st.caption(
     f"**{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}** "
     f"(local). Charts + PNGs are re-read from the DB / disk on every refresh."
 )
+
+# ---------------------------------------------------------------------------
+# Daily move twin — today vs best historical match (top of page)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("📈 Today's move vs historical twin")
+st.caption(
+    "Today's intraday % path (vs prior close) overlaid with the closest "
+    f"completed session from the last {daily_moves_store.KEEP_SESSIONS}. "
+    "As new points land, the best twin is recomputed — it can switch mid-day "
+    "when a better historical match emerges. The dashed continuation shows "
+    "where the current twin went after this time of day."
+)
+for ticker in tickers:
+    st.markdown(f"**{ticker}**")
+    _render_daily_move_twin(ticker)
 
 # ---------------------------------------------------------------------------
 # Implied-move time series (68% / 95% / 99.7%) per expiration
