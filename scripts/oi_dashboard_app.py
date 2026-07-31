@@ -1221,9 +1221,12 @@ for ticker in tickers:
 st.divider()
 st.header("📏 Implied vs actual daily moves")
 
-iva_days = st.slider(
-    "Sessions of history",
-    min_value=3, max_value=15, value=5, key="iva_days",
+iva_days = st.selectbox(
+    "History window",
+    options=[5, 10, 15, 20],
+    index=0,
+    format_func=lambda n: f"Last {n} working days",
+    key="iva_days",
 )
 _iva_end = _prev_business_day(date.today())
 st.caption(
