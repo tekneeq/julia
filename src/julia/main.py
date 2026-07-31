@@ -50,7 +50,10 @@ def ensure_logged_in(func):
                     "❌ Error: RH_USERNAME and RH_PASSWORD must be set in environment variables or .env file"
                 )
                 click.echo("Please set these credentials and try again.")
-                return
+                # Exit non-zero so batch/cron callers can tell this failed.
+                # Returning silently made `oi_batch.py` report every job as
+                # OK while writing no snapshots at all.
+                raise SystemExit(1)
 
             click.echo("🔐 Logging in to Robinhood...")
             try:
@@ -58,7 +61,7 @@ def ensure_logged_in(func):
                 click.echo("✅ Successfully logged in to Robinhood")
             except Exception as e:
                 click.echo(f"❌ Login failed: {e}")
-                return
+                raise SystemExit(1) from e
 
         return func(*args, **kwargs)
 
