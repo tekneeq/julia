@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -696,6 +697,175 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
             st.metric("Biggest move", "n/a")
 
 
+# ---------------------------------------------------------------------------
+# Today's most likely scenario — historical pattern matching
+# ---------------------------------------------------------------------------
+
+# How far back to scan for pattern occurrences. Days with no data are
+# skipped cheaply, so this is an upper bound, not a requirement.
+_PATTERN_SCAN_SESSIONS = 60
+
+_BUCKET_LABELS = {1: "under ±1σ", 2: "±1σ–±2σ", 3: "beyond ±2σ"}
+_ANSWER_LABELS = {1: "under ±1σ", 2: "under ±2σ", 3: "under ±3σ"}
+
+
+def _sigma_bucket(actual_pct: float, implied_1sigma_pct: float) -> int:
+    """1 = moved under ±1σ, 2 = between ±1σ and ±2σ, 3 = beyond ±2σ."""
+    az = abs(actual_pct) / implied_1sigma_pct
+    if az <= 1.0:
+        return 1
+    if az <= 2.0:
+        return 2
+    return 3
+
+
+def _pattern_prediction(
+    history: list[dict], today: date, max_matches: int,
+) -> dict | None:
+    """Predict today's sigma bucket purely from historical patterns.
+
+    Method — no distributional model, just counting what happened:
+
+    1. Bucket every completed session by how it moved vs its own
+       prior-session implied band: under ±1σ / ±1–2σ / beyond ±2σ.
+    2. The "pattern" is the buckets of the two most recent completed
+       sessions (e.g. yesterday under ±1σ, the day before ±1–2σ).
+    3. Walk back through history for the most recent times that same
+       two-session pattern appeared (up to ``max_matches``) and record
+       what the *next* day did each time.
+    4. The most frequent outcome is the call; its share of the matches
+       is the probability. Ties break toward the calmer bucket.
+
+    Fallbacks when the DB is young: if the two-session pattern has
+    fewer than 3 occurrences, match on yesterday's bucket alone; if
+    even that is thin, use the outcome distribution of all completed
+    sessions. ``basis`` reports which level answered.
+
+    Returns None with fewer than 3 completed sessions total.
+    """
+    conf1 = IMPLIED_MOVE_LEVELS[0][0]
+    completed = [
+        h for h in history
+        if h["day"] < today
+        and h["actual_pct"] is not None
+        and h["implied"] is not None
+    ]
+    if len(completed) < 3:
+        return None
+
+    buckets = [
+        (h["day"], _sigma_bucket(h["actual_pct"], h["implied"][conf1]))
+        for h in completed
+    ]  # oldest → newest
+
+    pattern = (buckets[-2][1], buckets[-1][1])
+    pattern_days = (buckets[-2][0], buckets[-1][0])
+
+    # Most recent matches first. The current pattern itself sits at
+    # i = len-2 and has no outcome yet, so scanning stops at len-3.
+    matches: list[tuple[date, int]] = []
+    for i in range(len(buckets) - 3, -1, -1):
+        if (buckets[i][1], buckets[i + 1][1]) == pattern:
+            matches.append(buckets[i + 2])
+        if len(matches) == max_matches:
+            break
+    basis = "two-session pattern"
+
+    if len(matches) < 3:
+        matches = []
+        for i in range(len(buckets) - 2, -1, -1):
+            if buckets[i][1] == pattern[1]:
+                matches.append(buckets[i + 1])
+            if len(matches) == max_matches:
+                break
+        basis = "yesterday's bucket only (two-session pattern too rare)"
+
+    if len(matches) < 3:
+        matches = list(reversed(buckets))[:max_matches]
+        basis = "overall distribution (patterns too rare in this history)"
+
+    counts = Counter(b for _d, b in matches)
+    # max count, ties to the calmer bucket
+    prediction = min(
+        (k for k in (1, 2, 3) if counts.get(k, 0) == max(counts.values())),
+    )
+    prob = counts[prediction] / len(matches)
+
+    out: dict = {
+        "pattern": pattern,
+        "pattern_days": pattern_days,
+        "matches": matches,
+        "counts": counts,
+        "prediction": prediction,
+        "prob": prob,
+        "basis": basis,
+        "today_implied1": None,
+        "today_ref_spot": None,
+        "today_actual_pct": None,
+    }
+    if history and history[-1]["day"] == today:
+        t = history[-1]
+        if t["implied"] is not None:
+            out["today_implied1"] = t["implied"][conf1]
+            out["today_ref_spot"] = t["ref_spot"]
+            out["today_actual_pct"] = t["actual_pct"]
+    return out
+
+
+def _render_pattern_prediction(
+    ticker: str, history: list[dict], max_matches: int,
+) -> None:
+    today = date.today()
+    res = _pattern_prediction(history, today, max_matches)
+    if res is None:
+        st.info(
+            f"Not enough history for {ticker} — the prediction needs at "
+            "least 3 completed sessions with both an implied band and an "
+            "actual move."
+        )
+        return
+
+    k = res["prediction"]
+    n = len(res["matches"])
+    st.metric(
+        f"{ticker} — most likely today",
+        _ANSWER_LABELS[k],
+        f"{res['prob'] * 100:.0f}% probability "
+        f"({res['counts'][k]} of {n} matches)",
+        delta_color="off",
+    )
+
+    d1, d2 = res["pattern_days"]
+    b1, b2 = res["pattern"]
+    dist = "  ·  ".join(
+        f"{_BUCKET_LABELS[b]} ×{res['counts'][b]}"
+        for b in (1, 2, 3) if res["counts"].get(b, 0) > 0
+    )
+    lines = [
+        f"Pattern observed: **{d1:%b %d}** moved {_BUCKET_LABELS[b1]}, "
+        f"**{d2:%b %d}** moved {_BUCKET_LABELS[b2]}. "
+        f"Matched on: {res['basis']}. "
+        f"Next-day outcomes across those {n} matches: {dist}."
+    ]
+    if res["today_implied1"] is not None and res["today_ref_spot"]:
+        imp1 = res["today_implied1"]
+        ref = res["today_ref_spot"]
+        band = imp1 * k
+        lines.append(
+            f"Today's ±{k}σ band (frozen from the prior session): "
+            f"**±{band:.2f}%** of ${ref:.2f} → "
+            f"**${ref * (1 - band / 100.0):.2f} – "
+            f"${ref * (1 + band / 100.0):.2f}**."
+        )
+        if res["today_actual_pct"] is not None:
+            so_far = abs(res["today_actual_pct"]) / imp1
+            lines.append(
+                f"So far today: {res['today_actual_pct']:+.2f}% "
+                f"= {so_far:.2f}σ."
+            )
+    st.caption("  ".join(lines))
+
+
 def _crossing_history(
     ticker: str, expiration: date, range_pct: float = 5.0,
 ) -> list[dict]:
@@ -1323,6 +1493,41 @@ for ticker in tickers:
     st.markdown(f"**{ticker}**")
     iva_hist = _implied_vs_actual_history(ticker, iva_days, _iva_end.isoformat())
     _render_implied_vs_actual_chart(ticker, iva_hist)
+
+# ---------------------------------------------------------------------------
+# Today's most likely scenario — historical pattern matching
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("🔮 Most likely scenario today")
+
+pred_matches = st.selectbox(
+    "Evidence",
+    options=[5, 10, 15, 20],
+    index=1,
+    format_func=lambda n: f"Last {n} times the pattern appeared",
+    key="pred_matches",
+    help=(
+        "How many past occurrences of the current pattern to count. "
+        "More = steadier probability, but reaches further into the past."
+    ),
+)
+st.caption(
+    "Purely historical — no model. Every completed session is bucketed "
+    "by how it moved vs its own prior-session implied band (under ±1σ, "
+    "±1–2σ, beyond ±2σ). Take the buckets of the last two sessions, find "
+    "the most recent times that same two-session pattern appeared, and "
+    "count what the next day did. The most frequent outcome is the "
+    "answer; its share of the matches is the probability. With a young "
+    "DB the exact pattern can be rare, so it falls back to matching on "
+    "yesterday's bucket alone, then to the overall outcome distribution "
+    "— the fine print under the answer says which was used."
+)
+
+for ticker in tickers:
+    pred_hist = _implied_vs_actual_history(
+        ticker, _PATTERN_SCAN_SESSIONS, _iva_end.isoformat()
+    )
+    _render_pattern_prediction(ticker, pred_hist, pred_matches)
 
 # ---------------------------------------------------------------------------
 # Crossing-strike time series (interactive, one per ticker × expiration)
