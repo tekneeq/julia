@@ -1633,55 +1633,118 @@ def _ingest_snapshot_paths(ticker: str, lookback_calendar_days: int = 60) -> Non
         )
 
 
-def _ingest_market_paths(ticker: str) -> None:
-    """Densify today + recent days with Robinhood 5-minute bars when possible.
+def _ohlc_bar_polyline(
+    m_start: int, o: float, h: float, low: float, c: float,
+) -> list[tuple[int, float]]:
+    """Turn one 5-minute OHLC bar into a short polyline that keeps the wick.
 
-    ``span='week'`` is the longest window RH serves at 5-minute resolution;
-    older sessions stay on the snapshot-derived path. No-op when auth fails.
+    Without this, a bar that opens high and closes near the low collapses
+    to a single close print — the sharp drop the user actually saw never
+    appears on the chart. Order follows the usual convention:
+    up-bar → open, low, high, close; down-bar → open, high, low, close.
+    Timestamps are spaced inside the 5-minute window.
     """
-    if not _rh_market_data_ready():
-        return
-    import robin_stocks.robinhood as rh
+    m0 = max(0, min(m_start, _SESSION_MINUTES))
+    m1 = max(0, min(m_start + 1, _SESSION_MINUTES))
+    m3 = max(0, min(m_start + 3, _SESSION_MINUTES))
+    m5 = max(0, min(m_start + 5, _SESSION_MINUTES))
+    # Flat / doji — just open → close.
+    if abs(h - low) < 1e-9:
+        return [(m0, o), (m5, c)] if m5 != m0 else [(m0, c)]
+    if c >= o:
+        return [(m0, o), (m1, low), (m3, h), (m5, c)]
+    return [(m0, o), (m1, h), (m3, low), (m5, c)]
 
+
+def _fetch_rh_5min(ticker: str, span: str) -> list[dict]:
+    """Raw 5-minute bars or [] on any failure."""
+    if not _rh_market_data_ready():
+        return []
+    import robin_stocks.robinhood as rh
     try:
-        candles = rh.stocks.get_stock_historicals(
-            ticker, interval="5minute", span="week", bounds="regular",
+        return rh.stocks.get_stock_historicals(
+            ticker, interval="5minute", span=span, bounds="regular",
         ) or []
     except Exception:
-        return
-    if not candles:
-        return
+        return []
 
-    by_day: dict[date, list[tuple[int, float]]] = {}
-    for c in candles:
-        begins = c.get("begins_at") or ""
-        close = c.get("close_price")
-        if not begins or close is None:
+
+def _fetch_rh_prior_close(ticker: str, session: date) -> float | None:
+    """Official prior regular-session close from daily bars, if available."""
+    if not _rh_market_data_ready():
+        return None
+    import robin_stocks.robinhood as rh
+    try:
+        bars = rh.stocks.get_stock_historicals(
+            ticker, interval="day", span="month", bounds="regular",
+        ) or []
+    except Exception:
+        return None
+    prior: tuple[date, float] | None = None
+    for bar in bars:
+        d_iso = (bar.get("begins_at") or "")[:10]
+        close = bar.get("close_price")
+        if not d_iso or close is None:
             continue
         try:
-            # begins_at is UTC; convert to local (ET in the container).
-            utc_dt = _parse_utc(begins)
-            local_dt = utc_dt.astimezone()
-            spot = float(close)
+            d = date.fromisoformat(d_iso)
+            c = float(close)
         except (TypeError, ValueError):
+            continue
+        if d < session and (prior is None or d > prior[0]):
+            prior = (d, c)
+    return prior[1] if prior else None
+
+
+def _ingest_market_paths(ticker: str) -> int:
+    """Densify today + recent days with Robinhood 5-minute OHLC bars.
+
+    Fetches ``span='day'`` (freshest today) and ``span='week'`` (recent
+    history). Each bar is expanded to an open→wick→close polyline so a
+    high open that dumps inside the first hour actually shows up as a
+    sharp drop, not a single close print. Returns the number of market
+    points upserted (0 when auth/network fails).
+    """
+    # Day first so today's bars win over the week payload on conflicts.
+    candles_by_key: dict[str, dict] = {}
+    for span in ("week", "day"):
+        for c in _fetch_rh_5min(ticker, span):
+            begins = c.get("begins_at") or ""
+            if begins:
+                candles_by_key[begins] = c
+    if not candles_by_key:
+        return 0
+
+    # day → list of (m_start, open, high, low, close)
+    by_day: dict[date, list[tuple[int, float, float, float, float]]] = {}
+    for begins, c in candles_by_key.items():
+        try:
+            local_dt = _parse_utc(begins).astimezone()
+            o = float(c["open_price"])
+            h = float(c["high_price"])
+            low = float(c["low_price"])
+            cl = float(c["close_price"])
+        except (KeyError, TypeError, ValueError):
             continue
         d = local_dt.date()
         if d.weekday() >= 5:
             continue
         m = daily_moves_store.minutes_from_open(local_dt)
-        if m < 0 or m > _SESSION_MINUTES:
+        if m < -1 or m > _SESSION_MINUTES:
             continue
-        by_day.setdefault(d, []).append((m, spot))
+        m = max(0, m)
+        by_day.setdefault(d, []).append((m, o, h, low, cl))
 
-    for d, pts in by_day.items():
-        # Prefer an existing session ref (from snapshot ingest); else
-        # fall back to the first bar of the day as a rough open-proxy
-        # only when we have no prior-close at all.
-        sessions = {
-            r["session_date"]: float(r["ref_spot"])
-            for r in daily_moves_store.list_sessions(ticker)
-        }
+    sessions = {
+        r["session_date"]: float(r["ref_spot"])
+        for r in daily_moves_store.list_sessions(ticker)
+    }
+    upserted = 0
+    for d, bars in by_day.items():
+        bars.sort(key=lambda b: b[0])
         ref = sessions.get(d.isoformat())
+        if ref is None:
+            ref = _fetch_rh_prior_close(ticker, d)
         if ref is None:
             ref = _prior_close_spot(ticker, d)
         if ref is None or ref <= 0:
@@ -1689,10 +1752,16 @@ def _ingest_market_paths(ticker: str) -> None:
         daily_moves_store.upsert_session(
             ticker=ticker, session_date=d, ref_spot=ref,
         )
-        # One point per minute bucket (last bar wins).
+        # Expand bars → polyline, then collapse to one spot per minute
+        # (last write wins, so close of a bar beats the next bar's open
+        # when they share a boundary minute).
         by_min: dict[int, float] = {}
-        for m, spot in pts:
-            by_min[m] = spot
+        for m_start, o, h, low, cl in bars:
+            for m, spot in _ohlc_bar_polyline(m_start, o, h, low, cl):
+                by_min[m] = spot
+        # Guarantee the true session open is at minute 0 (first bar open).
+        first = bars[0]
+        by_min[0] = first[1]  # open of earliest bar
         points = [
             (m, spot, (spot - ref) / ref * 100.0, "market")
             for m, spot in sorted(by_min.items())
@@ -1700,22 +1769,31 @@ def _ingest_market_paths(ticker: str) -> None:
         daily_moves_store.upsert_points(
             ticker=ticker, session_date=d, points=points,
         )
+        upserted += len(points)
+    return upserted
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
     """Refresh the 30-session library and return a small status dict."""
     _ingest_snapshot_paths(ticker)
-    _ingest_market_paths(ticker)
+    market_pts = _ingest_market_paths(ticker)
     today = date.fromisoformat(today_iso)
     deleted = daily_moves_store.prune(
         ticker, keep=daily_moves_store.KEEP_SESSIONS, today=today,
     )
     sessions = daily_moves_store.list_sessions(ticker)
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    sources = {p["source"] for p in today_path}
     return {
         "n_sessions": len(sessions),
         "pruned": deleted,
         "dates": [r["session_date"] for r in sessions],
+        "market_points": market_pts,
+        "today_points": len(today_path),
+        "today_sources": sorted(sources),
+        "today_first_m": today_path[0]["minutes_from_open"] if today_path else None,
+        "today_last_m": today_path[-1]["minutes_from_open"] if today_path else None,
     }
 
 
@@ -1821,6 +1899,25 @@ def _render_daily_move_twin(ticker: str) -> None:
             "sessions."
         )
         return
+
+    # Sparse / snapshot-only paths can't show a 9:30→10:10 dump — call
+    # that out so a missing sharp move isn't mistaken for a flat open.
+    sources = set(status.get("today_sources") or [])
+    first_m = status.get("today_first_m")
+    if "market" not in sources:
+        st.warning(
+            f"Today's path is **snapshot-only** ({status.get('today_points', 0)} "
+            "points from the scheduler). Sharp moves between batch fires "
+            "won't appear. Check Robinhood auth in the container "
+            "(`RH_USERNAME` / `RH_PASSWORD` or `~/.tokens`) so 5-minute "
+            "bars can densify the chart."
+        )
+    elif first_m is not None and first_m > 5:
+        st.warning(
+            f"Today's densified path starts at **{first_m} min after the "
+            "open** — the true 9:30 print may be missing from the market "
+            "feed. The open→first-bar move can look flatter than it was."
+        )
 
     fig = go.Figure()
     # Today — solid, thick
@@ -1989,14 +2086,21 @@ def _render_daily_move_twin(ticker: str) -> None:
         with col_d:
             st.metric("Twin at this time", "n/a")
 
+    src = "+".join(status.get("today_sources") or ["?"])
+    f_m = status.get("today_first_m")
+    l_m = status.get("today_last_m")
+    span = (
+        f"m{f_m}→m{l_m}" if f_m is not None and l_m is not None else "n/a"
+    )
     st.caption(
         f"Library: {status['n_sessions']} session"
         f"{'s' if status['n_sessions'] != 1 else ''} retained "
         f"(today + last {daily_moves_store.KEEP_SESSIONS} completed). "
-        "Paths come from scheduler spot stamps, densified with Robinhood "
-        "5-minute bars when authenticated. Match score = RMSE of % vs "
-        "prior close on today's sample times; as today evolves the best "
-        "twin is recomputed and can change."
+        f"Today: **{status.get('today_points', 0)}** points "
+        f"({src}, {span}). Market bars are expanded open→wick→close "
+        "so an opening dump shows as a sharp drop, not a single close. "
+        "Match score = recency-weighted RMSE of % vs prior close; as "
+        "today evolves the best twin is recomputed and can change."
     )
 
 
