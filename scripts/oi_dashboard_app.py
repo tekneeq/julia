@@ -380,6 +380,87 @@ def _render_implied_move_chart(
 # Implied vs actual daily moves (history of completed sessions)
 # ---------------------------------------------------------------------------
 
+@st.cache_resource(ttl=900, show_spinner=False)
+def _rh_market_data_ready() -> bool:
+    """Best-effort Robinhood auth so the candles can use official OHLC.
+
+    Reuses the CLI's cached token when one exists (~/.tokens is mounted
+    into the container), else tries RH_USERNAME/RH_PASSWORD from the
+    environment. Cached per process with a 15-min ttl so a transient
+    failure retries instead of disabling market data until restart.
+    """
+    try:
+        from julia.main import is_logged_in, login_robinhood
+        if is_logged_in():
+            return True
+        username = os.getenv("RH_USERNAME")
+        password = os.getenv("RH_PASSWORD")
+        if username and password:
+            login_robinhood(username, password)
+            return is_logged_in()
+    except Exception:
+        pass
+    return False
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _market_daily_ohlc(ticker: str, today_iso: str) -> dict[str, dict[str, float]]:
+    """date-iso → {open, high, low, close} from Robinhood; {} when
+    unavailable (not logged in, network down).
+
+    The snapshot-derived candles are sampled at the batch cadence: if the
+    scheduler starts late, the first snapshot masquerades as the "open"
+    and the true high/low between fires are invisible. Official bars fix
+    that. Past days come from daily bars; today from 5-minute candles,
+    because the running day-bar lags during the session.
+    """
+    if not _rh_market_data_ready():
+        return {}
+    import robin_stocks.robinhood as rh
+
+    out: dict[str, dict[str, float]] = {}
+    try:
+        bars = rh.stocks.get_stock_historicals(
+            ticker, interval="day", span="month", bounds="regular"
+        ) or []
+        for bar in bars:
+            d = (bar.get("begins_at") or "")[:10]
+            try:
+                out[d] = {
+                    "open": float(bar["open_price"]),
+                    "high": float(bar["high_price"]),
+                    "low": float(bar["low_price"]),
+                    "close": float(bar["close_price"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    try:
+        # Regular hours are 13:30–20:00 UTC, so the UTC date prefix of
+        # `begins_at` matches the ET session date.
+        candles = [
+            c for c in (rh.stocks.get_stock_historicals(
+                ticker, interval="5minute", span="day", bounds="regular"
+            ) or [])
+            if (c.get("begins_at") or "").startswith(today_iso)
+        ]
+        opens = [c for c in candles if c.get("open_price")]
+        highs = [float(c["high_price"]) for c in candles if c.get("high_price")]
+        lows = [float(c["low_price"]) for c in candles if c.get("low_price")]
+        closes = [c for c in candles if c.get("close_price")]
+        if opens and highs and lows and closes:
+            out[today_iso] = {
+                "open": float(opens[0]["open_price"]),
+                "high": max(highs),
+                "low": min(lows),
+                "close": float(closes[-1]["close_price"]),
+            }
+    except Exception:
+        pass
+    return out
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _implied_vs_actual_history(
     ticker: str, num_days: int, end_iso: str,
@@ -400,26 +481,36 @@ def _implied_vs_actual_history(
     same reference snapshot's spot, signed (down = negative), forming a
     standard OHLC candle per session:
 
-    * open  = first spot captured on D
+    * open / high / low = official market values from Robinhood when
+      reachable (``ohlc_source == "market"``); otherwise derived from
+      every snapshot captured on D regardless of expiration
+      (``ohlc_source == "snapshots"``). The snapshot fallback is sampled
+      at the batch cadence: a late scheduler start makes the first
+      snapshot masquerade as the open, and extremes between fires are
+      invisible.
     * actual = last spot captured on D (the session "close" for past
-      days; the latest print for today)
-    * high / low = max / min spot across every snapshot captured on D,
-      regardless of expiration — each batch fire stamps the same spot on
-      ~5 expiration rows, so this is the densest picture of where price
-      traded that the DB has. Still snapshot-sampled: the true intraday
-      extremes between fires are invisible, and "open" is really the
-      first batch fire of the session, not the 9:30 print.
+      days; the latest print for today). Stays snapshot-based even when
+      market data is available, so today's candle keeps updating on the
+      same clock as the rest of the dashboard; the high/low are clamped
+      to include it. Days with market data but zero snapshots fall back
+      to the official close.
 
     One dict per day, oldest → newest:
         {"day", "implied" ({conf: pct} or None), "actual_pct",
          "open_pct", "high_pct", "low_pct",
-         "open_spot", "high_spot", "low_spot",
+         "open_spot", "high_spot", "low_spot", "ohlc_source",
          "ref_spot", "close_spot", "iv", "days_to_exp",
          "implied_captured_at_local", "close_captured_at_local",
          "open_captured_at_local"}
     """
     end = date.fromisoformat(end_iso)
     days = _past_business_days(end, num_days)
+
+    # Official market OHLC (empty dict when Robinhood is unreachable).
+    # Snapshot-derived values are only the fallback: a late scheduler
+    # start makes the first snapshot masquerade as the open, and highs/
+    # lows between fires are missed entirely.
+    market_ohlc = _market_daily_ohlc(ticker, end_iso)
 
     # Spot path per day from ALL snapshots of the ticker. limit=10000
     # covers ~2000 batch fires — far more than the deepest window shown.
@@ -479,22 +570,40 @@ def _implied_vs_actual_history(
                 entry["implied_captured_at_local"] = local_dt
 
         day_spots = spots_by_day.get(day, [])
-        if day_spots and entry["ref_spot"] is not None:
+        market = market_ohlc.get(day.isoformat())
+        entry["ohlc_source"] = "snapshots"
+        if entry["ref_spot"] is not None and (day_spots or market):
             ref_spot = entry["ref_spot"]
 
             def _pct(spot: float) -> float:
                 return (spot - ref_spot) / ref_spot * 100.0
 
-            open_dt, open_spot = min(day_spots, key=lambda p: p[0])
-            close_dt, close_spot = max(day_spots, key=lambda p: p[0])
-            entry["open_spot"] = open_spot
-            entry["open_captured_at_local"] = open_dt
-            entry["open_pct"] = _pct(open_spot)
-            entry["close_spot"] = close_spot
-            entry["close_captured_at_local"] = close_dt
-            entry["actual_pct"] = _pct(close_spot)
-            entry["high_spot"] = max(s for _dt, s in day_spots)
-            entry["low_spot"] = min(s for _dt, s in day_spots)
+            if day_spots:
+                open_dt, open_spot = min(day_spots, key=lambda p: p[0])
+                close_dt, close_spot = max(day_spots, key=lambda p: p[0])
+                entry["open_spot"] = open_spot
+                entry["open_captured_at_local"] = open_dt
+                entry["close_spot"] = close_spot
+                entry["close_captured_at_local"] = close_dt
+                entry["high_spot"] = max(s for _dt, s in day_spots)
+                entry["low_spot"] = min(s for _dt, s in day_spots)
+
+            if market:
+                # Official open/high/low replace the snapshot-sampled
+                # ones. The close stays snapshot-based when snapshots
+                # exist (it's the value the implied bands are scored
+                # against, and hover cites its capture time); clamp the
+                # range so the candle stays well-formed either way.
+                entry["open_spot"] = market["open"]
+                entry["open_captured_at_local"] = None
+                if entry["close_spot"] is None:
+                    entry["close_spot"] = market["close"]
+                entry["high_spot"] = max(market["high"], entry["close_spot"])
+                entry["low_spot"] = min(market["low"], entry["close_spot"])
+                entry["ohlc_source"] = "market"
+
+            entry["actual_pct"] = _pct(entry["close_spot"])
+            entry["open_pct"] = _pct(entry["open_spot"])
             entry["high_pct"] = _pct(entry["high_spot"])
             entry["low_pct"] = _pct(entry["low_spot"])
         out.append(entry)
@@ -577,18 +686,28 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
     # above the open, red = below (standard convention). Candlestick
     # traces don't support hovertemplate, so the $ context rides along
     # as `text`, appended after the default O/H/L/C readout.
-    candle_text = [
-        (
+    candle_text = []
+    for h in history:
+        if h["actual_pct"] is None or h["ref_spot"] is None:
+            candle_text.append("")
+            continue
+        src = h.get("ohlc_source", "snapshots")
+        src_note = (
+            "OHLC from market"
+            if src == "market"
+            else "OHLC from snapshots (no market data)"
+        )
+        close_note = (
+            f"last snapshot {h['close_captured_at_local']:%b %d %H:%M}"
+            if h["close_captured_at_local"] is not None
+            else "official close"
+        )
+        candle_text.append(
             f"ref ${h['ref_spot']:.2f} → close ${h['close_spot']:.2f}  "
             f"(actual {h['actual_pct']:+.2f}% vs prior session)<br>"
             f"O ${h['open_spot']:.2f} · H ${h['high_spot']:.2f} · "
-            f"L ${h['low_spot']:.2f}"
-            f"  ·  last snapshot {h['close_captured_at_local']:%b %d %H:%M}"
+            f"L ${h['low_spot']:.2f}  ·  {close_note}  ·  {src_note}"
         )
-        if h["actual_pct"] is not None and h["ref_spot"] is not None
-        else ""
-        for h in history
-    ]
     fig.add_trace(go.Candlestick(
         x=labels,
         open=[h["open_pct"] for h in history],
@@ -1484,9 +1603,13 @@ st.caption(
     "green if it closed above the open, red below — with everything "
     "measured against that same prior-day spot, so **0% is where the prior "
     "session left off** and the close's height above/below 0% is the "
-    "actual daily move. Today's candle updates live as snapshots land. A "
-    "wick or body poking outside a dotted band = the market moved more "
-    "than options had priced in."
+    "actual daily move. Open/high/low prefer **official market bars** "
+    "(Robinhood); the close stays snapshot-based so today's candle "
+    "updates with each batch fire. If market data is unreachable, OHLC "
+    "falls back to the day's snapshots — which can miss the true open "
+    "or high if the scheduler started late. A wick or body poking "
+    "outside a dotted band = the market moved more than options had "
+    "priced in."
 )
 
 for ticker in tickers:
