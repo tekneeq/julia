@@ -395,22 +395,27 @@ def _implied_vs_actual_history(
     new snapshots land. Intraday repricing of D's own implied move lives
     in the "Implied move over time" section above.
 
-    Actual, high, and low are all measured against that same reference
-    snapshot's spot, signed (down = negative):
+    Open, high, low, and actual (close) are all measured against that
+    same reference snapshot's spot, signed (down = negative), forming a
+    standard OHLC candle per session:
 
+    * open  = first spot captured on D
     * actual = last spot captured on D (the session "close" for past
       days; the latest print for today)
     * high / low = max / min spot across every snapshot captured on D,
       regardless of expiration — each batch fire stamps the same spot on
       ~5 expiration rows, so this is the densest picture of where price
       traded that the DB has. Still snapshot-sampled: the true intraday
-      extremes between fires are invisible.
+      extremes between fires are invisible, and "open" is really the
+      first batch fire of the session, not the 9:30 print.
 
     One dict per day, oldest → newest:
         {"day", "implied" ({conf: pct} or None), "actual_pct",
-         "high_pct", "low_pct", "high_spot", "low_spot",
+         "open_pct", "high_pct", "low_pct",
+         "open_spot", "high_spot", "low_spot",
          "ref_spot", "close_spot", "iv", "days_to_exp",
-         "implied_captured_at_local", "close_captured_at_local"}
+         "implied_captured_at_local", "close_captured_at_local",
+         "open_captured_at_local"}
     """
     end = date.fromisoformat(end_iso)
     days = _past_business_days(end, num_days)
@@ -443,8 +448,10 @@ def _implied_vs_actual_history(
             "day": day,
             "implied": None,
             "actual_pct": None,
+            "open_pct": None,
             "high_pct": None,
             "low_pct": None,
+            "open_spot": None,
             "high_spot": None,
             "low_spot": None,
             "ref_spot": None,
@@ -453,6 +460,7 @@ def _implied_vs_actual_history(
             "days_to_exp": None,
             "implied_captured_at_local": None,
             "close_captured_at_local": None,
+            "open_captured_at_local": None,
         }
         if ref is not None:
             r, local_dt = ref
@@ -476,7 +484,11 @@ def _implied_vs_actual_history(
             def _pct(spot: float) -> float:
                 return (spot - ref_spot) / ref_spot * 100.0
 
+            open_dt, open_spot = min(day_spots, key=lambda p: p[0])
             close_dt, close_spot = max(day_spots, key=lambda p: p[0])
+            entry["open_spot"] = open_spot
+            entry["open_captured_at_local"] = open_dt
+            entry["open_pct"] = _pct(open_spot)
             entry["close_spot"] = close_spot
             entry["close_captured_at_local"] = close_dt
             entry["actual_pct"] = _pct(close_spot)
@@ -558,65 +570,40 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
             hoverinfo="skip",
         ))
 
-    actual_vals = [h["actual_pct"] for h in history]
-    bar_colors = [
-        "#2ca02c" if (v is not None and v >= 0) else "#d62728"
-        for v in actual_vals
-    ]
-    bar_customdata = [
-        [
-            h["ref_spot"] or 0.0,
-            h["close_spot"] or 0.0,
-            h["close_captured_at_local"].strftime("%b %d %H:%M")
-            if h["close_captured_at_local"] else "n/a",
-        ]
+    # Traditional candlestick per session: body = open→close, wicks =
+    # high/low — everything in % of the prior-session reference spot, so
+    # 0% is where yesterday's snapshot left off. Green body = closed
+    # above the open, red = below (standard convention). Candlestick
+    # traces don't support hovertemplate, so the $ context rides along
+    # as `text`, appended after the default O/H/L/C readout.
+    candle_text = [
+        (
+            f"ref ${h['ref_spot']:.2f} → close ${h['close_spot']:.2f}  "
+            f"(actual {h['actual_pct']:+.2f}% vs prior session)<br>"
+            f"O ${h['open_spot']:.2f} · H ${h['high_spot']:.2f} · "
+            f"L ${h['low_spot']:.2f}"
+            f"  ·  last snapshot {h['close_captured_at_local']:%b %d %H:%M}"
+        )
+        if h["actual_pct"] is not None and h["ref_spot"] is not None
+        else ""
         for h in history
     ]
-    fig.add_trace(go.Bar(
-        x=labels, y=actual_vals,
-        name="Actual move",
-        marker_color=bar_colors,
-        opacity=0.75,
-        width=0.45,
-        customdata=bar_customdata,
-        hovertemplate=(
-            "Actual: <b>%{y:+.2f}%</b>  "
-            "($%{customdata[0]:.2f} → $%{customdata[1]:.2f}, "
-            "last snapshot %{customdata[2]})<extra></extra>"
-        ),
-    ))
-
-    # Session high/low as a narrow floating bar spanning low% → high%,
-    # drawn over the wide actual bar — reads like a candle wick, so all
-    # three values coexist without hiding each other.
-    range_heights = [
-        h["high_pct"] - h["low_pct"]
-        if h["high_pct"] is not None else None
-        for h in history
-    ]
-    range_customdata = [
-        [
-            h["high_pct"] or 0.0,
-            h["low_pct"] or 0.0,
-            h["high_spot"] or 0.0,
-            h["low_spot"] or 0.0,
-        ]
-        for h in history
-    ]
-    fig.add_trace(go.Bar(
+    fig.add_trace(go.Candlestick(
         x=labels,
-        y=range_heights,
-        base=[h["low_pct"] for h in history],
-        name="Session high–low",
-        marker_color="#444",
-        opacity=0.9,
-        width=0.12,
-        customdata=range_customdata,
-        hovertemplate=(
-            "High: <b>%{customdata[0]:+.2f}%</b> ($%{customdata[2]:.2f})  ·  "
-            "Low: <b>%{customdata[1]:+.2f}%</b> ($%{customdata[3]:.2f})"
-            "<extra></extra>"
+        open=[h["open_pct"] for h in history],
+        high=[h["high_pct"] for h in history],
+        low=[h["low_pct"] for h in history],
+        close=[h["actual_pct"] for h in history],
+        name="Session (O/H/L/C)",
+        increasing=dict(
+            line=dict(color="#2ca02c", width=1.5),
+            fillcolor="rgba(44, 160, 44, 0.85)",
         ),
+        decreasing=dict(
+            line=dict(color="#d62728", width=1.5),
+            fillcolor="rgba(214, 39, 40, 0.85)",
+        ),
+        text=candle_text,
     ))
 
     fig.add_hline(y=0, line_color="#999", line_width=1)
@@ -628,7 +615,7 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
         hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0),
         margin=dict(t=60, l=60, r=20, b=40),
-        barmode="overlay",
+        xaxis_rangeslider_visible=False,
     )
     fig.update_xaxes(type="category")
     fig.update_yaxes(ticksuffix="%")
@@ -1322,12 +1309,14 @@ st.caption(
     "(weekends skipped), including today. Dotted lines are the ±1σ / ±2σ / "
     "±3σ implied moves **as priced before each session opened** (latest "
     "snapshot from the prior day) — today's bands are frozen at yesterday's "
-    "close too; intraday repricing lives in the section above. Wide bars "
-    "are the actual move vs that same prior-day spot (green up, red down); "
-    "today's bar updates live as snapshots land. The thin dark bar is the "
-    "session's high–low range from the day's snapshots. A bar poking "
-    "outside a dotted band = the market moved more than options had "
-    "priced in."
+    "close too; intraday repricing lives in the section above. Each session "
+    "is a traditional candlestick — body = open→close, wicks = high/low, "
+    "green if it closed above the open, red below — with everything "
+    "measured against that same prior-day spot, so **0% is where the prior "
+    "session left off** and the close's height above/below 0% is the "
+    "actual daily move. Today's candle updates live as snapshots land. A "
+    "wick or body poking outside a dotted band = the market moved more "
+    "than options had priced in."
 )
 
 for ticker in tickers:
