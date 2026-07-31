@@ -96,6 +96,40 @@ def upsert_session(
         )
 
 
+def rebase_session(
+    *,
+    ticker: str,
+    session_date: date,
+    ref_spot: float,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Set ``ref_spot`` and recompute every point's ``pct`` against it.
+
+    Used when we discover the official prior close after points were
+    already written against a stale snapshot-based ref.
+    """
+    ref = float(ref_spot)
+    iso = session_date.isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_move_sessions (ticker, session_date, ref_spot)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker, session_date) DO UPDATE SET
+                ref_spot = excluded.ref_spot
+            """,
+            (ticker, iso, ref),
+        )
+        conn.execute(
+            """
+            UPDATE daily_move_points
+            SET pct = (spot - ?) / ? * 100.0
+            WHERE ticker = ? AND session_date = ? AND ? != 0
+            """,
+            (ref, ref, ticker, iso, ref),
+        )
+
+
 def upsert_points(
     *,
     ticker: str,

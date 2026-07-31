@@ -1669,31 +1669,59 @@ def _fetch_rh_5min(ticker: str, span: str) -> list[dict]:
         return []
 
 
-def _fetch_rh_prior_close(ticker: str, session: date) -> float | None:
-    """Official prior regular-session close from daily bars, if available."""
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_rh_daily_closes(ticker: str) -> dict[str, float]:
+    """date-iso → regular-session close from Robinhood daily bars."""
     if not _rh_market_data_ready():
-        return None
+        return {}
     import robin_stocks.robinhood as rh
     try:
         bars = rh.stocks.get_stock_historicals(
             ticker, interval="day", span="month", bounds="regular",
         ) or []
     except Exception:
-        return None
-    prior: tuple[date, float] | None = None
+        return {}
+    out: dict[str, float] = {}
     for bar in bars:
         d_iso = (bar.get("begins_at") or "")[:10]
         close = bar.get("close_price")
         if not d_iso or close is None:
             continue
         try:
-            d = date.fromisoformat(d_iso)
-            c = float(close)
+            out[d_iso] = float(close)
         except (TypeError, ValueError):
             continue
+    return out
+
+
+def _official_prior_close(ticker: str, session: date) -> float | None:
+    """Most recent official daily close strictly before ``session``."""
+    closes = _fetch_rh_daily_closes(ticker)
+    prior: tuple[date, float] | None = None
+    for d_iso, close in closes.items():
+        try:
+            d = date.fromisoformat(d_iso)
+        except ValueError:
+            continue
         if d < session and (prior is None or d > prior[0]):
-            prior = (d, c)
+            prior = (d, close)
     return prior[1] if prior else None
+
+
+def _resolve_ref_spot(ticker: str, session: date) -> tuple[float | None, str]:
+    """Pick the % baseline. Official prior close always wins.
+
+    Snapshot-based refs are last-batch stamps, which can sit well above
+    or below the real 4pm close — that flattens an opening gap on the
+    twin chart (e.g. TradingView prev close 741.69 vs a 743.45 snapshot).
+    """
+    official = _official_prior_close(ticker, session)
+    if official is not None and official > 0:
+        return official, "official"
+    snap = _prior_close_spot(ticker, session)
+    if snap is not None and snap > 0:
+        return snap, "snapshot"
+    return None, "none"
 
 
 def _ingest_market_paths(ticker: str) -> int:
@@ -1705,7 +1733,7 @@ def _ingest_market_paths(ticker: str) -> int:
     sharp drop, not a single close print. Returns the number of market
     points upserted (0 when auth/network fails).
     """
-    # Day first so today's bars win over the week payload on conflicts.
+    # Day last so today's bars win over the week payload on conflicts.
     candles_by_key: dict[str, dict] = {}
     for span in ("week", "day"):
         for c in _fetch_rh_5min(ticker, span):
@@ -1735,21 +1763,15 @@ def _ingest_market_paths(ticker: str) -> int:
         m = max(0, m)
         by_day.setdefault(d, []).append((m, o, h, low, cl))
 
-    sessions = {
-        r["session_date"]: float(r["ref_spot"])
-        for r in daily_moves_store.list_sessions(ticker)
-    }
     upserted = 0
     for d, bars in by_day.items():
         bars.sort(key=lambda b: b[0])
-        ref = sessions.get(d.isoformat())
+        ref, _src = _resolve_ref_spot(ticker, d)
         if ref is None:
-            ref = _fetch_rh_prior_close(ticker, d)
-        if ref is None:
-            ref = _prior_close_spot(ticker, d)
-        if ref is None or ref <= 0:
             continue
-        daily_moves_store.upsert_session(
+        # rebase_session updates ref AND rewrites pct on any points
+        # already stored against a stale snapshot-based ref.
+        daily_moves_store.rebase_session(
             ticker=ticker, session_date=d, ref_spot=ref,
         )
         # Expand bars → polyline, then collapse to one spot per minute
@@ -1773,11 +1795,35 @@ def _ingest_market_paths(ticker: str) -> int:
     return upserted
 
 
+def _rebase_all_sessions_to_official_close(ticker: str) -> int:
+    """Correct every stored session whose ref isn't the official prior close.
+
+    Snapshot ingest runs first and can lock in a mid-afternoon stamp as
+    ``ref_spot``. Even after densifying with market bars, % paths stay
+    wrong until we rebase. Returns how many sessions were corrected.
+    """
+    corrected = 0
+    for s in daily_moves_store.list_sessions(ticker):
+        d = date.fromisoformat(s["session_date"])
+        official = _official_prior_close(ticker, d)
+        if official is None or official <= 0:
+            continue
+        old = float(s["ref_spot"])
+        if abs(old - official) / official < 1e-5:
+            continue
+        daily_moves_store.rebase_session(
+            ticker=ticker, session_date=d, ref_spot=official,
+        )
+        corrected += 1
+    return corrected
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
     """Refresh the 30-session library and return a small status dict."""
     _ingest_snapshot_paths(ticker)
     market_pts = _ingest_market_paths(ticker)
+    rebased = _rebase_all_sessions_to_official_close(ticker)
     today = date.fromisoformat(today_iso)
     deleted = daily_moves_store.prune(
         ticker, keep=daily_moves_store.KEEP_SESSIONS, today=today,
@@ -1785,15 +1831,28 @@ def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
     sessions = daily_moves_store.list_sessions(ticker)
     today_path = daily_moves_store.get_session_path(ticker, today)
     sources = {p["source"] for p in today_path}
+    today_ref = next(
+        (float(s["ref_spot"]) for s in sessions
+         if s["session_date"] == today_iso),
+        None,
+    )
+    _, ref_src = _resolve_ref_spot(ticker, today)
     return {
         "n_sessions": len(sessions),
         "pruned": deleted,
+        "rebased": rebased,
         "dates": [r["session_date"] for r in sessions],
         "market_points": market_pts,
         "today_points": len(today_path),
         "today_sources": sorted(sources),
         "today_first_m": today_path[0]["minutes_from_open"] if today_path else None,
         "today_last_m": today_path[-1]["minutes_from_open"] if today_path else None,
+        "today_ref": today_ref,
+        "today_ref_source": ref_src,
+        "today_open_pct": today_path[0]["pct"] if today_path else None,
+        "today_low_pct": (
+            min(p["pct"] for p in today_path) if today_path else None
+        ),
     }
 
 
@@ -2020,19 +2079,31 @@ def _render_daily_move_twin(ticker: str) -> None:
     # Verdict cards
     last_pct = today_path[-1]["pct"]
     last_spot = today_path[-1]["spot"]
+    open_pct = status.get("today_open_pct")
+    low_pct = status.get("today_low_pct")
+    ref_src = status.get("today_ref_source", "?")
     col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
+        prior_txt = (
+            f"${last_spot:.2f} vs prior ${result['today_ref']:.2f} "
+            f"({ref_src})"
+            if result["today_ref"] else f"${last_spot:.2f}"
+        )
+        if open_pct is not None and low_pct is not None:
+            prior_txt = (
+                f"open {open_pct:+.2f}% · low {low_pct:+.2f}% · {prior_txt}"
+            )
         st.metric(
             "Today so far",
             f"{last_pct:+.2f}%",
-            (
-                f"${last_spot:.2f}"
-                + (
-                    f"  vs prior ${result['today_ref']:.2f}"
-                    if result["today_ref"] else ""
-                )
-            ),
+            prior_txt,
             delta_color="off",
+            help=(
+                "Percent vs prior regular-session close. Prior close "
+                "should match TradingView's 'Prev close' — if it says "
+                "(snapshot) instead of (official), Robinhood daily bars "
+                "weren't available and the open gap can look flattened."
+            ),
         )
     if result["twins"]:
         best = result["twins"][0]
@@ -2092,15 +2163,26 @@ def _render_daily_move_twin(ticker: str) -> None:
     span = (
         f"m{f_m}→m{l_m}" if f_m is not None and l_m is not None else "n/a"
     )
+    rebased = status.get("rebased", 0)
     st.caption(
         f"Library: {status['n_sessions']} session"
         f"{'s' if status['n_sessions'] != 1 else ''} retained "
         f"(today + last {daily_moves_store.KEEP_SESSIONS} completed). "
         f"Today: **{status.get('today_points', 0)}** points "
-        f"({src}, {span}). Market bars are expanded open→wick→close "
-        "so an opening dump shows as a sharp drop, not a single close. "
-        "Match score = recency-weighted RMSE of % vs prior close; as "
-        "today evolves the best twin is recomputed and can change."
+        f"({src}, {span}, prior close {ref_src}"
+        + (
+            f" ${status['today_ref']:.2f}"
+            if status.get("today_ref") else ""
+        )
+        + "). "
+        + (
+            f"Rebased {rebased} session{'s' if rebased != 1 else ''} "
+            "onto official prior closes. "
+            if rebased else ""
+        )
+        + "Market bars are expanded open→wick→close so an opening dump "
+        "shows as a sharp drop. Match score = recency-weighted RMSE; "
+        "the best twin is recomputed as today evolves."
     )
 
 
