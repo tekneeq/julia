@@ -197,6 +197,84 @@ def _atm_iv_from_strikes(strikes, spot: float) -> float | None:
     return sum(ivs) / len(ivs)
 
 
+# Target tenor for the ticker-level IV series that feeds IV Rank.
+# ~30 calendar days is the conventional "front" IV used by IV-rank
+# screens; we pick whichever expiration that day was closest to it.
+_IV_RANK_TARGET_DTE = 30
+_IV_RANK_LOOKBACK_DAYS = 365  # calendar days of snapshot history to scan
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _ticker_daily_atm_iv(ticker: str) -> list[tuple[date, float]]:
+    """One ATM IV per local trading day for ``ticker``.
+
+    For each day, among every snapshot fired that day, keep the one
+    whose expiration is closest to ``capture + 30 calendar days``
+    (DTE ≥ 1 required), then take that chain's ATM IV. Returns
+    oldest → newest. Empty when the DB has nothing yet.
+    """
+    cutoff = date.today() - timedelta(days=_IV_RANK_LOOKBACK_DAYS)
+    rows = gex_store.recent_snapshots(ticker=ticker, limit=10000)
+    # local_date → (distance_to_target_dte, captured_at, snapshot_row)
+    best: dict[date, tuple[int, datetime, object]] = {}
+    for r in rows:
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        d = local_dt.date()
+        if d < cutoff:
+            continue
+        try:
+            exp = date.fromisoformat(r["expiration_date"])
+        except ValueError:
+            continue
+        dte = (exp - d).days
+        if dte < 1:
+            continue
+        dist = abs(dte - _IV_RANK_TARGET_DTE)
+        prev = best.get(d)
+        # Prefer closer-to-30-DTE; on a tie keep the later snapshot.
+        if (
+            prev is None
+            or dist < prev[0]
+            or (dist == prev[0] and local_dt > prev[1])
+        ):
+            best[d] = (dist, local_dt, r)
+
+    out: list[tuple[date, float]] = []
+    for d in sorted(best):
+        _dist, _ts, r = best[d]
+        iv = _atm_iv_from_strikes(
+            gex_store.get_strikes(r["id"]), float(r["spot_price"])
+        )
+        if iv is not None:
+            out.append((d, iv))
+    return out
+
+
+def _iv_rank(current_iv: float, daily: list[tuple[date, float]]) -> dict:
+    """Standard IV Rank of ``current_iv`` against a daily ATM-IV series.
+
+    IV Rank = (current − min) / (max − min) × 100 over the series.
+    0 = at the lookback low, 100 = at the lookback high. Returns
+    ``rank=None`` when the series is empty or flat (max == min).
+    """
+    if not daily:
+        return {"rank": None, "n": 0, "lo": None, "hi": None}
+    ivs = [iv for _d, iv in daily]
+    # Fold the live reading into the range so a brand-new high/low
+    # registers as 100 / 0 rather than extrapolating past the series.
+    lo = min(min(ivs), current_iv)
+    hi = max(max(ivs), current_iv)
+    n = len(ivs)
+    if hi - lo < 1e-9:
+        return {"rank": None, "n": n, "lo": lo, "hi": hi}
+    return {
+        "rank": (current_iv - lo) / (hi - lo) * 100.0,
+        "n": n,
+        "lo": lo,
+        "hi": hi,
+    }
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _implied_move_history(ticker: str, expiration_iso: str) -> list[dict]:
     """For each snapshot of (ticker, expiration), compute implied moves
@@ -339,7 +417,7 @@ def _render_implied_move_chart(
 
     first = history[0]
     d_iv = last["iv"] - first["iv"]
-    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
     for col, (conf, label, _color) in zip((col_a, col_b, col_c), IMPLIED_MOVE_LEVELS):
         with col:
             latest_val = last[f"{key}_{conf}"]
@@ -362,12 +440,59 @@ def _render_implied_move_chart(
             f"{last['iv']*100:.1f}%",
             None if single else f"{d_iv*100:+.2f}pp vs first",
             help=(
-                "Annualized at-the-money implied volatility, driving "
-                "the moves above. Rising = market pricing in more "
-                "uncertainty; falling = vol crush. Spikes into events "
-                "(FOMC, CPI, earnings), decays afterward."
+                "Annualized at-the-money implied volatility for this "
+                "expiration, driving the moves above. Rising = market "
+                "pricing in more uncertainty; falling = vol crush. "
+                "Spikes into events (FOMC, CPI, earnings), decays "
+                "afterward."
             ),
         )
+    with col_e:
+        # IV Rank is a ticker-level reading (≈30-DTE ATM IV over the
+        # snapshot history), shown next to this expiration's ATM IV so
+        # you can tell whether today's vol is cheap or rich vs recent
+        # range — not a rank of this single expiration alone.
+        daily_iv = _ticker_daily_atm_iv(ticker)
+        # Prefer the series' own latest IV as "current" so the rank and
+        # its lookback share one methodology; fall back to this
+        # expiration's ATM IV when the series is empty.
+        current_for_rank = daily_iv[-1][1] if daily_iv else last["iv"]
+        rank_info = _iv_rank(current_for_rank, daily_iv)
+        if rank_info["rank"] is None:
+            st.metric(
+                "IV Rank",
+                "n/a",
+                (
+                    f"need more history ({rank_info['n']} day"
+                    f"{'s' if rank_info['n'] != 1 else ''})"
+                ),
+                help=(
+                    "IV Rank = (current − min) / (max − min) over the "
+                    "ticker's daily ≈30-DTE ATM IV from your snapshots. "
+                    "Needs at least two distinct IV levels in the "
+                    "lookback to compute."
+                ),
+            )
+        else:
+            lo_pct = rank_info["lo"] * 100
+            hi_pct = rank_info["hi"] * 100
+            st.metric(
+                "IV Rank",
+                f"{rank_info['rank']:.0f}",
+                f"≈30D ATM {current_for_rank * 100:.1f}%  ·  "
+                f"{rank_info['n']}d  ·  {lo_pct:.1f}–{hi_pct:.1f}%",
+                help=(
+                    "Where the ticker's ≈30-DTE ATM IV sits between its "
+                    "lookback low (0) and high (100), from your snapshot "
+                    "history. Low rank = vol is cheap vs recent range; "
+                    "high rank = expensive. Distinct from this "
+                    "expiration's ATM IV on the left — that number is "
+                    "tenor-specific; IV Rank is the ticker regime. "
+                    f"Current ≈30D ATM = {current_for_rank * 100:.1f}%, "
+                    f"range {lo_pct:.1f}–{hi_pct:.1f}% over "
+                    f"{rank_info['n']} days."
+                ),
+            )
     if single:
         st.caption(
             "Only one snapshot so far — as new snapshots arrive, this "
