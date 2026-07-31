@@ -130,11 +130,22 @@ def _extract_saved_path(text: str) -> str | None:
 
 
 def _last_meaningful_line(text: str) -> str:
-    for line in reversed(text.splitlines()):
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return ""
+    """Best one-line summary of a job's output.
+
+    Prefers an explicit error line, because the genuinely useful message
+    ("❌ Error: RH_USERNAME ... must be set") is usually followed on
+    stderr by unrelated tool chatter (uv deprecation warnings and the
+    like) that would otherwise be all you see in the batch summary.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    noise = ("warning:", "warn:", "note:")
+    for line in reversed(lines):
+        if line.startswith("❌") or line.startswith("Error:"):
+            return line
+    for line in reversed(lines):
+        if not line.lower().startswith(noise):
+            return line
+    return lines[-1] if lines else ""
 
 
 def main() -> int:
