@@ -379,56 +379,74 @@ def _render_implied_move_chart(
 # Implied vs actual daily moves (history of completed sessions)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def _implied_vs_actual_history(
     ticker: str, num_days: int, end_iso: str,
 ) -> list[dict]:
     """For each of the ``num_days`` business days ending at ``end_iso``
-    (inclusive), pair the implied move that was priced in *before* the
-    session with the move that actually happened.
+    (inclusive — normally today), pair the implied move that was priced
+    in *before* the session with the move that actually happened.
 
     Key convention (per the section's purpose): the implied numbers for
     day D come from the **latest snapshot captured before D** — normally
     the last batch fire of the prior session — NOT from anything captured
-    during D itself. Intraday repricing of D's own implied move lives in
-    the "Implied move over time" section above.
+    during D itself. That holds for today too: today's bands are frozen
+    at yesterday's close while today's actual/high/low update live as
+    new snapshots land. Intraday repricing of D's own implied move lives
+    in the "Implied move over time" section above.
 
-    The actual move is measured against that same reference snapshot's
-    spot: (last spot captured on D − ref spot) / ref spot. Signed, so a
-    down day is negative. Uses the last snapshot of the session as the
-    "close", which is exact only if the batch runs near the close.
+    Actual, high, and low are all measured against that same reference
+    snapshot's spot, signed (down = negative):
+
+    * actual = last spot captured on D (the session "close" for past
+      days; the latest print for today)
+    * high / low = max / min spot across every snapshot captured on D,
+      regardless of expiration — each batch fire stamps the same spot on
+      ~5 expiration rows, so this is the densest picture of where price
+      traded that the DB has. Still snapshot-sampled: the true intraday
+      extremes between fires are invisible.
 
     One dict per day, oldest → newest:
-        {"day", "implied" ({conf: pct} or None), "actual_pct" (or None),
+        {"day", "implied" ({conf: pct} or None), "actual_pct",
+         "high_pct", "low_pct", "high_spot", "low_spot",
          "ref_spot", "close_spot", "iv", "days_to_exp",
          "implied_captured_at_local", "close_captured_at_local"}
     """
     end = date.fromisoformat(end_iso)
     days = _past_business_days(end, num_days)
 
+    # Spot path per day from ALL snapshots of the ticker. limit=10000
+    # covers ~2000 batch fires — far more than the deepest window shown.
+    spots_by_day: dict[date, list[tuple[datetime, float]]] = {}
+    for r in gex_store.recent_snapshots(ticker=ticker, limit=10000):
+        local_dt = _parse_utc(r["captured_at"]).astimezone()
+        if days[0] <= local_dt.date() <= days[-1]:
+            spots_by_day.setdefault(local_dt.date(), []).append(
+                (local_dt, float(r["spot_price"]))
+            )
+
     out: list[dict] = []
     for day in days:
         rows = gex_store.recent_snapshots(
             ticker=ticker, expiration_date=day.isoformat(), limit=500
         )
-        # rows are newest → oldest, so the first match on each side of
-        # the day boundary is the latest one.
-        ref = None    # latest snapshot captured BEFORE day (prior session)
-        close = None  # latest snapshot captured ON day (session "close")
+        # rows are newest → oldest, so the first row captured before the
+        # day boundary is the prior session's latest snapshot.
+        ref = None
         for r in rows:
             local_dt = _parse_utc(r["captured_at"]).astimezone()
-            ld = local_dt.date()
-            if ld == day and close is None:
-                close = (r, local_dt)
-            elif ld < day and ref is None:
+            if local_dt.date() < day:
                 ref = (r, local_dt)
-            if ref is not None and close is not None:
                 break
 
         entry: dict = {
             "day": day,
             "implied": None,
             "actual_pct": None,
+            "high_pct": None,
+            "low_pct": None,
+            "high_spot": None,
+            "low_spot": None,
             "ref_spot": None,
             "close_spot": None,
             "iv": None,
@@ -450,14 +468,22 @@ def _implied_vs_actual_history(
                 entry["iv"] = iv
                 entry["days_to_exp"] = days_to_exp
                 entry["implied_captured_at_local"] = local_dt
-        if close is not None and entry["ref_spot"] is not None:
-            rc, close_dt = close
-            close_spot = float(rc["spot_price"])
+
+        day_spots = spots_by_day.get(day, [])
+        if day_spots and entry["ref_spot"] is not None:
+            ref_spot = entry["ref_spot"]
+
+            def _pct(spot: float) -> float:
+                return (spot - ref_spot) / ref_spot * 100.0
+
+            close_dt, close_spot = max(day_spots, key=lambda p: p[0])
             entry["close_spot"] = close_spot
             entry["close_captured_at_local"] = close_dt
-            entry["actual_pct"] = (
-                (close_spot - entry["ref_spot"]) / entry["ref_spot"] * 100.0
-            )
+            entry["actual_pct"] = _pct(close_spot)
+            entry["high_spot"] = max(s for _dt, s in day_spots)
+            entry["low_spot"] = min(s for _dt, s in day_spots)
+            entry["high_pct"] = _pct(entry["high_spot"])
+            entry["low_pct"] = _pct(entry["low_spot"])
         out.append(entry)
     return out
 
@@ -473,7 +499,12 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
         )
         return
 
-    labels = [f"{h['day'].strftime('%b %d')} ({h['day'].strftime('%a')})" for h in history]
+    today = date.today()
+    labels = [
+        f"{h['day'].strftime('%b %d')} "
+        + ("(today)" if h["day"] == today else f"({h['day'].strftime('%a')})")
+        for h in history
+    ]
 
     fig = go.Figure()
 
@@ -555,6 +586,39 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
         ),
     ))
 
+    # Session high/low as a narrow floating bar spanning low% → high%,
+    # drawn over the wide actual bar — reads like a candle wick, so all
+    # three values coexist without hiding each other.
+    range_heights = [
+        h["high_pct"] - h["low_pct"]
+        if h["high_pct"] is not None else None
+        for h in history
+    ]
+    range_customdata = [
+        [
+            h["high_pct"] or 0.0,
+            h["low_pct"] or 0.0,
+            h["high_spot"] or 0.0,
+            h["low_spot"] or 0.0,
+        ]
+        for h in history
+    ]
+    fig.add_trace(go.Bar(
+        x=labels,
+        y=range_heights,
+        base=[h["low_pct"] for h in history],
+        name="Session high–low",
+        marker_color="#444",
+        opacity=0.9,
+        width=0.12,
+        customdata=range_customdata,
+        hovertemplate=(
+            "High: <b>%{customdata[0]:+.2f}%</b> ($%{customdata[2]:.2f})  ·  "
+            "Low: <b>%{customdata[1]:+.2f}%</b> ($%{customdata[3]:.2f})"
+            "<extra></extra>"
+        ),
+    ))
+
     fig.add_hline(y=0, line_color="#999", line_width=1)
     fig.update_layout(
         title=f"{ticker} — implied (from prior session) vs actual daily move",
@@ -575,42 +639,63 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
         h for h in history
         if h["actual_pct"] is not None and h["implied"] is not None
     ]
+    # Today isn't over — its close can still walk in or out of the bands,
+    # so the hit-rate stats only count finished sessions.
+    completed = [h for h in scored if h["day"] < today]
     col_a, col_b, col_c, col_d = st.columns(4)
     conf1, conf2 = IMPLIED_MOVE_LEVELS[0][0], IMPLIED_MOVE_LEVELS[1][0]
     with col_a:
-        if scored:
-            n1 = sum(1 for h in scored if abs(h["actual_pct"]) <= h["implied"][conf1])
+        if completed:
+            n1 = sum(
+                1 for h in completed if abs(h["actual_pct"]) <= h["implied"][conf1]
+            )
             st.metric(
                 "Days within ±1σ",
-                f"{n1}/{len(scored)}",
+                f"{n1}/{len(completed)}",
                 help=(
-                    "If the options market prices risk correctly, "
-                    "~68% of sessions should land inside the 1σ band."
+                    "Completed sessions only (today excluded). If the "
+                    "options market prices risk correctly, ~68% of "
+                    "sessions should land inside the 1σ band."
                 ),
             )
         else:
             st.metric("Days within ±1σ", "n/a")
     with col_b:
-        if scored:
-            n2 = sum(1 for h in scored if abs(h["actual_pct"]) <= h["implied"][conf2])
+        if completed:
+            n2 = sum(
+                1 for h in completed if abs(h["actual_pct"]) <= h["implied"][conf2]
+            )
             st.metric(
                 "Days within ±2σ",
-                f"{n2}/{len(scored)}",
-                help="~95% of sessions should land inside the 2σ band.",
+                f"{n2}/{len(completed)}",
+                help=(
+                    "Completed sessions only (today excluded). ~95% of "
+                    "sessions should land inside the 2σ band."
+                ),
             )
         else:
             st.metric("Days within ±2σ", "n/a")
     with col_c:
         if scored:
             last = scored[-1]
+            is_live = last["day"] == today
+            title = (
+                "Today so far (live)" if is_live
+                else f"Last session ({last['day'].strftime('%b %d')})"
+            )
             st.metric(
-                f"Last scored day ({last['day'].strftime('%b %d')})",
+                title,
                 f"{last['actual_pct']:+.2f}%",
                 f"±{last['implied'][conf1]:.2f}% was 1σ implied",
                 delta_color="off",
+                help=(
+                    "Today's number moves with each new snapshot; the "
+                    "implied band it's judged against stays frozen at "
+                    "the prior session's close."
+                ) if is_live else None,
             )
         else:
-            st.metric("Last scored day", "n/a")
+            st.metric("Last session", "n/a")
     with col_d:
         if scored:
             big = max(scored, key=lambda h: abs(h["actual_pct"]))
@@ -1228,16 +1313,21 @@ iva_days = st.selectbox(
     format_func=lambda n: f"Last {n} working days",
     key="iva_days",
 )
-_iva_end = _prev_business_day(date.today())
+_iva_today = date.today()
+_iva_end = (
+    _iva_today if _iva_today.weekday() < 5 else _prev_business_day(_iva_today)
+)
 st.caption(
-    f"Completed sessions only — the last {iva_days} trading days ending "
-    f"**{_iva_end.strftime('%b %d')}** (weekends skipped). Dotted lines are "
-    "the ±1σ / ±2σ / ±3σ implied moves **as priced before each session "
-    "opened** (latest snapshot from the prior day — intraday repricing of "
-    "the day itself is deliberately excluded; that lives in the section "
-    "above). Bars are the actual move vs that same prior-day spot: green "
-    "up, red down. A bar poking outside a dotted band = the market moved "
-    "more than options had priced in."
+    f"The last {iva_days} trading days ending **{_iva_end.strftime('%b %d')}** "
+    "(weekends skipped), including today. Dotted lines are the ±1σ / ±2σ / "
+    "±3σ implied moves **as priced before each session opened** (latest "
+    "snapshot from the prior day) — today's bands are frozen at yesterday's "
+    "close too; intraday repricing lives in the section above. Wide bars "
+    "are the actual move vs that same prior-day spot (green up, red down); "
+    "today's bar updates live as snapshots land. The thin dark bar is the "
+    "session's high–low range from the day's snapshots. A bar poking "
+    "outside a dotted band = the market moved more than options had "
+    "priced in."
 )
 
 for ticker in tickers:
