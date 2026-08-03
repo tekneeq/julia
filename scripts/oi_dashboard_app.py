@@ -2396,24 +2396,22 @@ def _session_chicklet_fig(
                     opacity=0.55,
                 )
 
-    open_pct = (iva or {}).get("open_pct")
-    high_pct = (iva or {}).get("high_pct")
-    low_pct = (iva or {}).get("low_pct")
-    close_pct = (iva or {}).get("actual_pct")
+    # O/H/L/close annotations and line color come from the path being
+    # drawn so labels match the line. Sigma bands still come from
+    # ``iva["implied"]`` (prior-session priced move).
+    open_pct = high_pct = low_pct = close_pct = None
 
     if path:
         xs = [p["minutes_from_open"] for p in path]
         ys = [p["pct"] for p in path]
-        if open_pct is None:
-            open_pct = ys[0]
-        if high_pct is None:
-            high_pct = max(ys)
-        if low_pct is None:
-            low_pct = min(ys)
-        if close_pct is None:
-            close_pct = ys[-1]
+        open_pct = ys[0]
+        high_pct = max(ys)
+        low_pct = min(ys)
+        close_pct = ys[-1]
+        hi_i = max(range(len(ys)), key=lambda i: ys[i])
+        lo_i = min(range(len(ys)), key=lambda i: ys[i])
 
-        up = close_pct is not None and close_pct >= 0
+        up = close_pct >= 0
         line_color = _TV_UP if up else _TV_DOWN
         fig.add_trace(go.Scatter(
             x=xs, y=ys,
@@ -2425,47 +2423,24 @@ def _session_chicklet_fig(
             showlegend=False,
         ))
 
-        # Annotation x-positions: open at the first sample; H/L at the
-        # minute the path actually printed that extreme (falls back to
-        # the nearest sample if the official market extreme isn't on
-        # the path).
-        def _min_at_extreme(target: float, prefer: str) -> int:
-            best_i, best_d = 0, abs(ys[0] - target)
-            for i, y in enumerate(ys):
-                d = abs(y - target)
-                if d < best_d - 1e-9 or (
-                    abs(d - best_d) < 1e-9
-                    and (
-                        (prefer == "high" and y >= ys[best_i])
-                        or (prefer == "low" and y <= ys[best_i])
-                    )
-                ):
-                    best_i, best_d = i, d
-            return xs[best_i]
-
-        if open_pct is not None:
-            fig.add_annotation(
-                x=xs[0], y=open_pct, text=f"O {open_pct:+.2f}%",
-                showarrow=False, xanchor="left", yanchor="bottom",
-                font=dict(size=10, color=_TV_TEXT),
-                xshift=2, yshift=2,
-            )
-        if high_pct is not None:
-            fig.add_annotation(
-                x=_min_at_extreme(high_pct, "high"), y=high_pct,
-                text=f"H {high_pct:+.2f}%",
-                showarrow=False, xanchor="center", yanchor="bottom",
-                font=dict(size=10, color=_TV_UP),
-                yshift=4,
-            )
-        if low_pct is not None:
-            fig.add_annotation(
-                x=_min_at_extreme(low_pct, "low"), y=low_pct,
-                text=f"L {low_pct:+.2f}%",
-                showarrow=False, xanchor="center", yanchor="top",
-                font=dict(size=10, color=_TV_DOWN),
-                yshift=-4,
-            )
+        fig.add_annotation(
+            x=xs[0], y=open_pct, text=f"O {open_pct:+.2f}%",
+            showarrow=False, xanchor="left", yanchor="bottom",
+            font=dict(size=10, color=_TV_TEXT),
+            xshift=2, yshift=2,
+        )
+        fig.add_annotation(
+            x=xs[hi_i], y=high_pct, text=f"H {high_pct:+.2f}%",
+            showarrow=False, xanchor="center", yanchor="bottom",
+            font=dict(size=10, color=_TV_UP),
+            yshift=4,
+        )
+        fig.add_annotation(
+            x=xs[lo_i], y=low_pct, text=f"L {low_pct:+.2f}%",
+            showarrow=False, xanchor="center", yanchor="top",
+            font=dict(size=10, color=_TV_DOWN),
+            yshift=-4,
+        )
     else:
         # Empty day — still show sigma bands + a placeholder so the
         # chicklet row stays aligned.
