@@ -2504,19 +2504,26 @@ def _session_chicklet_fig(
 
 
 def _render_recent_session_chiclets(ticker: str, today: date) -> None:
-    """Last 5 trading days as a horizontal row of compact % path cards."""
+    """Prior 5 completed sessions as a horizontal row of compact % cards.
+
+    Today is excluded — the live session chart above already covers it.
+    Cards with no path yet render empty and fill in as the library
+    densifies (market bars / ticks from the poller).
+    """
     st.markdown("##### 📅 Last 5 sessions")
     st.caption(
-        "Each card is one regular session as % vs that day's prior close. "
-        "Annotated **O / H / L** are the open, high, and low of the move. "
-        "Dotted horizontal bands are the ±1σ / ±2σ / ±3σ implied moves "
-        "priced in *before* the session opened — the same numbers as the "
-        "candles under **Implied vs actual daily moves** "
-        f"(blue / orange / red). Library covers the last "
-        f"{daily_moves_store.KEEP_SESSIONS} completed sessions."
+        "The five most recent **completed** sessions (today excluded) as "
+        "% vs each day's prior close. Annotated **O / H / L** are the "
+        "open, high, and low of the move. Dotted horizontal bands are the "
+        "±1σ / ±2σ / ±3σ implied moves priced in *before* the session "
+        "opened — the same numbers as the candles under **Implied vs "
+        "actual daily moves** (blue / orange / red). Empty cards mean we "
+        "don't have a densified path for that day yet; they fill in as "
+        "history accumulates."
     )
 
-    end = today if today.weekday() < 5 else _prev_business_day(today)
+    # Yesterday (or Friday if today is Mon / weekend) → four more back.
+    end = _prev_business_day(today)
     days = _past_business_days(end, 5)
     iva = _implied_vs_actual_history(ticker, 5, end.isoformat())
     iva_by_day = {h["day"]: h for h in iva}
@@ -2528,7 +2535,7 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
             st.plotly_chart(
                 _session_chicklet_fig(
                     day, path, iva_by_day.get(day),
-                    is_today=(day == today),
+                    is_today=False,
                 ),
                 use_container_width=True,
                 config={"displayModeBar": False},
