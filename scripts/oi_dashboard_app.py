@@ -2368,6 +2368,198 @@ def _twin_fig(
     return fig
 
 
+def _session_chicklet_fig(
+    day: date,
+    path: list[dict],
+    iva: dict | None,
+    *,
+    is_today: bool,
+) -> go.Figure:
+    """One compact session card: % path, O/H/L annotations, ±σ bands."""
+    fig = go.Figure()
+    implied = (iva or {}).get("implied") or None
+
+    # ±σ bands from the prior-session implied move (same numbers as the
+    # "Implied vs actual daily moves" candles). Drawn first so the price
+    # path sits on top.
+    if implied:
+        for conf, label, color in IMPLIED_MOVE_LEVELS:
+            sigma = implied.get(conf)
+            if sigma is None:
+                continue
+            for sign in (+1, -1):
+                fig.add_hline(
+                    y=sign * sigma,
+                    line_color=color,
+                    line_width=1,
+                    line_dash="dot",
+                    opacity=0.55,
+                )
+
+    open_pct = (iva or {}).get("open_pct")
+    high_pct = (iva or {}).get("high_pct")
+    low_pct = (iva or {}).get("low_pct")
+    close_pct = (iva or {}).get("actual_pct")
+
+    if path:
+        xs = [p["minutes_from_open"] for p in path]
+        ys = [p["pct"] for p in path]
+        if open_pct is None:
+            open_pct = ys[0]
+        if high_pct is None:
+            high_pct = max(ys)
+        if low_pct is None:
+            low_pct = min(ys)
+        if close_pct is None:
+            close_pct = ys[-1]
+
+        up = close_pct is not None and close_pct >= 0
+        line_color = _TV_UP if up else _TV_DOWN
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys,
+            mode="lines",
+            line=dict(color=line_color, width=1.6),
+            fill="tozeroy",
+            fillcolor=(_TV_UP_FILL if up else _TV_DOWN_FILL),
+            hovertemplate="%{x}m · <b>%{y:+.2f}%</b><extra></extra>",
+            showlegend=False,
+        ))
+
+        # Annotation x-positions: open at the first sample; H/L at the
+        # minute the path actually printed that extreme (falls back to
+        # the nearest sample if the official market extreme isn't on
+        # the path).
+        def _min_at_extreme(target: float, prefer: str) -> int:
+            best_i, best_d = 0, abs(ys[0] - target)
+            for i, y in enumerate(ys):
+                d = abs(y - target)
+                if d < best_d - 1e-9 or (
+                    abs(d - best_d) < 1e-9
+                    and (
+                        (prefer == "high" and y >= ys[best_i])
+                        or (prefer == "low" and y <= ys[best_i])
+                    )
+                ):
+                    best_i, best_d = i, d
+            return xs[best_i]
+
+        if open_pct is not None:
+            fig.add_annotation(
+                x=xs[0], y=open_pct, text=f"O {open_pct:+.2f}%",
+                showarrow=False, xanchor="left", yanchor="bottom",
+                font=dict(size=10, color=_TV_TEXT),
+                xshift=2, yshift=2,
+            )
+        if high_pct is not None:
+            fig.add_annotation(
+                x=_min_at_extreme(high_pct, "high"), y=high_pct,
+                text=f"H {high_pct:+.2f}%",
+                showarrow=False, xanchor="center", yanchor="bottom",
+                font=dict(size=10, color=_TV_UP),
+                yshift=4,
+            )
+        if low_pct is not None:
+            fig.add_annotation(
+                x=_min_at_extreme(low_pct, "low"), y=low_pct,
+                text=f"L {low_pct:+.2f}%",
+                showarrow=False, xanchor="center", yanchor="top",
+                font=dict(size=10, color=_TV_DOWN),
+                yshift=-4,
+            )
+    else:
+        # Empty day — still show sigma bands + a placeholder so the
+        # chicklet row stays aligned.
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.5, y=0.5,
+            text="no path", showarrow=False,
+            font=dict(size=11, color=_TV_MUTED),
+        )
+
+    fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
+
+    # Y-pad: path extremes + outermost sigma band, so a quiet day with
+    # wide implied bands doesn't clip the lines.
+    y_vals: list[float] = [0.0]
+    if path:
+        y_vals.extend(p["pct"] for p in path)
+    for v in (open_pct, high_pct, low_pct, close_pct):
+        if v is not None:
+            y_vals.append(v)
+    if implied:
+        for conf, _label, _color in IMPLIED_MOVE_LEVELS:
+            s = implied.get(conf)
+            if s is not None:
+                y_vals.extend((s, -s))
+    lo_y, hi_y = min(y_vals), max(y_vals)
+    pad = max((hi_y - lo_y) * 0.18, 0.15)
+
+    day_label = (
+        f"Today · {day:%b %d}" if is_today else f"{day:%a %b %d}"
+    )
+    if close_pct is not None:
+        day_label = f"{day_label}  {close_pct:+.2f}%"
+
+    tick_vals = [0, 195, 390]
+    tick_text = ["9:30", "12:45", "4:00"]
+    fig.update_layout(**_tv_layout(
+        title=dict(
+            text=day_label,
+            font=dict(size=12, color=_TV_TEXT),
+            x=0.02, xanchor="left",
+        ),
+        height=210,
+        hovermode="x",
+        showlegend=False,
+        margin=dict(t=36, l=4, r=28, b=24),
+        xaxis=dict(
+            tickmode="array", tickvals=tick_vals, ticktext=tick_text,
+            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
+            fixedrange=True,
+        ),
+        yaxis=dict(
+            range=[lo_y - pad, hi_y + pad],
+            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
+            fixedrange=True,
+            nticks=5,
+        ),
+    ))
+    return fig
+
+
+def _render_recent_session_chiclets(ticker: str, today: date) -> None:
+    """Last 5 trading days as a horizontal row of compact % path cards."""
+    st.markdown("##### 📅 Last 5 sessions")
+    st.caption(
+        "Each card is one regular session as % vs that day's prior close. "
+        "Annotated **O / H / L** are the open, high, and low of the move. "
+        "Dotted horizontal bands are the ±1σ / ±2σ / ±3σ implied moves "
+        "priced in *before* the session opened — the same numbers as the "
+        "candles under **Implied vs actual daily moves** "
+        f"(blue / orange / red). Library covers the last "
+        f"{daily_moves_store.KEEP_SESSIONS} completed sessions."
+    )
+
+    end = today if today.weekday() < 5 else _prev_business_day(today)
+    days = _past_business_days(end, 5)
+    iva = _implied_vs_actual_history(ticker, 5, end.isoformat())
+    iva_by_day = {h["day"]: h for h in iva}
+
+    cols = st.columns(5)
+    for col, day in zip(cols, days):
+        with col:
+            path = daily_moves_store.get_session_path(ticker, day)
+            st.plotly_chart(
+                _session_chicklet_fig(
+                    day, path, iva_by_day.get(day),
+                    is_today=(day == today),
+                ),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+
 def _render_twin_panels(ticker: str, today: date) -> None:
     """The two closest historical twins, each on its own chart
     (bottom-left / bottom-right) — never overlaid on the price chart."""
@@ -2432,6 +2624,7 @@ def _render_today_and_twins(ticker: str) -> None:
 
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
+    _render_recent_session_chiclets(ticker, today)
     _render_twin_panels(ticker, today)
 
     src = "+".join(status.get("today_sources") or ["none"])
