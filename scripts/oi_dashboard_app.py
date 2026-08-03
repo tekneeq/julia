@@ -1886,6 +1886,10 @@ def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
         None,
     )
     _, ref_src = _resolve_ref_spot(ticker, today)
+    if ref_src == "none" and today_ref is not None:
+        # Robinhood/snapshots unreachable right now, but a prior sync
+        # already pinned today's ref — report that instead of "none".
+        ref_src = "stored"
     return {
         "n_sessions": len(sessions),
         "pruned": deleted,
@@ -2118,21 +2122,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             mode="lines", line=dict(width=0),
             hoverinfo="skip", showlegend=False,
         ))
-        customdata = [
-            [(y - ref) / ref * 100.0, e["source"]]
-            for y, e in zip(ys, series)
-        ]
-        hover = (
-            "<b>$%{y:,.2f}</b>  (%{customdata[0]:+.2f}%)"
-            "  ·  %{x|%H:%M:%S}  ·  %{customdata[1]}<extra></extra>"
-        )
-    else:
-        customdata = [[0.0, e["source"]] for e in series]
-        hover = (
-            "<b>$%{y:,.2f}</b>  ·  %{x|%H:%M:%S}"
-            "  ·  %{customdata[1]}<extra></extra>"
-        )
 
+    # Pre-formatted in Python: plotly can't apply d3 number formats to
+    # customdata columns once the array mixes floats and strings.
+    hover_notes = [
+        (f"({(y - ref) / ref * 100.0:+.2f}%)  ·  " if ref else "")
+        + e["source"]
+        for y, e in zip(ys, series)
+    ]
     fig.add_trace(go.Scatter(
         x=xs, y=ys,
         mode="lines",
@@ -2140,8 +2137,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         line=dict(color=line_color, width=1.7),
         fill="tonexty" if ref else None,
         fillcolor=(_TV_UP_FILL if up else _TV_DOWN_FILL) if ref else None,
-        customdata=customdata,
-        hovertemplate=hover,
+        text=hover_notes,
+        hovertemplate=(
+            "<b>$%{y:,.2f}</b>  %{text}  ·  %{x|%H:%M:%S}<extra></extra>"
+        ),
         showlegend=False,
     ))
 
@@ -2189,7 +2188,8 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         xaxis=dict(
             range=[session_open, session_close],
             tickformat="%H:%M",
-            dtick=30 * 60 * 1000,  # 30-min gridlines
+            tick0=session_open,
+            dtick=30 * 60 * 1000,  # 30-min gridlines anchored at 09:30
             gridcolor=_TV_GRID,
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
