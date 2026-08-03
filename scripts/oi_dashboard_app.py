@@ -2373,17 +2373,21 @@ def _chicklet_sigma_window(
     low_pct: float,
     implied: dict,
 ) -> tuple[float, float, list[tuple[float, str]]]:
-    """Snap the y-axis to the nearest σ that brackets the day's high/low.
+    """Snap the y-axis to the nearest σ on each side the path actually used.
 
-    * Stayed inside ±1σ → range [-1σ, +1σ], only ±1σ lines.
-    * High past +1σ but not +2σ → top = +2σ; bottom stays at the
-      nearest σ floor for the low (usually −1σ).
-    * Low past −1σ but not −2σ → bottom = −2σ; likewise for −3σ.
+    Per side independently:
+
+    * Path never crossed above 0% → top = day's high (no +σ lines).
+    * Path never crossed below 0% → bottom = day's low (no −σ lines).
+    * Otherwise the bound snaps to the nearest σ that brackets that
+      side's extreme (inside ±1σ → ±1σ; past +1σ → top = +2σ; etc.).
+
+    So a Thursday that stayed green all session is framed
+    ``[day's low, +1σ]`` with only the +1σ line — not a wasted −1σ
+    half-plane that flattens the move.
 
     Returns ``(y_min, y_max, levels)`` where ``levels`` is
-    ``[(signed_pct, color), ...]`` for the σ lines that fall inside
-    the window (untouched outer bands are dropped so quiet days stay
-    sharp instead of flattened by ±3σ).
+    ``[(signed_pct, color), ...]`` for the σ lines inside the window.
     """
     # Magnitudes ascending: 1σ, 2σ, 3σ (skip any missing).
     tiers: list[tuple[float, str]] = []
@@ -2395,22 +2399,43 @@ def _chicklet_sigma_window(
         pad = max((high_pct - low_pct) * 0.15, 0.15)
         return low_pct - pad, high_pct + pad, []
 
-    y_max = tiers[0][0]
-    for s, _color in tiers:
-        y_max = s
-        if high_pct <= s:
-            break
+    # Top: path never went positive → pin to the day's high; else the
+    # smallest +σ that still clears the high (stepping to +2σ/+3σ as
+    # needed). Same mirror logic on the bottom.
+    if high_pct <= 0:
+        y_max = high_pct
     else:
-        # Blew through +3σ — let the path set the top.
-        y_max = max(high_pct, tiers[-1][0])
+        y_max = tiers[0][0]
+        for s, _color in tiers:
+            y_max = s
+            if high_pct <= s:
+                break
+        else:
+            y_max = max(high_pct, tiers[-1][0])
 
-    y_min = -tiers[0][0]
-    for s, _color in tiers:
-        y_min = -s
-        if low_pct >= -s:
-            break
+    if low_pct >= 0:
+        y_min = low_pct
     else:
-        y_min = min(low_pct, -tiers[-1][0])
+        y_min = -tiers[0][0]
+        for s, _color in tiers:
+            y_min = -s
+            if low_pct >= -s:
+                break
+        else:
+            y_min = min(low_pct, -tiers[-1][0])
+
+    # Tiny pad on a path-pinned side so the H/L label isn't flush with
+    # the axis edge (σ-pinned sides already have headroom inside the band).
+    span = max(y_max - y_min, 1e-6)
+    edge_pad = max(span * 0.06, 0.02)
+    if high_pct <= 0:
+        y_max = high_pct + edge_pad
+    if low_pct >= 0:
+        y_min = low_pct - edge_pad
+
+    # Guard against a degenerate window (flat day exactly at 0).
+    if y_max <= y_min:
+        y_min, y_max = -tiers[0][0], tiers[0][0]
 
     levels: list[tuple[float, str]] = []
     for s, color in tiers:
@@ -2429,8 +2454,9 @@ def _session_chicklet_fig(
 ) -> go.Figure:
     """One compact session card: % path, O/H/L annotations, ±σ bands.
 
-    Y-axis snaps to the nearest σ that brackets the day's high/low so
-    a quiet session isn't flattened by unused ±2σ/±3σ lines.
+    Y-axis snaps per side: unused σ half-planes (path never crossed 0%
+    that way) pin to the day's high/low; the crossed side snaps to the
+    nearest σ so quiet sessions aren't flattened by ±2σ/±3σ.
     """
     fig = go.Figure()
     implied = (iva or {}).get("implied") or None
@@ -2567,14 +2593,16 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
     st.caption(
         "The five most recent **completed** sessions (today excluded) as "
         "% vs each day's prior close. Annotated **O / H / L** are the "
-        "open, high, and low of the move. Each card's y-axis snaps to the "
-        "**nearest σ that brackets that day's high/low** — a session that "
-        "stayed inside ±1σ is framed by ±1σ only; if the high cleared +1σ, "
-        "the top steps up to +2σ (and likewise for the low). Untouched "
-        "outer bands stay off so quiet days don't look flat. σ levels are "
-        "the prior-session implied moves from **Implied vs actual daily "
-        "moves** (blue / orange / red). Empty cards mean no densified path "
-        "yet; they fill in as history accumulates."
+        "open, high, and low of the move. Each card's y-axis snaps per "
+        "side: if the path never went below 0%, the bottom is the day's "
+        "**low** (no −σ line); if it never went above 0%, the top is the "
+        "day's **high**. On a side that did cross 0%, the bound is the "
+        "**nearest σ that brackets that extreme** (inside ±1σ → ±1σ; high "
+        "past +1σ → top steps to +2σ). Untouched outer bands stay off so "
+        "quiet / one-sided days stay sharp. σ levels are the prior-session "
+        "implied moves from **Implied vs actual daily moves** "
+        "(blue / orange / red). Empty cards mean no densified path yet; "
+        "they fill in as history accumulates."
     )
 
     # Yesterday (or Friday if today is Mon / weekend) → four more back.
