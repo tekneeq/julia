@@ -153,13 +153,33 @@ lia oi-dashboard-diff --ticker SPY --expiration 2026-07-28
 
 
 # Live Streamlit dashboard:
+#   • TradingView-style live session chart (price in $, crosshair, prev-close
+#     baseline) fed tick-by-tick by scripts/price_poller.py
+#   • Historical twin panels (the two closest past sessions, side by side)
 #   • Interactive Plotly time series of the crossing strike per expiration
 #     (see how the positioning "pin" drifts over time as new snapshots arrive)
 #   • Latest 3-panel oi-dashboard PNGs
-#   • Auto-refresh every 30s, or manual "▶ Run batch" button in the sidebar
+#   • Auto-refresh every 15s, or manual "▶ Run batch" button in the sidebar
 UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 # Then open http://localhost:8501 in your browser.
+
+
+# Live price poller — the high-resolution feed for the "Today's price
+# action" chart. One quote per ticker every 15s during market hours,
+# written to the spot_ticks table. Independent of the 30-min OI scheduler
+# (oi_scheduler.py), which stays on options-chain duty.
+./scripts/price_poller.py                  # foreground, SPY every 15s
+./scripts/price_poller.py --status         # is it up? tick coverage today
+./scripts/price_poller.py --once           # auth smoke test
+./scripts/price_poller.py --stop
+
+# From the host, inside the docker container (detached, like the scheduler):
+./restart-price-poller.sh                  # start / restart
+./restart-price-poller.sh --status
+./restart-price-poller.sh --logs
+# Note: like the scheduler, a detached docker exec does not survive a
+# container restart — run this again after ./restart.sh or a reboot.
 
 
 # -----------------------------------------------------------------------------
