@@ -1994,15 +1994,39 @@ def _find_daily_twins(
     }
 
 
-# TradingView-flavoured palette for the live session chart.
+# TradingView dark palette for the live session + twin charts.
+_TV_BG = "#131722"
 _TV_UP = "#089981"
 _TV_DOWN = "#f23645"
-_TV_UP_FILL = "rgba(8, 153, 129, 0.07)"
-_TV_DOWN_FILL = "rgba(242, 54, 69, 0.07)"
-_TV_GRID = "rgba(42, 46, 57, 0.08)"
+_TV_UP_FILL = "rgba(8, 153, 129, 0.14)"
+_TV_DOWN_FILL = "rgba(242, 54, 69, 0.14)"
+_TV_GRID = "#1e222d"
 _TV_SPIKE = "#9598a1"
 _TV_MUTED = "#787b86"
-_TWIN_COLORS = ["#1f77b4", "#ff7f0e"]
+_TV_TEXT = "#d1d4dc"
+_TV_ZERO = "#363a45"
+_TWIN_COLORS = ["#2962ff", "#ff9800"]
+
+
+def _tv_layout(**kwargs) -> dict:
+    """Shared dark layout defaults so these charts match TradingView."""
+    base = dict(
+        paper_bgcolor=_TV_BG,
+        plot_bgcolor=_TV_BG,
+        font=dict(color=_TV_TEXT),
+        title_font=dict(color=_TV_TEXT),
+        legend=dict(font=dict(color=_TV_TEXT)),
+        # Keep Streamlit's chrome from painting a white frame around the
+        # dark plot — margin color inherits from paper_bgcolor.
+        margin=dict(t=48, l=10, r=64, b=36),
+        hoverlabel=dict(
+            bgcolor="#1e222d",
+            bordercolor=_TV_MUTED,
+            font=dict(color=_TV_TEXT, size=12),
+        ),
+    )
+    base.update(kwargs)
+    return base
 
 
 def _session_clock_ticks(step_min: int = 60) -> tuple[list[int], list[str]]:
@@ -2178,19 +2202,19 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
 
-    fig.update_layout(
+    fig.update_layout(**_tv_layout(
         title=f"{ticker} — {today:%a %b %d} regular session",
         height=480,
         hovermode="x",
         showlegend=False,
-        margin=dict(t=48, l=10, r=64, b=36),
-        plot_bgcolor="#ffffff",
         xaxis=dict(
             range=[session_open, session_close],
             tickformat="%H:%M",
             tick0=session_open,
             dtick=30 * 60 * 1000,  # 30-min gridlines anchored at 09:30
             gridcolor=_TV_GRID,
+            zeroline=False,
+            color=_TV_MUTED,
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
         ),
@@ -2199,10 +2223,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             range=[lo_y - pad, hi_y + pad],
             tickprefix="$", tickformat=",.2f",
             gridcolor=_TV_GRID,
+            zeroline=False,
+            color=_TV_MUTED,
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
         ),
-    )
+    ))
     st.plotly_chart(fig, use_container_width=True)
 
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
@@ -2305,34 +2331,40 @@ def _twin_fig(
         ))
     if now_m is not None:
         fig.add_vline(
-            x=now_m, line_color="#bbbbbb", line_width=1, line_dash="dot",
+            x=now_m, line_color=_TV_MUTED, line_width=1, line_dash="dot",
         )
-    fig.add_hline(y=0, line_color="#cccccc", line_width=1)
+    fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
 
     tick_vals, tick_text = _session_clock_ticks(90)
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin["final_pct"] is not None else "close n/a"
     )
-    fig.update_layout(
+    fig.update_layout(**_tv_layout(
         title=dict(
             text=(
                 f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
                 f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
             ),
-            font=dict(size=14),
+            font=dict(size=14, color=_TV_TEXT),
         ),
         height=320,
         hovermode="x unified",
-        legend=dict(orientation="h", y=1.18, x=0, font=dict(size=10)),
+        legend=dict(
+            orientation="h", y=1.18, x=0,
+            font=dict(size=10, color=_TV_TEXT),
+        ),
         margin=dict(t=48, l=10, r=10, b=30),
-        plot_bgcolor="#ffffff",
         xaxis=dict(
             tickmode="array", tickvals=tick_vals, ticktext=tick_text,
             range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED,
         ),
-        yaxis=dict(ticksuffix="%", side="right", gridcolor=_TV_GRID),
-    )
+        yaxis=dict(
+            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED,
+        ),
+    ))
     return fig
 
 
