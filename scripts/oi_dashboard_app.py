@@ -2368,80 +2368,36 @@ def _twin_fig(
     return fig
 
 
-def _chicklet_sigma_window(
+def _chicklet_zero_window(
     high_pct: float,
     low_pct: float,
-    implied: dict,
+    implied: dict | None,
 ) -> tuple[float, float, list[tuple[float, str]]]:
-    """Snap the y-axis to the nearest σ on each side the path actually used.
+    """Symmetric y-window around 0% (prior close), plus any touched σ lines.
 
-    Per side independently:
-
-    * Path never crossed above 0% → top = day's high (no +σ lines).
-    * Path never crossed below 0% → bottom = day's low (no −σ lines).
-    * Otherwise the bound snaps to the nearest σ that brackets that
-      side's extreme (inside ±1σ → ±1σ; past +1σ → top = +2σ; etc.).
-
-    So a Thursday that stayed green all session is framed
-    ``[day's low, +1σ]`` with only the +1σ line — not a wasted −1σ
-    half-plane that flattens the move.
-
-    Returns ``(y_min, y_max, levels)`` where ``levels`` is
-    ``[(signed_pct, color), ...]`` for the σ lines inside the window.
+    * 0% is always the vertical midpoint — so a gap-up open is obvious.
+    * Extent is ``max(|high|, |low|)`` of the day's path (small pad),
+      so every card is uniform: prior close centered, day's extremes
+      set the scale.
+    * A σ line is drawn only if the path actually reached it
+      (high ≥ +σ or low ≤ −σ). Untouched bands stay off.
     """
-    # Magnitudes ascending: 1σ, 2σ, 3σ (skip any missing).
-    tiers: list[tuple[float, str]] = []
-    for conf, _label, color in IMPLIED_MOVE_LEVELS:
-        s = implied.get(conf)
-        if s is not None and s > 0:
-            tiers.append((float(s), color))
-    if not tiers:
-        pad = max((high_pct - low_pct) * 0.15, 0.15)
-        return low_pct - pad, high_pct + pad, []
-
-    # Top: path never went positive → pin to the day's high; else the
-    # smallest +σ that still clears the high (stepping to +2σ/+3σ as
-    # needed). Same mirror logic on the bottom.
-    if high_pct <= 0:
-        y_max = high_pct
-    else:
-        y_max = tiers[0][0]
-        for s, _color in tiers:
-            y_max = s
-            if high_pct <= s:
-                break
-        else:
-            y_max = max(high_pct, tiers[-1][0])
-
-    if low_pct >= 0:
-        y_min = low_pct
-    else:
-        y_min = -tiers[0][0]
-        for s, _color in tiers:
-            y_min = -s
-            if low_pct >= -s:
-                break
-        else:
-            y_min = min(low_pct, -tiers[-1][0])
-
-    # Tiny pad on a path-pinned side so the H/L label isn't flush with
-    # the axis edge (σ-pinned sides already have headroom inside the band).
-    span = max(y_max - y_min, 1e-6)
-    edge_pad = max(span * 0.06, 0.02)
-    if high_pct <= 0:
-        y_max = high_pct + edge_pad
-    if low_pct >= 0:
-        y_min = low_pct - edge_pad
-
-    # Guard against a degenerate window (flat day exactly at 0).
-    if y_max <= y_min:
-        y_min, y_max = -tiers[0][0], tiers[0][0]
+    extent = max(abs(high_pct), abs(low_pct), 0.15)
+    pad = max(extent * 0.08, 0.05)
+    y_max = extent + pad
+    y_min = -extent - pad
 
     levels: list[tuple[float, str]] = []
-    for s, color in tiers:
-        for signed in (+s, -s):
-            if y_min - 1e-9 <= signed <= y_max + 1e-9:
-                levels.append((signed, color))
+    if implied:
+        for conf, _label, color in IMPLIED_MOVE_LEVELS:
+            s = implied.get(conf)
+            if s is None or s <= 0:
+                continue
+            s = float(s)
+            if high_pct + 1e-9 >= s:
+                levels.append((+s, color))
+            if low_pct - 1e-9 <= -s:
+                levels.append((-s, color))
     return y_min, y_max, levels
 
 
@@ -2454,9 +2410,8 @@ def _session_chicklet_fig(
 ) -> go.Figure:
     """One compact session card: % path, O/H/L annotations, ±σ bands.
 
-    Y-axis snaps per side: unused σ half-planes (path never crossed 0%
-    that way) pin to the day's high/low; the crossed side snaps to the
-    nearest σ so quiet sessions aren't flattened by ±2σ/±3σ.
+    Y-axis is always centered on 0% (prior close) and scaled to the
+    day's high/low. σ lines appear only when the path touched them.
     """
     fig = go.Figure()
     implied = (iva or {}).get("implied") or None
@@ -2513,30 +2468,17 @@ def _session_chicklet_fig(
             font=dict(size=11, color=_TV_MUTED),
         )
 
-    # Y-window: nearest σ brackets when we have implied + a path; else
-    # a small pad around the path (or ±1σ alone for an empty card).
+    # Always center on 0% (prior close). Empty cards get a neutral ±1%
+    # window so the row stays aligned.
     sigma_levels: list[tuple[float, str]] = []
-    if path and implied and high_pct is not None and low_pct is not None:
-        lo_y, hi_y, sigma_levels = _chicklet_sigma_window(
+    if path and high_pct is not None and low_pct is not None:
+        lo_y, hi_y, sigma_levels = _chicklet_zero_window(
             high_pct, low_pct, implied,
         )
-    elif path and high_pct is not None and low_pct is not None:
-        pad = max((high_pct - low_pct) * 0.18, 0.15)
-        lo_y, hi_y = low_pct - pad, high_pct + pad
-    elif implied:
-        s1 = next(
-            (float(implied[c]) for c, _, _ in IMPLIED_MOVE_LEVELS
-             if implied.get(c)),
-            1.0,
-        )
-        lo_y, hi_y = -s1, s1
-        color1 = IMPLIED_MOVE_LEVELS[0][2]
-        sigma_levels = [(s1, color1), (-s1, color1)]
     else:
         lo_y, hi_y = -1.0, 1.0
 
-    # Only the σ lines inside the window — unused outer bands stay off
-    # so the path keeps its vertical resolution.
+    # σ lines the path actually reached — nothing else.
     for signed, color in sigma_levels:
         fig.add_hline(
             y=signed,
@@ -2545,7 +2487,8 @@ def _session_chicklet_fig(
             line_dash="dot",
             opacity=0.55,
         )
-    fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
+    # Prior-close baseline — always the vertical midpoint.
+    fig.add_hline(y=0, line_color=_TV_MUTED, line_width=1.2)
 
     day_label = (
         f"Today · {day:%b %d}" if is_today else f"{day:%a %b %d}"
@@ -2593,16 +2536,14 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
     st.caption(
         "The five most recent **completed** sessions (today excluded) as "
         "% vs each day's prior close. Annotated **O / H / L** are the "
-        "open, high, and low of the move. Each card's y-axis snaps per "
-        "side: if the path never went below 0%, the bottom is the day's "
-        "**low** (no −σ line); if it never went above 0%, the top is the "
-        "day's **high**. On a side that did cross 0%, the bound is the "
-        "**nearest σ that brackets that extreme** (inside ±1σ → ±1σ; high "
-        "past +1σ → top steps to +2σ). Untouched outer bands stay off so "
-        "quiet / one-sided days stay sharp. σ levels are the prior-session "
-        "implied moves from **Implied vs actual daily moves** "
-        "(blue / orange / red). Empty cards mean no densified path yet; "
-        "they fill in as history accumulates."
+        "open, high, and low of the move. Every card is centered on "
+        "**0% (prior close)** and scaled symmetrically to that day's "
+        "high/low — so a gap-up open is obvious and the row stays "
+        "uniform. A ±σ line (blue / orange / red — same prior-session "
+        "implied moves as **Implied vs actual daily moves**) is drawn "
+        "only if the path actually reached it; untouched bands stay "
+        "off. Empty cards mean no densified path yet; they fill in as "
+        "history accumulates."
     )
 
     # Yesterday (or Friday if today is Mon / weekend) → four more back.
