@@ -2056,12 +2056,16 @@ _TWIN_COLORS = ["#2962ff", "#ff9800"]
 
 
 def _tv_layout(**kwargs) -> dict:
-    """Shared dark layout defaults so these charts match TradingView."""
+    """Shared dark layout defaults so these charts match TradingView.
+
+    Note: do NOT set legacy ``title_font`` here — when combined with
+    ``title=dict(font=...)`` Plotly can paint the title twice (blurry
+    overlapping text). Title color comes from ``font`` / ``title.font``.
+    """
     base = dict(
         paper_bgcolor=_TV_BG,
         plot_bgcolor=_TV_BG,
         font=dict(color=_TV_TEXT),
-        title_font=dict(color=_TV_TEXT),
         legend=dict(font=dict(color=_TV_TEXT)),
         # Keep Streamlit's chrome from painting a white frame around the
         # dark plot — margin color inherits from paper_bgcolor.
@@ -2074,6 +2078,35 @@ def _tv_layout(**kwargs) -> dict:
     )
     base.update(kwargs)
     return base
+
+
+def _twin_chart_chrome(title: str, *, show_legend: bool = True) -> dict:
+    """Title + legend placement that doesn't collide on twin panels.
+
+    Legend sits under the plot (not above it) so it can't overlap the
+    title; top margin is reserved for the title alone.
+    """
+    layout = dict(
+        title=dict(
+            text=title,
+            font=dict(size=13, color=_TV_TEXT),
+            x=0.0, xanchor="left",
+            pad=dict(t=2, b=2),
+        ),
+        height=340,
+        margin=dict(t=44, l=10, r=10, b=64 if show_legend else 36),
+    )
+    if show_legend:
+        layout["legend"] = dict(
+            orientation="h",
+            yanchor="top", y=-0.22,
+            xanchor="left", x=0,
+            font=dict(size=10, color=_TV_TEXT),
+            bgcolor="rgba(0,0,0,0)",
+        )
+    else:
+        layout["showlegend"] = False
+    return layout
 
 
 def _session_clock_ticks(step_min: int = 60) -> tuple[list[int], list[str]]:
@@ -2388,20 +2421,11 @@ def _twin_fig(
         if twin["final_pct"] is not None else "close n/a"
     )
     fig.update_layout(**_tv_layout(
-        title=dict(
-            text=(
-                f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
-                f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
-            ),
-            font=dict(size=14, color=_TV_TEXT),
+        **_twin_chart_chrome(
+            f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
+            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
         ),
-        height=320,
         hovermode="x unified",
-        legend=dict(
-            orientation="h", y=1.18, x=0,
-            font=dict(size=10, color=_TV_TEXT),
-        ),
-        margin=dict(t=48, l=10, r=10, b=30),
         xaxis=dict(
             tickmode="array", tickvals=tick_vals, ticktext=tick_text,
             range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
@@ -2453,20 +2477,11 @@ def _yesterday_match_fig(
         if twin.get("final_pct") is not None else "close n/a"
     )
     fig.update_layout(**_tv_layout(
-        title=dict(
-            text=(
-                f"Yesterday vs {twin['day']:%a %b %d}  ·  "
-                f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
-            ),
-            font=dict(size=13, color=_TV_TEXT),
+        **_twin_chart_chrome(
+            f"Yesterday vs {twin['day']:%a %b %d}  ·  "
+            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
         ),
-        height=320,
         hovermode="x unified",
-        legend=dict(
-            orientation="h", y=1.18, x=0,
-            font=dict(size=10, color=_TV_TEXT),
-        ),
-        margin=dict(t=48, l=10, r=10, b=30),
         xaxis=dict(
             tickmode="array", tickvals=tick_vals, ticktext=tick_text,
             range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
@@ -2531,11 +2546,8 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
             f"(no session after {twin['day']:%b %d} in library)"
         )
     fig.update_layout(**_tv_layout(
-        title=dict(text=title, font=dict(size=13, color=_TV_TEXT)),
-        height=320,
+        **_twin_chart_chrome(title, show_legend=False),
         hovermode="x",
-        showlegend=False,
-        margin=dict(t=48, l=10, r=10, b=30),
         xaxis=dict(
             tickmode="array", tickvals=tick_vals, ticktext=tick_text,
             range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
