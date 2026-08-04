@@ -1967,43 +1967,77 @@ def _path_rmse(today_path: list[dict], hist_path: list[dict]) -> float | None:
     return math.sqrt(sum(w * e * e for w, e in weighted) / wsum)
 
 
-def _find_daily_twins(
-    ticker: str, today: date, *, top_n: int = 3,
+def _find_path_twins(
+    ticker: str, query_day: date, *, top_n: int = 3,
 ) -> dict:
-    """Today's path + the closest completed sessions by RMSE so far."""
-    today_path = daily_moves_store.get_session_path(ticker, today)
+    """Closest completed sessions to ``query_day``'s path by RMSE.
+
+    Each candidate also carries the *next* business day's path (when we
+    have it) — used by the "yesterday → next day" twin panel to show
+    what followed the last time a similar session printed.
+    """
+    query_path = daily_moves_store.get_session_path(ticker, query_day)
     sessions = daily_moves_store.list_sessions(ticker)
+    sessions_by_day = {
+        date.fromisoformat(s["session_date"]): s for s in sessions
+    }
     candidates: list[dict] = []
     for s in sessions:
         d = date.fromisoformat(s["session_date"])
-        if d >= today:
+        if d >= query_day:
             continue
         hist = daily_moves_store.get_session_path(ticker, d)
-        rmse = _path_rmse(today_path, hist)
+        rmse = _path_rmse(query_path, hist)
         if rmse is None:
             continue
+        nxt = _add_business_days(d, 1)
+        next_path = daily_moves_store.get_session_path(ticker, nxt)
         candidates.append({
             "day": d,
             "ref_spot": float(s["ref_spot"]),
             "path": hist,
             "rmse": rmse,
             "final_pct": hist[-1]["pct"] if hist else None,
+            "next_day": nxt if next_path else None,
+            "next_path": next_path or None,
+            "next_ref_spot": (
+                float(sessions_by_day[nxt]["ref_spot"])
+                if nxt in sessions_by_day else None
+            ),
+            "next_final_pct": (
+                next_path[-1]["pct"] if next_path else None
+            ),
         })
     candidates.sort(key=lambda c: c["rmse"])
-    today_ref = next(
+    query_ref = next(
         (float(s["ref_spot"]) for s in sessions
-         if s["session_date"] == today.isoformat()),
+         if s["session_date"] == query_day.isoformat()),
         None,
     )
     return {
-        "today": today,
-        "today_path": today_path,
-        "today_ref": today_ref,
+        "query_day": query_day,
+        "query_path": query_path,
+        "query_ref": query_ref,
         "twins": candidates[:top_n],
         "library_size": sum(
             1 for s in sessions
-            if s["session_date"] != today.isoformat()
+            if s["session_date"] != query_day.isoformat()
         ),
+    }
+
+
+def _find_daily_twins(
+    ticker: str, today: date, *, top_n: int = 3,
+) -> dict:
+    """Today's path + the closest completed sessions by RMSE so far."""
+    result = _find_path_twins(ticker, today, top_n=top_n)
+    # Keep the legacy keys the today-twin renderer still reads.
+    return {
+        "today": result["query_day"],
+        "today_path": result["query_path"],
+        "today_ref": result["query_ref"],
+        "twins": result["twins"],
+        "library_size": result["library_size"],
     }
 
 
@@ -2381,6 +2415,105 @@ def _twin_fig(
     return fig
 
 
+def _twin_nextday_fig(
+    yesterday: date,
+    yesterday_path: list[dict],
+    twin: dict,
+    rank: int,
+    color: str,
+) -> go.Figure:
+    """Yesterday's twin + the session that followed it.
+
+    Grey = yesterday (the query). Solid = the historical day that matched
+    yesterday. Bright = the *next* business day after that twin — what
+    happened the last time a similar session printed.
+    """
+    fig = go.Figure()
+    if yesterday_path:
+        fig.add_trace(go.Scatter(
+            x=[p["minutes_from_open"] for p in yesterday_path],
+            y=[p["pct"] for p in yesterday_path],
+            mode="lines",
+            name=f"Yesterday ({yesterday:%b %d})",
+            line=dict(color=_TV_SPIKE, width=1.3),
+            hovertemplate="Yesterday: <b>%{y:+.2f}%</b><extra></extra>",
+        ))
+    if twin.get("path"):
+        fig.add_trace(go.Scatter(
+            x=[p["minutes_from_open"] for p in twin["path"]],
+            y=[p["pct"] for p in twin["path"]],
+            mode="lines",
+            name=f"Twin {twin['day']:%b %d}",
+            line=dict(color=color, width=1.8, dash="dot"),
+            opacity=0.75,
+            hovertemplate=(
+                f"Twin {twin['day']:%b %d}: "
+                "<b>%{y:+.2f}%</b><extra></extra>"
+            ),
+        ))
+
+    next_path = twin.get("next_path") or []
+    next_day = twin.get("next_day")
+    if next_path and next_day is not None:
+        next_close = twin.get("next_final_pct")
+        next_color = (
+            _TV_UP if (next_close is not None and next_close >= 0)
+            else _TV_DOWN
+        )
+        fig.add_trace(go.Scatter(
+            x=[p["minutes_from_open"] for p in next_path],
+            y=[p["pct"] for p in next_path],
+            mode="lines",
+            name=f"Next day {next_day:%b %d}",
+            line=dict(color=next_color, width=2.4),
+            hovertemplate=(
+                f"Next day {next_day:%b %d}: "
+                "<b>%{y:+.2f}%</b><extra></extra>"
+            ),
+        ))
+    else:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.5, y=0.55,
+            text="no next-day path in library",
+            showarrow=False,
+            font=dict(size=12, color=_TV_MUTED),
+        )
+
+    fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
+    tick_vals, tick_text = _session_clock_ticks(90)
+    next_txt = (
+        f"next day {next_day:%a %b %d} closed {twin['next_final_pct']:+.2f}%"
+        if next_day is not None and twin.get("next_final_pct") is not None
+        else "next day n/a"
+    )
+    fig.update_layout(**_tv_layout(
+        title=dict(
+            text=(
+                f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
+                f"RMSE {twin['rmse']:.2f}pp  ·  {next_txt}"
+            ),
+            font=dict(size=13, color=_TV_TEXT),
+        ),
+        height=320,
+        hovermode="x unified",
+        legend=dict(
+            orientation="h", y=1.18, x=0,
+            font=dict(size=10, color=_TV_TEXT),
+        ),
+        margin=dict(t=48, l=10, r=10, b=30),
+        xaxis=dict(
+            tickmode="array", tickvals=tick_vals, ticktext=tick_text,
+            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED,
+        ),
+        yaxis=dict(
+            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            zeroline=False, color=_TV_MUTED,
+        ),
+    ))
+    return fig
+
+
 def _chicklet_zero_window(
     high_pct: float,
     low_pct: float,
@@ -2579,19 +2712,16 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
             )
 
 
-def _render_twin_panels(ticker: str, today: date) -> None:
-    """The two closest historical twins, each on its own chart
-    (bottom-left / bottom-right) — never overlaid on the price chart."""
-    st.markdown("##### 🧬 Historical twins")
+def _render_today_twin_row(ticker: str, today: date) -> None:
+    """Twins of *today so far* — continuation dashed after 'now'."""
+    st.markdown("##### 🧬 Historical twins — today")
     st.caption(
         "The two completed sessions (of the last "
         f"{daily_moves_store.KEEP_SESSIONS}) whose intraday path most "
-        "closely matches today so far — each on its own chart, in % vs "
-        "that day's prior close (twins come from different price levels, "
-        "so % is the comparable unit). The thin grey line is today, for "
-        "reference; the dashed tail is where the twin went after this "
-        "time of day. Match score = recency-weighted RMSE, recomputed on "
-        "every refresh — twins can switch mid-day."
+        "closely matches **today so far** — each on its own chart, in % "
+        "vs that day's prior close. Thin grey = today; solid = the twin "
+        "up to now; dashed = where that twin went after this time of day. "
+        "Match score = recency-weighted RMSE, recomputed on every refresh."
     )
     result = _find_daily_twins(ticker, today, top_n=2)
     today_path = result["today_path"]
@@ -2633,6 +2763,66 @@ def _render_twin_panels(ticker: str, today: date) -> None:
                 "Only one comparable session in the library so far — a "
                 "second twin appears as more history accumulates."
             )
+
+
+def _render_yesterday_twin_row(ticker: str, today: date) -> None:
+    """Twins of *yesterday's full session* + what the next day did."""
+    yesterday = _prev_business_day(today)
+    st.markdown("##### 🧬 Historical twins — yesterday → next day")
+    st.caption(
+        f"Closest completed sessions to **yesterday ({yesterday:%a %b %d})**'s "
+        "full path. Grey = yesterday; dotted colored = the historical twin; "
+        "**solid green/red = the next business day after that twin** — what "
+        "happened the last time a similar session printed. Useful as a "
+        "read on *today* when yesterday's shape has a clear analog."
+    )
+    result = _find_path_twins(ticker, yesterday, top_n=2)
+    ypath = result["query_path"]
+    if not ypath:
+        st.info(
+            f"No path for yesterday ({yesterday:%b %d}) yet — it fills in "
+            "once market bars / ticks densify that session."
+        )
+        return
+    if not result["twins"]:
+        st.info(
+            f"No comparable session for yesterday — library holds "
+            f"{result['library_size']} other sessions."
+        )
+        return
+
+    cols = st.columns(2)
+    for i, twin in enumerate(result["twins"][:2]):
+        with cols[i]:
+            st.plotly_chart(
+                _twin_nextday_fig(
+                    yesterday, ypath, twin,
+                    i + 1, _TWIN_COLORS[i % len(_TWIN_COLORS)],
+                ),
+                use_container_width=True,
+            )
+            bits = [f"Twin closed **{twin['final_pct']:+.2f}%**"
+                    if twin.get("final_pct") is not None else "Twin close n/a"]
+            if twin.get("next_day") is not None and twin.get("next_final_pct") is not None:
+                bits.append(
+                    f"next day ({twin['next_day']:%a %b %d}) closed "
+                    f"**{twin['next_final_pct']:+.2f}%**"
+                )
+            else:
+                bits.append("next-day path not in library yet")
+            st.caption("  ·  ".join(bits))
+    if len(result["twins"]) == 1:
+        with cols[1]:
+            st.info(
+                "Only one comparable session for yesterday so far — a "
+                "second twin appears as more history accumulates."
+            )
+
+
+def _render_twin_panels(ticker: str, today: date) -> None:
+    """Today-so-far twins, then yesterday→next-day twins."""
+    _render_today_twin_row(ticker, today)
+    _render_yesterday_twin_row(ticker, today)
 
 
 def _render_today_and_twins(ticker: str) -> None:
