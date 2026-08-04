@@ -2160,10 +2160,10 @@ def _today_price_series(ticker: str, today: date) -> list[dict]:
 
 
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
-    """TradingView-style live session chart: y-axis in dollars, crosshair
-    spikes, prev-close baseline with green/red tint, H/L markers, and a
-    last-price tag on the price axis. No twins here — they get their own
-    panels below.
+    """TradingView-style live session chart: $ on the right, % vs prev
+    close on the left, crosshair spikes, prev-close baseline with
+    green/red tint, H/L markers, and a last-price tag (with %) on the
+    price axis. No twins here — they get their own panels below.
     """
     series = _today_price_series(ticker, today)
     ref = status.get("today_ref")
@@ -2181,6 +2181,9 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     n_ticks = sum(1 for e in series if e["source"] == "tick")
     n_fallback = len(series) - n_ticks
     last_ts, last_price = xs[-1], ys[-1]
+    last_pct = (
+        (last_price - ref) / ref * 100.0 if ref else None
+    )
     up = ref is None or last_price >= ref
     line_color = _TV_UP if up else _TV_DOWN
 
@@ -2265,15 +2268,20 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             hoverinfo="skip", showlegend=False,
         ))
 
-    # Last price: dot on the line + tag on the price axis
+    # Last price: dot on the line + tag on the price axis (incl. % move)
     fig.add_trace(go.Scatter(
         x=[last_ts], y=[last_price], mode="markers",
         marker=dict(size=7, color=line_color),
         hoverinfo="skip", showlegend=False,
     ))
+    last_tag = (
+        f" {last_price:,.2f} ({last_pct:+.2f}%) "
+        if last_pct is not None
+        else f" {last_price:,.2f} "
+    )
     fig.add_annotation(
         xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
-        text=f" {last_price:,.2f} ", showarrow=False,
+        text=last_tag, showarrow=False,
         font=dict(size=11, color="#ffffff"),
         bgcolor=line_color, borderpad=1,
     )
@@ -2281,12 +2289,22 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     y_all = ys + ([ref] if ref else [])
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
+    y_lo, y_hi = lo_y - pad, hi_y + pad
 
-    fig.update_layout(**_tv_layout(
+    # Left axis mirrors the same price range as % vs prev close so you
+    # can read the move at a glance without hovering. No second grid —
+    # only the $ axis draws gridlines.
+    layout_kw: dict = dict(
         title=f"{ticker} — {today:%a %b %d} regular session",
         height=480,
         hovermode="x",
         showlegend=False,
+        margin=dict(
+            t=48,
+            l=56 if ref else 10,
+            r=110 if last_pct is not None else 64,
+            b=36,
+        ),
         xaxis=dict(
             range=[session_open, session_close],
             tickformat="%H:%M",
@@ -2300,7 +2318,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         ),
         yaxis=dict(
             side="right",
-            range=[lo_y - pad, hi_y + pad],
+            range=[y_lo, y_hi],
             tickprefix="$", tickformat=",.2f",
             gridcolor=_TV_GRID,
             zeroline=False,
@@ -2308,7 +2326,27 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
         ),
-    ))
+    )
+    if ref:
+        layout_kw["yaxis2"] = dict(
+            overlaying="y",
+            side="left",
+            range=[
+                (y_lo - ref) / ref * 100.0,
+                (y_hi - ref) / ref * 100.0,
+            ],
+            tickformat="+.2f",
+            ticksuffix="%",
+            showgrid=False,
+            zeroline=False,
+            color=_TV_MUTED,
+            title=dict(
+                text="% vs prev close",
+                font=dict(size=11, color=_TV_MUTED),
+            ),
+        )
+
+    fig.update_layout(**_tv_layout(**layout_kw))
     st.plotly_chart(fig, use_container_width=True)
 
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
@@ -3017,11 +3055,12 @@ st.caption(
 st.divider()
 st.header("📈 Today's price action")
 st.caption(
-    "TradingView-style live session chart — the y-axis is the actual "
-    "price in dollars, fed tick-by-tick by the dedicated price poller "
-    "(`scripts/price_poller.py`, ~15s cadence — its own loop, completely "
-    "independent of the 30-minute OI scheduler). Hover for a crosshair "
-    "with price, % vs prev close, and exact time. The closest historical "
+    "TradingView-style live session chart — **right axis = $ price**, "
+    "**left axis = % vs prev close**. Fed tick-by-tick by the dedicated "
+    "price poller (`scripts/price_poller.py`, ~15s cadence — its own "
+    "loop, completely independent of the 30-minute OI scheduler). The "
+    "last-price tag on the right also shows the % move. Hover for a "
+    "crosshair with price, %, and exact time. The closest historical "
     "twins are charted separately below — never overlaid on the price."
 )
 for ticker in tickers:
