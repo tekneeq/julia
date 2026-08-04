@@ -808,10 +808,16 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
 
     # Traditional candlestick per session: body = open→close, wicks =
     # high/low — everything in % of the prior-session reference spot, so
-    # 0% is where yesterday's snapshot left off. Green body = closed
-    # above the open, red = below (standard convention). Candlestick
-    # traces don't support hovertemplate, so the $ context rides along
-    # as `text`, appended after the default O/H/L/C readout.
+    # 0% is where yesterday's snapshot left off.
+    #
+    # Hollow vs filled (classic open/close cue):
+    #   * hollow green  = close ≥ open (open was lower — buyers won)
+    #   * filled red    = close <  open (open was higher — sellers won)
+    # Color alone wasn't enough to make O vs C obvious; the empty/filled
+    # body matches what TradingView / most charting apps do.
+    #
+    # Candlestick traces don't support hovertemplate, so the $ context
+    # rides along as `text`, appended after the default O/H/L/C readout.
     candle_text = []
     for h in history:
         if h["actual_pct"] is None or h["ref_spot"] is None:
@@ -828,11 +834,16 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
             if h["close_captured_at_local"] is not None
             else "official close"
         )
+        oc = (
+            "hollow (close ≥ open)"
+            if h["actual_pct"] >= h["open_pct"]
+            else "filled (close < open)"
+        )
         candle_text.append(
             f"ref ${h['ref_spot']:.2f} → close ${h['close_spot']:.2f}  "
             f"(actual {h['actual_pct']:+.2f}% vs prior session)<br>"
             f"O ${h['open_spot']:.2f} · H ${h['high_spot']:.2f} · "
-            f"L ${h['low_spot']:.2f}  ·  {close_note}  ·  {src_note}"
+            f"L ${h['low_spot']:.2f}  ·  {oc}  ·  {close_note}  ·  {src_note}"
         )
     fig.add_trace(go.Candlestick(
         x=labels,
@@ -842,12 +853,14 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
         close=[h["actual_pct"] for h in history],
         name="Session (O/H/L/C)",
         increasing=dict(
-            line=dict(color="#2ca02c", width=1.5),
-            fillcolor="rgba(44, 160, 44, 0.85)",
+            # Hollow body — transparent fill, green border + wick.
+            line=dict(color="#2ca02c", width=2),
+            fillcolor="rgba(0, 0, 0, 0)",
         ),
         decreasing=dict(
-            line=dict(color="#d62728", width=1.5),
-            fillcolor="rgba(214, 39, 40, 0.85)",
+            # Solid body — filled red.
+            line=dict(color="#d62728", width=2),
+            fillcolor="#d62728",
         ),
         text=candle_text,
     ))
@@ -2829,11 +2842,12 @@ st.caption(
     "±3σ implied moves **as priced before each session opened** (latest "
     "snapshot from the prior day) — today's bands are frozen at yesterday's "
     "close too; intraday repricing lives in the section above. Each session "
-    "is a traditional candlestick — body = open→close, wicks = high/low, "
-    "green if it closed above the open, red below — with everything "
-    "measured against that same prior-day spot, so **0% is where the prior "
-    "session left off** and the close's height above/below 0% is the "
-    "actual daily move. Open/high/low prefer **official market bars** "
+    "is a traditional candlestick — body = open→close, wicks = high/low. "
+    "**Hollow green** = close ≥ open (open was lower); **filled red** = "
+    "close < open (open was higher). Everything is measured against that "
+    "same prior-day spot, so **0% is where the prior session left off** "
+    "and the close's height above/below 0% is the actual daily move. "
+    "Open/high/low prefer **official market bars** "
     "(Robinhood); the close stays snapshot-based so today's candle "
     "updates with each batch fire. If market data is unreachable, OHLC "
     "falls back to the day's snapshots — which can miss the true open "
