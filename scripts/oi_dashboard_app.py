@@ -2757,17 +2757,20 @@ def _session_chicklet_fig(
 
 
 def _render_recent_session_chiclets(ticker: str, today: date) -> None:
-    """Prior 5 completed sessions as a horizontal row of compact % cards.
+    """Prior 10 completed sessions as two rows of 5 compact % cards.
 
     Today is excluded — the live session chart above already covers it.
     Cards with no path yet render empty and fill in as the library
     densifies (market bars / ticks from the poller).
     """
-    st.markdown("##### 📅 Last 5 sessions")
+    n_sessions = 10
+    per_row = 5
+    st.markdown("##### 📅 Last 10 sessions")
     st.caption(
-        "The five most recent **completed** sessions (today excluded) as "
-        "% vs each day's prior close. Annotated **O / H / L** are the "
-        "open, high, and low of the move. Every card is centered on "
+        "The ten most recent **completed** sessions (today excluded) as "
+        "% vs each day's prior close — five per row, oldest → newest "
+        "left-to-right then top-to-bottom. Annotated **O / H / L** are "
+        "the open, high, and low of the move. Every card is centered on "
         "**0% (prior close)** and scaled symmetrically to that day's "
         "high/low — so a gap-up open is obvious and the row stays "
         "uniform. A ±σ line (blue / orange / red — same prior-session "
@@ -2777,24 +2780,26 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
         "history accumulates."
     )
 
-    # Yesterday (or Friday if today is Mon / weekend) → four more back.
+    # Yesterday (or Friday if today is Mon / weekend) → nine more back.
     end = _prev_business_day(today)
-    days = _past_business_days(end, 5)
-    iva = _implied_vs_actual_history(ticker, 5, end.isoformat())
+    days = _past_business_days(end, n_sessions)
+    iva = _implied_vs_actual_history(ticker, n_sessions, end.isoformat())
     iva_by_day = {h["day"]: h for h in iva}
 
-    cols = st.columns(5)
-    for col, day in zip(cols, days):
-        with col:
-            path = daily_moves_store.get_session_path(ticker, day)
-            st.plotly_chart(
-                _session_chicklet_fig(
-                    day, path, iva_by_day.get(day),
-                    is_today=False,
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-            )
+    for row_start in range(0, n_sessions, per_row):
+        row_days = days[row_start:row_start + per_row]
+        cols = st.columns(per_row)
+        for col, day in zip(cols, row_days):
+            with col:
+                path = daily_moves_store.get_session_path(ticker, day)
+                st.plotly_chart(
+                    _session_chicklet_fig(
+                        day, path, iva_by_day.get(day),
+                        is_today=False,
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
 
 
 def _render_today_twin_row(ticker: str, today: date) -> None:
