@@ -1979,6 +1979,165 @@ def _path_rmse(today_path: list[dict], hist_path: list[dict]) -> float | None:
     return math.sqrt(sum(w * e * e for w, e in weighted) / wsum)
 
 
+def _today_implied_1sigma_pct(ticker: str, today: date) -> float | None:
+    """Prior-session 1σ implied move for ``today``, in percent of spot."""
+    hist = _implied_vs_actual_history(ticker, 1, today.isoformat())
+    if not hist:
+        return None
+    row = hist[-1]
+    if row.get("day") != today:
+        return None
+    implied = row.get("implied") or None
+    if not implied:
+        return None
+    conf1 = IMPLIED_MOVE_LEVELS[0][0]
+    val = implied.get(conf1)
+    return float(val) if val is not None else None
+
+
+def _sigma_extreme_hold_prob(
+    *,
+    last_pct: float,
+    extreme_pct: float,
+    sigma_1pct: float | None,
+    now_m: int,
+    side: str,
+) -> float | None:
+    """Analytic P(extreme holds) from remaining-session σ (driftless BM).
+
+    ``side`` is ``"high"`` or ``"low"``. Uses the reflection-principle
+    approx ``P(new extreme) ≈ 2·(1−Φ(a/σ_rem))`` clipped to [0, 1].
+    """
+    if sigma_1pct is None or sigma_1pct <= 0:
+        return None
+    rem = max(_SESSION_MINUTES - now_m, 0)
+    if rem <= 0:
+        return 1.0
+    sigma_rem = sigma_1pct * math.sqrt(rem / _SESSION_MINUTES)
+    if sigma_rem < 1e-9:
+        return 1.0
+    if side == "high":
+        a = extreme_pct - last_pct  # how far above last a new high needs
+    else:
+        a = last_pct - extreme_pct  # how far below last a new low needs
+    # Already away from the extreme → holding is likelier. At the print
+    # (a≈0) continuous BM would say P(new extreme)≈1; floor a so a
+    # fresh tick doesn't force ~0% hold from the σ prior alone.
+    a = max(a, 0.05 * sigma_1pct)
+    p_new = min(1.0, max(0.0, 2.0 * (1.0 - float(norm.cdf(a / sigma_rem)))))
+    return 1.0 - p_new
+
+
+def _extreme_survival_probs(
+    ticker: str,
+    today: date,
+    today_path: list[dict],
+    *,
+    sigma_1pct: float | None = None,
+) -> dict | None:
+    """P(current high/low so far are the full-day extremes).
+
+    Primary signal: among completed sessions that reached this time of
+    day, what fraction never made a new high/low afterward. Days whose
+    path shape is closer to today (lower RMSE) get more weight.
+
+    Optional blend with a remaining-session 1σ Brownian prior when the
+    prior-session implied move is available.
+
+    Returns None when the library is too thin / too early to be useful.
+    """
+    if not today_path or len(today_path) < 2:
+        return None
+    now_m = int(today_path[-1]["minutes_from_open"])
+    last_pct = float(today_path[-1]["pct"])
+    today_hi = max(p["pct"] for p in today_path)
+    today_lo = min(p["pct"] for p in today_path)
+    at_high = abs(last_pct - today_hi) < 1e-9
+    at_low = abs(last_pct - today_lo) < 1e-9
+
+    if now_m >= _SESSION_MINUTES:
+        return {
+            "p_high": 1.0, "p_low": 1.0, "n": 0, "now_m": now_m,
+            "at_high": at_high, "at_low": at_low,
+            "basis": "session closed",
+        }
+
+    # Too early — historical prefixes are noisy and almost never "done".
+    if now_m < 15:
+        return None
+
+    eps = 1e-6
+    w_high = w_low = 0.0
+    held_high = held_low = 0.0
+    n = 0
+    for s in daily_moves_store.list_sessions(ticker):
+        d = date.fromisoformat(s["session_date"])
+        if d >= today:
+            continue
+        hist = daily_moves_store.get_session_path(ticker, d)
+        if not hist or hist[-1]["minutes_from_open"] < now_m:
+            continue
+        prefix = [p for p in hist if p["minutes_from_open"] <= now_m]
+        if len(prefix) < 2:
+            continue
+        prefix_hi = max(p["pct"] for p in prefix)
+        prefix_lo = min(p["pct"] for p in prefix)
+        day_hi = max(p["pct"] for p in hist)
+        day_lo = min(p["pct"] for p in hist)
+        rmse = _path_rmse(today_path, hist)
+        w = 1.0 / (rmse + 0.05) if rmse is not None else 1.0
+        n += 1
+        w_high += w
+        w_low += w
+        if day_hi <= prefix_hi + eps:
+            held_high += w
+        if day_lo >= prefix_lo - eps:
+            held_low += w
+
+    emp_high = (held_high / w_high) if w_high > 0 else None
+    emp_low = (held_low / w_low) if w_low > 0 else None
+
+    sig_high = _sigma_extreme_hold_prob(
+        last_pct=last_pct, extreme_pct=today_hi,
+        sigma_1pct=sigma_1pct, now_m=now_m, side="high",
+    )
+    sig_low = _sigma_extreme_hold_prob(
+        last_pct=last_pct, extreme_pct=today_lo,
+        sigma_1pct=sigma_1pct, now_m=now_m, side="low",
+    )
+
+    def _blend(emp: float | None, sig: float | None) -> float | None:
+        if emp is not None and sig is not None:
+            return 0.7 * emp + 0.3 * sig
+        return emp if emp is not None else sig
+
+    p_high = _blend(emp_high, sig_high)
+    p_low = _blend(emp_low, sig_low)
+    if p_high is None or p_low is None:
+        return None
+    if n < 5 and sig_high is None:
+        return None
+
+    if emp_high is not None and sig_high is not None:
+        basis = (
+            f"path-weighted history (n={n}) blended with remaining-session σ"
+        )
+    elif emp_high is not None:
+        basis = f"path-weighted history (n={n})"
+    else:
+        basis = "remaining-session σ prior"
+
+    return {
+        "p_high": float(p_high),
+        "p_low": float(p_low),
+        "n": n,
+        "now_m": now_m,
+        "at_high": at_high,
+        "at_low": at_low,
+        "basis": basis,
+    }
+
+
 def _find_path_twins(
     ticker: str, query_day: date, *, top_n: int = 3,
 ) -> dict:
@@ -2177,8 +2336,9 @@ def _today_price_series(ticker: str, today: date) -> list[dict]:
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
-    green/red tint, H/L markers, and a last-price tag (with %) on the
-    price axis. No twins here — they get their own panels below.
+    green/red tint, H/L markers labeled with P(day extreme), and a
+    last-price tag (with %) on the price axis. No twins here — they
+    get their own panels below.
     """
     series = _today_price_series(ticker, today)
     ref = status.get("today_ref")
@@ -2266,21 +2426,44 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         showlegend=False,
     ))
 
-    # Session high / low markers
+    # Session high / low markers — with P(this is the day's extreme)
     hi_i = max(range(len(ys)), key=lambda i: ys[i])
     lo_i = min(range(len(ys)), key=lambda i: ys[i])
-    for idx, label, pos in (
-        (hi_i, "H", "top center"), (lo_i, "L", "bottom center"),
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    sigma_1 = _today_implied_1sigma_pct(ticker, today)
+    extreme_probs = _extreme_survival_probs(
+        ticker, today, today_path, sigma_1pct=sigma_1,
+    )
+    for idx, label, pos, p_key in (
+        (hi_i, "H", "top center", "p_high"),
+        (lo_i, "L", "bottom center", "p_low"),
     ):
+        price = ys[idx]
+        if extreme_probs is not None:
+            pct_label = f"{extreme_probs[p_key] * 100:.0f}%"
+            text = f"{label} {price:,.2f} · {pct_label}"
+            word = "high" if label == "H" else "low"
+            hover = (
+                f"{label} ${price:,.2f}<br>"
+                f"<b>{pct_label}</b> chance this is the day's {word}<br>"
+                f"<i>{extreme_probs['basis']}</i>"
+                f"<extra></extra>"
+            )
+            color = _TV_UP if label == "H" else _TV_DOWN
+        else:
+            text = f"{label} {price:,.2f}"
+            hover = f"{label} ${price:,.2f}<extra></extra>"
+            color = _TV_MUTED
         fig.add_trace(go.Scatter(
-            x=[xs[idx]], y=[ys[idx]],
+            x=[xs[idx]], y=[price],
             mode="markers+text",
-            marker=dict(size=5, color=_TV_MUTED),
-            text=[f"{label} {ys[idx]:,.2f}"],
+            marker=dict(size=6, color=color),
+            text=[text],
             textposition=pos,
-            textfont=dict(size=10, color=_TV_MUTED),
+            textfont=dict(size=11, color=color),
             cliponaxis=False,
-            hoverinfo="skip", showlegend=False,
+            hovertemplate=hover,
+            showlegend=False,
         ))
 
     # Last price: dot on the line + tag on the price axis (incl. % move)
@@ -2363,6 +2546,20 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
 
     fig.update_layout(**_tv_layout(**layout_kw))
     st.plotly_chart(fig, use_container_width=True)
+    if extreme_probs is not None:
+        fresh = []
+        if extreme_probs["at_high"]:
+            fresh.append("printing a **new high**")
+        if extreme_probs["at_low"]:
+            fresh.append("printing a **new low**")
+        fresh_note = (
+            f" Right now: {', '.join(fresh)}."
+            if fresh else ""
+        )
+        st.caption(
+            f"H/L % = chance this extreme holds for the rest of the day "
+            f"({extreme_probs['basis']}).{fresh_note}"
+        )
 
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
     with col_a:
@@ -2376,14 +2573,38 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         else:
             st.metric("Last", f"${last_price:,.2f}")
     with col_b:
+        hi_delta = xs[hi_i].strftime("%H:%M:%S")
+        if extreme_probs is not None:
+            hi_delta = (
+                f"{hi_delta} · {extreme_probs['p_high'] * 100:.0f}% day high"
+            )
         st.metric(
             "High", f"${ys[hi_i]:,.2f}",
-            xs[hi_i].strftime("%H:%M:%S"), delta_color="off",
+            hi_delta, delta_color="off",
+            help=(
+                "Probability the session high so far is the full-day high — "
+                "from path-weighted historical survival at this time of day, "
+                "blended with the remaining-session 1σ implied move when "
+                "available."
+                if extreme_probs is not None else None
+            ),
         )
     with col_c:
+        lo_delta = xs[lo_i].strftime("%H:%M:%S")
+        if extreme_probs is not None:
+            lo_delta = (
+                f"{lo_delta} · {extreme_probs['p_low'] * 100:.0f}% day low"
+            )
         st.metric(
             "Low", f"${ys[lo_i]:,.2f}",
-            xs[lo_i].strftime("%H:%M:%S"), delta_color="off",
+            lo_delta, delta_color="off",
+            help=(
+                "Probability the session low so far is the full-day low — "
+                "from path-weighted historical survival at this time of day, "
+                "blended with the remaining-session 1σ implied move when "
+                "available."
+                if extreme_probs is not None else None
+            ),
         )
     with col_d:
         st.metric(
@@ -3089,10 +3310,12 @@ st.caption(
     "TradingView-style live session chart — **right axis = $ price**, "
     "**left axis = % vs prev close**. Fed tick-by-tick by the dedicated "
     "price poller (`scripts/price_poller.py`, ~15s cadence — its own "
-    "loop, completely independent of the 30-minute OI scheduler). The "
-    "last-price tag on the right also shows the % move. Hover for a "
-    "crosshair with price, %, and exact time. The closest historical "
-    "twins are charted separately below — never overlaid on the price."
+    "loop, completely independent of the 30-minute OI scheduler). "
+    "H/L labels include a **% chance that extreme is the day's high/low** "
+    "(historical path survival at this time of day, blended with the "
+    "remaining-session 1σ band). The last-price tag also shows the % "
+    "move. Hover for crosshair details. Historical twins are charted "
+    "separately below — never overlaid on the price."
 )
 for ticker in tickers:
     st.markdown(f"**{ticker}**")
