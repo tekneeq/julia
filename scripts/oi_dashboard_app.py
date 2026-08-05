@@ -2109,23 +2109,26 @@ def _twin_chart_chrome(title: str, *, show_legend: bool = True) -> dict:
     return layout
 
 
+def _fmt_session_clock(m: int | float) -> str:
+    """Clock label for minutes-from-open (e.g. 195 → ``12:45pm``)."""
+    total = 9 * 60 + 30 + int(round(m))
+    h24, mm = divmod(total, 60)
+    ampm = "am" if h24 < 12 else "pm"
+    h12 = h24 % 12 or 12
+    return f"{h12}:{mm:02d}{ampm}"
+
+
 def _session_clock_ticks(step_min: int = 60) -> tuple[list[int], list[str]]:
     """(tick_vals, tick_labels) for a minutes-from-open axis."""
     tick_vals = list(range(0, _SESSION_MINUTES + 1, step_min))
-    tick_text = []
-    for m in tick_vals:
-        total = 9 * 60 + 30 + m  # minutes since midnight
-        h24, mm = divmod(total, 60)
-        ampm = "am" if h24 < 12 else "pm"
-        h12 = h24 % 12 or 12
-        tick_text.append(f"{h12}:{mm:02d}{ampm}")
+    tick_text = [_fmt_session_clock(m) for m in tick_vals]
     return tick_vals, tick_text
 
 
-def _minute_to_dt(session: date, m: int) -> datetime:
+def _minute_to_dt(session: date, m: int | float) -> datetime:
     return (
         datetime.combine(session, daily_moves_store.MARKET_OPEN)
-        + timedelta(minutes=m)
+        + timedelta(minutes=float(m))
     )
 
 
@@ -2653,7 +2656,10 @@ def _session_chicklet_fig(
     open_pct = high_pct = low_pct = close_pct = None
 
     if path:
-        xs = [p["minutes_from_open"] for p in path]
+        # Datetime x so hover/spike show clock time, not minutes-from-open.
+        mins = [p["minutes_from_open"] for p in path]
+        xs = [_minute_to_dt(day, m) for m in mins]
+        clocks = [_fmt_session_clock(m) for m in mins]
         ys = [p["pct"] for p in path]
         open_pct = ys[0]
         high_pct = max(ys)
@@ -2670,7 +2676,8 @@ def _session_chicklet_fig(
             line=dict(color=line_color, width=1.6),
             fill="tozeroy",
             fillcolor=(_TV_UP_FILL if up else _TV_DOWN_FILL),
-            hovertemplate="%{x}m · <b>%{y:+.2f}%</b><extra></extra>",
+            customdata=clocks,
+            hovertemplate="%{customdata} · <b>%{y:+.2f}%</b><extra></extra>",
             showlegend=False,
         ))
 
@@ -2727,7 +2734,8 @@ def _session_chicklet_fig(
     if close_pct is not None:
         day_label = f"{day_label}  {close_pct:+.2f}%"
 
-    tick_vals = [0, 195, 390]
+    tick_mins = (0, 195, 390)
+    tick_vals = [_minute_to_dt(day, m) for m in tick_mins]
     tick_text = ["9:30", "12:45", "4:00"]
     fig.update_layout(**_tv_layout(
         title=dict(
@@ -2741,9 +2749,15 @@ def _session_chicklet_fig(
         margin=dict(t=36, l=4, r=28, b=24),
         xaxis=dict(
             tickmode="array", tickvals=tick_vals, ticktext=tick_text,
-            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
+            range=[
+                _minute_to_dt(day, 0),
+                _minute_to_dt(day, _SESSION_MINUTES),
+            ],
+            gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
             fixedrange=True,
+            # Axis spike / unified hover — not minutes-from-open.
+            hoverformat="%-I:%M%p",
         ),
         yaxis=dict(
             range=[lo_y, hi_y],
