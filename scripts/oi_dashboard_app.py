@@ -550,6 +550,8 @@ def _market_daily_ohlc(ticker: str, today_iso: str) -> dict[str, dict[str, float
             ticker, interval="day", span="month", bounds="regular"
         ) or []
         for bar in bars:
+            if not isinstance(bar, dict):
+                continue
             d = (bar.get("begins_at") or "")[:10]
             try:
                 out[d] = {
@@ -569,7 +571,8 @@ def _market_daily_ohlc(ticker: str, today_iso: str) -> dict[str, dict[str, float
             c for c in (rh.stocks.get_stock_historicals(
                 ticker, interval="5minute", span="day", bounds="regular"
             ) or [])
-            if (c.get("begins_at") or "").startswith(today_iso)
+            if isinstance(c, dict)
+            and (c.get("begins_at") or "").startswith(today_iso)
         ]
         opens = [c for c in candles if c.get("open_price")]
         highs = [float(c["high_price"]) for c in candles if c.get("high_price")]
@@ -1671,16 +1674,21 @@ def _ohlc_bar_polyline(
 
 
 def _fetch_rh_5min(ticker: str, span: str) -> list[dict]:
-    """Raw 5-minute bars or [] on any failure."""
+    """Raw 5-minute bars or [] on any failure.
+
+    Robinhood occasionally returns ``None`` slots in the list — drop
+    those so callers can safely ``.get(...)`` on each candle.
+    """
     if not _rh_market_data_ready():
         return []
     import robin_stocks.robinhood as rh
     try:
-        return rh.stocks.get_stock_historicals(
+        bars = rh.stocks.get_stock_historicals(
             ticker, interval="5minute", span=span, bounds="regular",
         ) or []
     except Exception:
         return []
+    return [c for c in bars if isinstance(c, dict)]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1697,6 +1705,8 @@ def _fetch_rh_daily_closes(ticker: str) -> dict[str, float]:
         return {}
     out: dict[str, float] = {}
     for bar in bars:
+        if not isinstance(bar, dict):
+            continue
         d_iso = (bar.get("begins_at") or "")[:10]
         close = bar.get("close_price")
         if not d_iso or close is None:
@@ -1751,6 +1761,8 @@ def _ingest_market_paths(ticker: str) -> int:
     candles_by_key: dict[str, dict] = {}
     for span in ("week", "day"):
         for c in _fetch_rh_5min(ticker, span):
+            if not isinstance(c, dict):
+                continue
             begins = c.get("begins_at") or ""
             if begins:
                 candles_by_key[begins] = c
