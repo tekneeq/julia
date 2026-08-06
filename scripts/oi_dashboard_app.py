@@ -24,6 +24,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import math
 
@@ -152,9 +153,12 @@ def _running_git_revision() -> tuple[str, str]:
 
     if when_raw:
         try:
-            # Handle trailing Z / offset; show local wall time + zone.
+            # Always show US/Eastern — matches the dashboard's market clock.
             dt = datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
-            when_label = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            when_label = (
+                dt.astimezone(ZoneInfo("America/New_York"))
+                .strftime("%Y-%m-%d %H:%M:%S ET")
+            )
         except ValueError:
             when_label = when_raw
     else:
