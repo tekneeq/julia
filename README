@@ -159,17 +159,17 @@ lia oi-dashboard-diff --ticker SPY --expiration 2026-07-28
 #   • Interactive Plotly time series of the crossing strike per expiration
 #     (see how the positioning "pin" drifts over time as new snapshots arrive)
 #   • Latest 3-panel oi-dashboard PNGs
-#   • Auto-refresh every 15s, or manual "▶ Run batch" button in the sidebar
+#   • Auto-refresh every 5s, or manual "▶ Run batch" button in the sidebar
 UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 # Then open http://localhost:8501 in your browser.
 
 
 # Live price poller — the high-resolution feed for the "Today's price
-# action" chart. One quote per ticker every 15s during market hours,
+# action" chart. One quote per ticker every 5s during market hours,
 # written to the spot_ticks table. Independent of the 30-min OI scheduler
 # (oi_scheduler.py), which stays on options-chain duty.
-./scripts/price_poller.py                  # foreground, SPY every 15s
+./scripts/price_poller.py                  # foreground, SPY every 5s
 ./scripts/price_poller.py --status         # is it up? tick coverage today
 ./scripts/price_poller.py --once           # auth smoke test
 ./scripts/price_poller.py --stop
