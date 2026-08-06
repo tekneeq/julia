@@ -2535,6 +2535,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             ],
             tickformat="+.2f",
             ticksuffix="%",
+            hoverformat="+.2f",
             showgrid=False,
             zeroline=False,
             color=_TV_MUTED,
@@ -2706,7 +2707,9 @@ def _twin_fig(
             zeroline=False, color=_TV_MUTED,
         ),
         yaxis=dict(
-            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            tickformat="+.2f", ticksuffix="%",
+            hoverformat="+.2f",
+            side="right", gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED,
         ),
     ))
@@ -2762,7 +2765,9 @@ def _yesterday_match_fig(
             zeroline=False, color=_TV_MUTED,
         ),
         yaxis=dict(
-            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            tickformat="+.2f", ticksuffix="%",
+            hoverformat="+.2f",
+            side="right", gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED,
         ),
     ))
@@ -2828,7 +2833,9 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
             zeroline=False, color=_TV_MUTED,
         ),
         yaxis=dict(
-            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            tickformat="+.2f", ticksuffix="%",
+            hoverformat="+.2f",
+            side="right", gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED,
         ),
     ))
@@ -2994,7 +3001,9 @@ def _session_chicklet_fig(
         ),
         yaxis=dict(
             range=[lo_y, hi_y],
-            ticksuffix="%", side="right", gridcolor=_TV_GRID,
+            tickformat="+.2f", ticksuffix="%",
+            hoverformat="+.2f",
+            side="right", gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
             fixedrange=True,
             nticks=5,
