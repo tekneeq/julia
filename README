@@ -183,6 +183,38 @@ UV_NATIVE_TLS=true uv run streamlit run scripts/oi_dashboard_app.py
 
 
 # -----------------------------------------------------------------------------
+# Auto-deploy on push (EC2)
+# -----------------------------------------------------------------------------
+# Pushes to ``main`` trigger .github/workflows/deploy-ec2.yml, which SSHes
+# into the box and runs ``./deploy.sh``:
+#   1. ./restart.sh                 git pull + rebuild julia-dashboard
+#   2. ./restart-oi-scheduler.sh    re-attach scheduler (dies with container)
+#   3. ./restart-price-poller.sh    re-attach price poller
+#
+# One-time GitHub setup (repo → Settings → Secrets and variables → Actions):
+#   EC2_HOST              e.g. 54.91.65.71
+#   EC2_USER              ec2-user
+#   EC2_SSH_PRIVATE_KEY   full contents of the .pem (including BEGIN/END lines)
+# Optional:
+#   EC2_SSH_PORT          default 22
+#   EC2_APP_DIR           default /home/ec2-user/julia
+#
+# EC2 security group: allow inbound TCP 22 from GitHub Actions (or, for a
+# small personal box, temporarily 0.0.0.0/0 — tighten later). The deploy
+# key should be the instance key pair (or a dedicated deploy key in
+# ~/.ssh/authorized_keys).
+#
+# Manual / test deploy from your laptop:
+#   ssh ec2-user@<host> 'cd ~/julia && ./deploy.sh'
+# Or use the Actions tab → "Deploy to EC2" → Run workflow.
+#
+# Fallback without GitHub→SSH (poll every 2 min on the box itself):
+#   */2 * * * * cd /home/ec2-user/julia && git fetch origin main && \
+#     [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ] && \
+#     ./deploy.sh >> /home/ec2-user/julia/logs/deploy.log 2>&1
+
+
+# -----------------------------------------------------------------------------
 # Docker (recommended for EC2 / older-glibc hosts)
 # -----------------------------------------------------------------------------
 # Amazon Linux 2 (glibc 2.26) doesn't have wheels for modern pyarrow, torch,

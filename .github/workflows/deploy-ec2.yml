@@ -1,0 +1,52 @@
+# Redeploy the dashboard on EC2 whenever ``main`` advances.
+#
+# Required GitHub repo secrets (Settings → Secrets and variables → Actions):
+#   EC2_HOST            public IP or DNS of the instance
+#   EC2_USER            SSH user (usually ``ec2-user`` on Amazon Linux)
+#   EC2_SSH_PRIVATE_KEY full PEM private key that can SSH as EC2_USER
+# Optional:
+#   EC2_SSH_PORT        default 22
+#   EC2_APP_DIR         default ``/home/ec2-user/julia``
+#
+# The EC2 security group must allow inbound SSH from GitHub Actions
+# (or temporarily 0.0.0.0/0 on :22). See README "Auto-deploy on push".
+
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # manual "Run workflow" button
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false  # never cut a mid-deploy rebuild short
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          # docker builds can take a few minutes on a small instance
+          command_timeout: 25m
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            if [ -z "$APP_DIR" ]; then
+              APP_DIR="$HOME/julia"
+            fi
+            cd "$APP_DIR"
+            # Make sure the deploy helper from this push is what we run:
+            # restart.sh already git-pulls, but pull first so deploy.sh
+            # itself is up to date before we execute it.
+            git pull --ff-only origin main
+            chmod +x deploy.sh restart.sh restart-oi-scheduler.sh restart-price-poller.sh
+            ./deploy.sh
