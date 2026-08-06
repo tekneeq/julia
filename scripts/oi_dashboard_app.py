@@ -24,6 +24,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import math
 
@@ -118,6 +119,51 @@ def _format_age(secs: int) -> str:
     if secs < 86400:
         return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
     return f"{secs // 86400}d ago"
+
+
+def _running_git_revision() -> tuple[str, str]:
+    """``(short_sha, commit_time_label)`` for the build this process serves.
+
+    Prefers ``JULIA_GIT_SHA`` / ``JULIA_GIT_COMMIT_TIME`` baked in by
+    ``restart.sh`` (Docker images have no ``.git``). Falls back to a
+    local ``git`` call for ``streamlit run`` outside Docker.
+    """
+    sha = (os.environ.get("JULIA_GIT_SHA") or "").strip()
+    when_raw = (os.environ.get("JULIA_GIT_COMMIT_TIME") or "").strip()
+    if not sha or sha == "unknown":
+        try:
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(REPO_ROOT),
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            sha = "unknown"
+    if not when_raw or when_raw == "unknown":
+        try:
+            when_raw = subprocess.check_output(
+                ["git", "show", "-s", "--format=%cI", "HEAD"],
+                cwd=str(REPO_ROOT),
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            when_raw = ""
+
+    if when_raw:
+        try:
+            # Always show US/Eastern — matches the dashboard's market clock.
+            dt = datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
+            when_label = (
+                dt.astimezone(ZoneInfo("America/New_York"))
+                .strftime("%Y-%m-%d %H:%M:%S ET")
+            )
+        except ValueError:
+            when_label = when_raw
+    else:
+        when_label = "unknown"
+    return sha, when_label
 
 
 def _age_str(path: Path) -> str:
@@ -3209,6 +3255,8 @@ def _render_today_and_twins(ticker: str) -> None:
 
 st.set_page_config(page_title="Options OI Dashboard", layout="wide")
 st.title("📊 Options OI — Live Dashboard")
+_git_sha, _git_when = _running_git_revision()
+st.caption(f"Running `{_git_sha}` · committed {_git_when}")
 
 with st.sidebar:
     st.header("Config")

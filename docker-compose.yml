@@ -1,6 +1,10 @@
 services:
   dashboard:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        GIT_COMMIT_TIME: ${GIT_COMMIT_TIME:-unknown}
     image: julia-dashboard:latest
     container_name: julia-dashboard
     ports:
@@ -12,4 +16,7 @@ services:
       - ./logs:/app/logs
     env_file:
       - .env
+    environment:
+      JULIA_GIT_SHA: ${GIT_SHA:-unknown}
+      JULIA_GIT_COMMIT_TIME: ${GIT_COMMIT_TIME:-unknown}
     restart: unless-stopped
