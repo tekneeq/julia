@@ -916,18 +916,22 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
     ))
 
     fig.add_hline(y=0, line_color="#999", line_width=1)
+    # Longer windows pack more candles on x — grow the plot so wicks /
+    # σ bands stay readable (5d ≈ 560px, 20d ≈ 800px).
+    n = max(len(history), 1)
+    chart_h = int(min(900, max(560, 400 + 20 * n)))
     fig.update_layout(
         title=f"{ticker} — implied (from prior session) vs actual daily move",
         xaxis_title="Session",
         yaxis_title="Move (% of prior-session spot)",
-        height=420,
+        height=chart_h,
         hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0),
-        margin=dict(t=60, l=60, r=20, b=40),
+        margin=dict(t=70, l=60, r=20, b=50),
         xaxis_rangeslider_visible=False,
     )
     fig.update_xaxes(type="category")
-    fig.update_yaxes(ticksuffix="%")
+    fig.update_yaxes(ticksuffix="%", tickformat="+.2f")
 
     st.plotly_chart(fig, use_container_width=True)
 
