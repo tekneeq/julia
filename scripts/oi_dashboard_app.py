@@ -3157,18 +3157,18 @@ def _session_chicklet_fig(
 
 
 def _render_recent_session_chiclets(ticker: str, today: date) -> None:
-    """Prior 10 completed sessions as two rows of 5 compact % cards.
+    """Prior 20 completed sessions as four rows of 5 compact % cards.
 
     Today is excluded — the live session chart above already covers it.
     Cards with no path yet render empty and fill in as the library
     densifies (market bars / ticks from the poller).
     """
-    n_sessions = 10
+    n_sessions = 20
     per_row = 5
-    st.markdown("##### 📅 Last 10 sessions")
+    st.markdown("##### 📅 Last 20 sessions")
     st.caption(
-        "The ten most recent **completed** sessions (today excluded) as "
-        "% vs each day's prior close — five per row, oldest → newest "
+        "The twenty most recent **completed** sessions (today excluded) "
+        "as % vs each day's prior close — five per row, oldest → newest "
         "left-to-right then top-to-bottom. Annotated **O / H / L** are "
         "the open, high, and low of the move. Every card is centered on "
         "**0% (prior close)** and scaled symmetrically to that day's "
@@ -3180,7 +3180,7 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
         "history accumulates."
     )
 
-    # Yesterday (or Friday if today is Mon / weekend) → nine more back.
+    # Yesterday (or Friday if today is Mon / weekend) → nineteen more back.
     end = _prev_business_day(today)
     days = _past_business_days(end, n_sessions)
     iva = _implied_vs_actual_history(ticker, n_sessions, end.isoformat())
