@@ -91,7 +91,8 @@ for a in --replace "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
 
 # Drop recycled PIDs left on the host-mounted logs/ volume after a
 # container recreate — the Python side also scrubs, but clear eagerly.
-rm -f logs/oi-scheduler.pid
+# Pid files are root-owned (written in-container); delete via docker exec.
+docker exec "$CONTAINER" rm -f logs/oi-scheduler.pid
 
 # ``setsid`` + ignore SIGHUP so the process survives ``docker exec -d``
 # session teardown (plain ``exec uv run`` was dying right after deploy).

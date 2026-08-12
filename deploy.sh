@@ -34,7 +34,10 @@ fi
 
 # PID files live on the host-mounted logs/ volume and survive container
 # recreates — clear them so we never SIGTERM a recycled PID (e.g. Streamlit).
-rm -f logs/oi-scheduler.pid logs/price-poller.pid
+# They are usually root-owned (written inside the container), so delete
+# via docker exec rather than host ``rm`` (which Permission-denies).
+docker exec julia-dashboard rm -f \
+    logs/oi-scheduler.pid logs/price-poller.pid
 
 log "2/4  restart OI scheduler (detached)"
 ./restart-oi-scheduler.sh
