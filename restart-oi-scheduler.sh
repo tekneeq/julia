@@ -89,13 +89,25 @@ fi
 QUOTED=""
 for a in --replace "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
 
+# Drop recycled PIDs left on the host-mounted logs/ volume after a
+# container recreate — the Python side also scrubs, but clear eagerly.
+rm -f logs/oi-scheduler.pid
+
+# ``setsid`` + ignore SIGHUP so the process survives ``docker exec -d``
+# session teardown (plain ``exec uv run`` was dying right after deploy).
 docker exec -d "$CONTAINER" sh -c \
-    "mkdir -p logs && exec uv run python $SCHED$QUOTED >> $OUT_LOG 2>&1"
+    "mkdir -p logs && setsid uv run python $SCHED$QUOTED >>$OUT_LOG 2>&1 </dev/null"
 
 # Confirm it actually came up rather than reporting success for a process
 # that died on startup.
-sleep 3
+sleep 5
 echo "── scheduler status ──────────────────────────────────────────────"
-docker exec "$CONTAINER" uv run python "$SCHED" --status "$@" || true
+STATUS="$(docker exec "$CONTAINER" uv run python "$SCHED" --status "$@" || true)"
+printf '%s\n' "$STATUS"
 echo
 echo "Console log: $OUT_LOG   (follow with: $0 --logs)"
+if ! printf '%s\n' "$STATUS" | grep -q 'Process: ● RUNNING'; then
+    echo "❌ scheduler failed to stay up — last log lines:" >&2
+    docker exec "$CONTAINER" sh -c "tail -n 60 $OUT_LOG" 2>/dev/null || true
+    exit 1
+fi

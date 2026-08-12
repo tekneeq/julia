@@ -172,6 +172,9 @@ def _rolling_window(day: date, days_ahead: int) -> list[date]:
 # by an unrelated process would read as "running". The window is small and
 # the blast radius is a refused start, so we don't try to be cleverer.
 
+_PID_MARKER = "oi_scheduler.py"
+
+
 def _read_pid(pid_file: Path) -> int | None:
     try:
         return int(pid_file.read_text().strip())
@@ -191,10 +194,41 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode(errors="replace")
+
+
+def _is_our_process(pid: int) -> bool:
+    """True only if ``pid`` is actually this scheduler (not a recycled PID).
+
+    ``logs/oi-scheduler.pid`` lives on a host volume, so after
+    ``docker rm`` + recreate the old number can belong to Streamlit / uv
+    inside the new container. Never SIGTERM those.
+    """
+    return _PID_MARKER in _pid_cmdline(pid)
+
+
+def _scrub_stale_pid(pid_file: Path) -> None:
+    """Drop a pid file that doesn't point at a live scheduler."""
+    pid = _read_pid(pid_file)
+    if pid is None:
+        return
+    if pid == os.getpid():
+        return
+    if not _pid_alive(pid) or not _is_our_process(pid):
+        pid_file.unlink(missing_ok=True)
+
+
 def _running_pid(pid_file: Path) -> int | None:
     """The pid of a live scheduler other than us, if there is one."""
     pid = _read_pid(pid_file)
     if pid is None or pid == os.getpid() or not _pid_alive(pid):
+        return None
+    if not _is_our_process(pid):
         return None
     return pid
 
@@ -218,6 +252,7 @@ def _stop_running(pid_file: Path, timeout: float = 30.0) -> bool:
     fire already in flight runs to completion, so we escalate to SIGKILL
     after ``timeout``. Returns False if nothing was running.
     """
+    _scrub_stale_pid(pid_file)
     pid = _running_pid(pid_file)
     if pid is None:
         return False
@@ -396,13 +431,12 @@ def _status_report(
     print(f"  db: {DB_PATH}{'' if DB_PATH.exists() else '   ← does not exist yet'}")
 
     # --- is it up? ---------------------------------------------------
+    _scrub_stale_pid(pid_file)
     pid = _running_pid(pid_file)
     if pid:
         print(f"\nProcess: ● RUNNING (pid {pid}, pid-file {pid_file.name})")
     else:
-        stale = _read_pid(pid_file)
-        extra = f" — stale pid-file points at {stale}" if stale else ""
-        print(f"\nProcess: ○ NOT RUNNING{extra}")
+        print("\nProcess: ○ NOT RUNNING")
         print("         start it with  ./restart-oi-scheduler.sh --now")
 
     # --- current window coverage -------------------------------------
@@ -626,6 +660,7 @@ def main() -> int:
         )
         return rc
 
+    _scrub_stale_pid(pid_file)
     if args.replace:
         _stop_running(pid_file)
     elif (existing := _running_pid(pid_file)) is not None:
@@ -638,6 +673,8 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    # Ignore SIGHUP so a detached ``docker exec`` teardown can't kill us.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     _write_pid(pid_file)
 
     print(
