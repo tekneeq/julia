@@ -31,7 +31,6 @@ import math
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
@@ -2404,46 +2403,52 @@ def _pct_axis_layout(**extra) -> dict:
     return base
 
 
-def _plotly_chart_with_pulse(fig: go.Figure, *, height: int = 480) -> None:
-    """Render ``fig`` and auto-loop its animation frames (live-price blink).
+def _plotly_chart_with_pulse(
+    fig: go.Figure, *, height: int = 480, live: bool = False,
+) -> None:
+    """Render the live session chart via native Streamlit Plotly.
 
-    ``st.plotly_chart`` does not autoplay frames, so we embed Plotly in a
-    small component and call ``Plotly.animate`` in a loop. Falls back to
-    a static chart when there are no frames.
+    Previously this embedded ``fig.to_json()`` in ``components.html`` so
+    a JS loop could animate the last-price dot. Once the session has
+    thousands of ticks that payload is multi‑MB every refresh and
+    Streamlit blanks the rest of the page after the ticker header.
+    Keep a bright halo on the last print instead, plus a CSS live pill.
     """
-    if not fig.frames:
-        st.plotly_chart(fig, use_container_width=True)
-        return
-    # Hide any leftover animation chrome; JS drives the loop.
-    fig.update_layout(updatemenus=[])
-    spec = fig.to_json()
-    components.html(
-        f"""
-<div id="tv-live" style="width:100%;height:{height}px;"></div>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-<script>
-const fig = {spec};
-const el = document.getElementById("tv-live");
-Plotly.newPlot(el, fig.data, fig.layout, {{
-  responsive: true,
-  displayModeBar: false
-}}).then(gd => Plotly.addFrames(gd, fig.frames || []))
-  .then(gd => {{
-    const opts = {{
-      frame: {{duration: 700, redraw: false}},
-      transition: {{duration: 600, easing: "cubic-in-out"}},
-      mode: "immediate"
-    }};
-    function loop() {{
-      Plotly.animate(gd, null, opts).then(
-        () => window.setTimeout(loop, 40)
-      );
-    }}
-    loop();
-  }});
-</script>
+    if live:
+        st.markdown(
+            """
+<style>
+@keyframes julia-live-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.julia-live-pill {
+  display: inline-block;
+  margin: 0 0 6px 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(8, 153, 129, 0.18);
+  color: #089981;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.julia-live-pill .dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #089981;
+  animation: julia-live-blink 1.1s ease-in-out infinite;
+}
+</style>
+<div class="julia-live-pill"><span class="dot"></span>LIVE</div>
 """,
-        height=height + 10,
+            unsafe_allow_html=True,
+        )
+    st.plotly_chart(
+        fig, use_container_width=True,
+        config={"displayModeBar": False},
     )
 
 
@@ -2454,53 +2459,27 @@ def _attach_live_price_pulse(
     last_price: float,
     color: str,
 ) -> None:
-    """Add a solid live dot + expanding halo, with blink animation frames."""
-    halo_i = len(fig.data)
-    fig.add_trace(go.Scatter(
-        x=[last_ts], y=[last_price], mode="markers",
-        marker=dict(size=16, color=color, opacity=0.35, line=dict(width=0)),
-        hoverinfo="skip", showlegend=False,
-    ))
-    core_i = len(fig.data)
+    """Add a solid live dot + bright halo so it stays obvious near H/L."""
+    # Phase the halo size on each refresh so it still "pulses" a bit
+    # without a multi-MB JS animation embed.
+    t = 0.5 + 0.5 * math.sin(time.time() * 2.2)
     fig.add_trace(go.Scatter(
         x=[last_ts], y=[last_price], mode="markers",
         marker=dict(
-            size=9, color=color,
-            line=dict(width=1.5, color="#ffffff"),
+            size=14 + 10 * t, color=color,
+            opacity=0.18 + 0.22 * (1.0 - t),
+            line=dict(width=0),
         ),
         hoverinfo="skip", showlegend=False,
     ))
-    frames: list[go.Frame] = []
-    n = 14
-    for i in range(n):
-        # 0 → 1 → 0 over the cycle: ring expands and fades.
-        t = 0.5 - 0.5 * math.cos(2 * math.pi * i / n)
-        frames.append(go.Frame(
-            name=str(i),
-            data=[
-                go.Scatter(
-                    x=[last_ts], y=[last_price],
-                    mode="markers",
-                    marker=dict(
-                        size=12 + 18 * t,
-                        color=color,
-                        opacity=max(0.05, 0.40 * (1.0 - t)),
-                        line=dict(width=0),
-                    ),
-                ),
-                go.Scatter(
-                    x=[last_ts], y=[last_price],
-                    mode="markers",
-                    marker=dict(
-                        size=8 + 3 * t,
-                        color=color,
-                        line=dict(width=1.5, color="#ffffff"),
-                    ),
-                ),
-            ],
-            traces=[halo_i, core_i],
-        ))
-    fig.frames = frames
+    fig.add_trace(go.Scatter(
+        x=[last_ts], y=[last_price], mode="markers",
+        marker=dict(
+            size=10, color=color,
+            line=dict(width=2, color="#ffffff"),
+        ),
+        hoverinfo="skip", showlegend=False,
+    ))
 
 
 def _today_price_series(ticker: str, today: date) -> list[dict]:
@@ -2744,7 +2723,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
-    _plotly_chart_with_pulse(fig, height=480)
+    _plotly_chart_with_pulse(fig, height=480, live=market_open_now)
     if extreme_probs is not None:
         fresh = []
         if extreme_probs["at_high"]:
@@ -3364,10 +3343,17 @@ def _render_today_and_twins(ticker: str) -> None:
         st.info("Weekend — the live session chart resumes next trading day.")
         return
 
-    status = _sync_daily_move_library(ticker, today.isoformat())
-    _render_today_price_chart(ticker, today, status)
-    _render_recent_session_chiclets(ticker, today)
-    _render_twin_panels(ticker, today)
+    try:
+        status = _sync_daily_move_library(ticker, today.isoformat())
+        _render_today_price_chart(ticker, today, status)
+        _render_recent_session_chiclets(ticker, today)
+        _render_twin_panels(ticker, today)
+    except Exception as e:  # noqa: BLE001 — surface so the page isn't blank
+        st.error(
+            f"Failed to render today's price action for **{ticker}**: "
+            f"`{type(e).__name__}: {e}`"
+        )
+        return
 
     src = "+".join(status.get("today_sources") or ["none"])
     st.caption(
@@ -3499,14 +3485,15 @@ st.divider()
 st.header("📈 Today's price action")
 st.caption(
     "TradingView-style live session chart — **right axis = $ price**, "
-    "**left axis = % vs prev close**. The **blinking** last-price dot "
-    "is the live print (easy to spot when sitting on the high/low). "
-    "Fed by the dedicated price poller (`scripts/price_poller.py`, "
-    "~5s cadence — its own loop, independent of the 30-minute OI "
-    "scheduler); the dashboard auto-refreshes every 5s to match. "
-    "H/L labels include a **% chance that extreme is the day's "
-    "high/low**. Hover for crosshair details. Historical twins are "
-    "charted separately below — never overlaid on the price."
+    "**left axis = % vs prev close**. The last print has a bright "
+    "halo + blinking **LIVE** pill so it stays obvious near the "
+    "high/low. Fed by the dedicated price poller "
+    "(`scripts/price_poller.py`, ~5s cadence — its own loop, "
+    "independent of the 30-minute OI scheduler); the dashboard "
+    "auto-refreshes every 5s to match. H/L labels include a "
+    "**% chance that extreme is the day's high/low**. Hover for "
+    "crosshair details. Historical twins are charted separately "
+    "below — never overlaid on the price."
 )
 for ticker in tickers:
     st.markdown(f"**{ticker}**")
