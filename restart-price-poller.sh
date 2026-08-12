@@ -81,7 +81,8 @@ fi
 QUOTED=""
 for a in --replace "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
 
-rm -f logs/price-poller.pid
+# Pid files are root-owned (written in-container); delete via docker exec.
+docker exec "$CONTAINER" rm -f logs/price-poller.pid
 
 docker exec -d "$CONTAINER" sh -c \
     "mkdir -p logs && setsid uv run python $POLLER$QUOTED >>$OUT_LOG 2>&1 </dev/null"
