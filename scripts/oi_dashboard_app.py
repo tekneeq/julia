@@ -2723,7 +2723,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
-    _plotly_chart_with_pulse(fig, height=480)
+    _plotly_chart_with_pulse(fig, height=480, live=market_open_now)
     if extreme_probs is not None:
         fresh = []
         if extreme_probs["at_high"]:
@@ -3343,10 +3343,17 @@ def _render_today_and_twins(ticker: str) -> None:
         st.info("Weekend — the live session chart resumes next trading day.")
         return
 
-    status = _sync_daily_move_library(ticker, today.isoformat())
-    _render_today_price_chart(ticker, today, status)
-    _render_recent_session_chiclets(ticker, today)
-    _render_twin_panels(ticker, today)
+    try:
+        status = _sync_daily_move_library(ticker, today.isoformat())
+        _render_today_price_chart(ticker, today, status)
+        _render_recent_session_chiclets(ticker, today)
+        _render_twin_panels(ticker, today)
+    except Exception as e:  # noqa: BLE001 — surface so the page isn't blank
+        st.error(
+            f"Failed to render today's price action for **{ticker}**: "
+            f"`{type(e).__name__}: {e}`"
+        )
+        return
 
     src = "+".join(status.get("today_sources") or ["none"])
     st.caption(
@@ -3478,14 +3485,15 @@ st.divider()
 st.header("📈 Today's price action")
 st.caption(
     "TradingView-style live session chart — **right axis = $ price**, "
-    "**left axis = % vs prev close**. The **blinking** last-price dot "
-    "is the live print (easy to spot when sitting on the high/low). "
-    "Fed by the dedicated price poller (`scripts/price_poller.py`, "
-    "~5s cadence — its own loop, independent of the 30-minute OI "
-    "scheduler); the dashboard auto-refreshes every 5s to match. "
-    "H/L labels include a **% chance that extreme is the day's "
-    "high/low**. Hover for crosshair details. Historical twins are "
-    "charted separately below — never overlaid on the price."
+    "**left axis = % vs prev close**. The last print has a bright "
+    "halo + blinking **LIVE** pill so it stays obvious near the "
+    "high/low. Fed by the dedicated price poller "
+    "(`scripts/price_poller.py`, ~5s cadence — its own loop, "
+    "independent of the 30-minute OI scheduler); the dashboard "
+    "auto-refreshes every 5s to match. H/L labels include a "
+    "**% chance that extreme is the day's high/low**. Hover for "
+    "crosshair details. Historical twins are charted separately "
+    "below — never overlaid on the price."
 )
 for ticker in tickers:
     st.markdown(f"**{ticker}**")
