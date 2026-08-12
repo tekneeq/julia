@@ -431,13 +431,12 @@ def _status_report(
     print(f"  db: {DB_PATH}{'' if DB_PATH.exists() else '   ← does not exist yet'}")
 
     # --- is it up? ---------------------------------------------------
+    _scrub_stale_pid(pid_file)
     pid = _running_pid(pid_file)
     if pid:
         print(f"\nProcess: ● RUNNING (pid {pid}, pid-file {pid_file.name})")
     else:
-        stale = _read_pid(pid_file)
-        extra = f" — stale pid-file points at {stale}" if stale else ""
-        print(f"\nProcess: ○ NOT RUNNING{extra}")
+        print("\nProcess: ○ NOT RUNNING")
         print("         start it with  ./restart-oi-scheduler.sh --now")
 
     # --- current window coverage -------------------------------------
