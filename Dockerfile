@@ -32,6 +32,13 @@ VOLUME ["/app/.options_cache", "/app/plots", "/app/logs"]
 
 EXPOSE 8501
 
+# Baked in by restart.sh / CI so the live dashboard can show which
+# commit it's serving (``.git`` is not copied into the image).
+ARG GIT_SHA=unknown
+ARG GIT_COMMIT_TIME=unknown
+ENV JULIA_GIT_SHA=$GIT_SHA \
+    JULIA_GIT_COMMIT_TIME=$GIT_COMMIT_TIME
+
 ENV UV_NATIVE_TLS=true \
     PYTHONUNBUFFERED=1 \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \

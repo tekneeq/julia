@@ -2,7 +2,7 @@
 """Dedicated live price poller for the "Today's price action" chart.
 
 Polls Robinhood for the latest regular-session price every N seconds
-(default 15) during market hours and stores each print in the
+(default 5) during market hours and stores each print in the
 ``spot_ticks`` table. This is deliberately independent of
 ``oi_scheduler.py`` — the OI batch is heavyweight (full options chains,
 PNG rendering) and fires every 30 minutes, which is far too coarse for
@@ -24,10 +24,10 @@ Runs forever in the foreground. Ctrl-C to stop. Handles:
 
 Examples
 --------
-    # Start with the defaults (SPY every 15s)
+    # Start with the defaults (SPY every 5s)
     ./scripts/price_poller.py
 
-    # Finer cadence, more tickers
+    # More tickers / slower cadence
     ./scripts/price_poller.py --tickers SPY,QQQ --interval-sec 10
 
     # One poll right now (auth smoke test), then exit
@@ -300,8 +300,8 @@ def main() -> int:
         help="Comma-separated tickers to poll (default: SPY).",
     )
     p.add_argument(
-        "--interval-sec", type=int, default=15,
-        help="Seconds between polls during market hours (default: 15).",
+        "--interval-sec", type=int, default=5,
+        help="Seconds between polls during market hours (default: 5).",
     )
     p.add_argument(
         "--pid-file", default=str(DEFAULT_PID_FILE),
