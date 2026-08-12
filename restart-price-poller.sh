@@ -81,13 +81,21 @@ fi
 QUOTED=""
 for a in --replace "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
 
+rm -f logs/price-poller.pid
+
 docker exec -d "$CONTAINER" sh -c \
-    "mkdir -p logs && exec uv run python $POLLER$QUOTED >> $OUT_LOG 2>&1"
+    "mkdir -p logs && setsid uv run python $POLLER$QUOTED >>$OUT_LOG 2>&1 </dev/null"
 
 # Confirm it actually came up rather than reporting success for a process
 # that died on startup.
-sleep 3
+sleep 5
 echo "── price poller status ───────────────────────────────────────────"
-docker exec "$CONTAINER" uv run python "$POLLER" --status "$@" || true
+STATUS="$(docker exec "$CONTAINER" uv run python "$POLLER" --status "$@" || true)"
+printf '%s\n' "$STATUS"
 echo
 echo "Console log: $OUT_LOG   (follow with: $0 --logs)"
+if ! printf '%s\n' "$STATUS" | grep -q 'Process: ● RUNNING'; then
+    echo "❌ price poller failed to stay up — last log lines:" >&2
+    docker exec "$CONTAINER" sh -c "tail -n 60 $OUT_LOG" 2>/dev/null || true
+    exit 1
+fi

@@ -22,7 +22,7 @@ log() { echo "[$(ts)] $*"; }
 
 log "=== deploy start (cwd=$(pwd), rev=$(git rev-parse --short HEAD 2>/dev/null || echo '?')) ==="
 
-log "1/3  rebuild dashboard container (git pull + docker build/run)"
+log "1/4  rebuild dashboard container (git pull + docker build/run)"
 ./restart.sh
 
 # Give Streamlit a moment to bind :8501 before we pile on more processes.
@@ -32,11 +32,20 @@ if ! docker ps --format '{{.Names}}' | grep -qx julia-dashboard; then
     exit 1
 fi
 
-log "2/3  restart OI scheduler (detached)"
+# PID files live on the host-mounted logs/ volume and survive container
+# recreates — clear them so we never SIGTERM a recycled PID (e.g. Streamlit).
+rm -f logs/oi-scheduler.pid logs/price-poller.pid
+
+log "2/4  restart OI scheduler (detached)"
 ./restart-oi-scheduler.sh
 
-log "3/3  restart price poller (detached)"
+log "3/4  restart price poller (detached)"
 ./restart-price-poller.sh
+
+log "4/4  one-off batch to seed the current expiration window"
+# Blocks until the batch finishes so 08-17 / 08-18 etc. get a snapshot
+# immediately instead of waiting for the next :00/:30 slot.
+./restart-oi-scheduler.sh --run-once
 
 log "=== deploy done (rev=$(git rev-parse --short HEAD)) ==="
 ./restart-oi-scheduler.sh --status || true
