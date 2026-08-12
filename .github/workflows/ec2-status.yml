@@ -1,0 +1,98 @@
+# One-shot SSH diagnostics for the dashboard box (no rebuild).
+name: EC2 status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Scheduler / poller / snapshot coverage
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          command_timeout: 8m
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            if [ -z "$APP_DIR" ]; then APP_DIR="$HOME/julia"; fi
+            cd "$APP_DIR"
+            echo "=== host time ==="
+            date
+            echo "=== container ==="
+            docker ps --filter name=julia-dashboard --format '{{.Names}} {{.Status}} {{.Image}}'
+            echo "=== git ==="
+            git rev-parse --short HEAD
+            git log -1 --format='%h %ci %s'
+            echo "=== oi-scheduler --status ==="
+            ./restart-oi-scheduler.sh --status || true
+            echo "=== price-poller --status ==="
+            ./restart-price-poller.sh --status || true
+            echo "=== recent scheduler log (tail) ==="
+            tail -n 80 logs/oi-scheduler.out 2>/dev/null || echo "(no oi-scheduler.out)"
+            echo "=== snapshot counts for Aug 12–18 ==="
+            docker exec julia-dashboard uv run python - <<'PY'
+            from pathlib import Path
+            import sqlite3
+            db = Path(".options_cache/predictions.db")
+            if not db.exists():
+                print("DB missing:", db)
+                raise SystemExit(0)
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            # Discover tables that look like OI snapshot storage
+            tables = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1"
+            )]
+            print("tables:", ", ".join(tables))
+            for t in tables:
+                cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
+                if not any(c in cols for c in ("expiration", "expiration_date", "exp")):
+                    continue
+                exp_col = next(c for c in ("expiration", "expiration_date", "exp") if c in cols)
+                ticker_col = "ticker" if "ticker" in cols else None
+                print(f"\n-- {t} ({exp_col}) --")
+                q = f"""
+                  SELECT {exp_col} AS exp, COUNT(*) AS n
+                  FROM {t}
+                  WHERE {exp_col} BETWEEN '2026-08-12' AND '2026-08-18'
+                  {"AND ticker='SPY'" if ticker_col else ""}
+                  GROUP BY 1 ORDER BY 1
+                """
+                rows = list(con.execute(q))
+                if not rows:
+                    print("(no rows in window)")
+                for r in rows:
+                    print(dict(r))
+            # Also show latest capture times if a captured_at column exists
+            for t in tables:
+                cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
+                if "captured_at" not in cols and "captured_at_utc" not in cols:
+                    continue
+                ts = "captured_at_utc" if "captured_at_utc" in cols else "captured_at"
+                exp_col = next((c for c in ("expiration", "expiration_date", "exp") if c in cols), None)
+                if not exp_col:
+                    continue
+                print(f"\n-- latest {ts} by exp in {t} --")
+                q = f"""
+                  SELECT {exp_col} AS exp, COUNT(*) AS n, MAX({ts}) AS last_ts
+                  FROM {t}
+                  WHERE {exp_col} BETWEEN '2026-08-12' AND '2026-08-18'
+                  AND ticker='SPY'
+                  GROUP BY 1 ORDER BY 1
+                """
+                try:
+                    for r in con.execute(q):
+                        print(dict(r))
+                except Exception as e:
+                    print("query failed:", e)
+            PY
+            echo "=== recent batch logs ==="
+            ls -lt logs/oi-batch 2>/dev/null | head -20 || echo "(no oi-batch dir)"
+            ls -lt logs/oi-scheduler 2>/dev/null | head -10 || true
