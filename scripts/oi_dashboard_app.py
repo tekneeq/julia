@@ -2354,6 +2354,56 @@ def _minute_to_dt(session: date, m: int | float) -> datetime:
     )
 
 
+# Synthetic Monday used only so twin overlays from different real dates
+# share one session-clock x-axis (hover shows time, not minutes-from-open).
+_TWIN_AXIS_DAY = date(2000, 1, 3)
+
+
+def _path_clock_series(
+    path: list[dict], *, axis_day: date,
+) -> tuple[list[datetime], list[str], list[float]]:
+    """Datetime x + clock labels + pct rounded to 2dp for hover/plot."""
+    mins = [p["minutes_from_open"] for p in path]
+    xs = [_minute_to_dt(axis_day, m) for m in mins]
+    clocks = [_fmt_session_clock(m) for m in mins]
+    ys = [round(float(p["pct"]), 2) for p in path]
+    return xs, clocks, ys
+
+
+def _session_axis_layout(*, step_min: int = 90) -> dict:
+    """Shared datetime session-clock x-axis for twin / chicklet charts."""
+    tick_mins, tick_text = _session_clock_ticks(step_min)
+    tick_vals = [_minute_to_dt(_TWIN_AXIS_DAY, m) for m in tick_mins]
+    return dict(
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        range=[
+            _minute_to_dt(_TWIN_AXIS_DAY, 0),
+            _minute_to_dt(_TWIN_AXIS_DAY, _SESSION_MINUTES),
+        ],
+        gridcolor=_TV_GRID,
+        zeroline=False,
+        color=_TV_MUTED,
+        hoverformat="%-I:%M%p",
+    )
+
+
+def _pct_axis_layout(**extra) -> dict:
+    """% y-axis with two-decimal ticks and hover."""
+    base = dict(
+        tickformat="+.2f",
+        ticksuffix="%",
+        hoverformat="+.2f",
+        side="right",
+        gridcolor=_TV_GRID,
+        zeroline=False,
+        color=_TV_MUTED,
+    )
+    base.update(extra)
+    return base
+
+
 def _plotly_chart_with_pulse(fig: go.Figure, *, height: int = 480) -> None:
     """Render ``fig`` and auto-loop its animation frames (live-price blink).
 
@@ -2801,44 +2851,52 @@ def _twin_fig(
 
     fig = go.Figure()
     if today_path:
+        xs, clocks, ys = _path_clock_series(
+            today_path, axis_day=_TWIN_AXIS_DAY,
+        )
         fig.add_trace(go.Scatter(
-            x=[p["minutes_from_open"] for p in today_path],
-            y=[p["pct"] for p in today_path],
-            mode="lines",
+            x=xs, y=ys, mode="lines",
             name=f"Today ({today:%b %d})",
             line=dict(color=_TV_SPIKE, width=1.3),
-            hovertemplate="Today: <b>%{y:+.2f}%</b><extra></extra>",
+            customdata=clocks,
+            hovertemplate=(
+                "Today %{customdata}: <b>%{y:+.2f}%</b><extra></extra>"
+            ),
         ))
-    fig.add_trace(go.Scatter(
-        x=[p["minutes_from_open"] for p in matched],
-        y=[p["pct"] for p in matched],
-        mode="lines",
-        name=f"{twin['day']:%b %d} (matched)",
-        line=dict(color=color, width=2.2),
-        hovertemplate=(
-            f"{twin['day']:%b %d}: <b>%{{y:+.2f}}%</b><extra></extra>"
-        ),
-    ))
-    if len(rest) >= 2:
+    if matched:
+        xs, clocks, ys = _path_clock_series(
+            matched, axis_day=_TWIN_AXIS_DAY,
+        )
         fig.add_trace(go.Scatter(
-            x=[p["minutes_from_open"] for p in rest],
-            y=[p["pct"] for p in rest],
-            mode="lines",
+            x=xs, y=ys, mode="lines",
+            name=f"{twin['day']:%b %d} (matched)",
+            line=dict(color=color, width=2.2),
+            customdata=clocks,
+            hovertemplate=(
+                f"{twin['day']:%b %d} %{{customdata}}: "
+                "<b>%{y:+.2f}%</b><extra></extra>"
+            ),
+        ))
+    if len(rest) >= 2:
+        xs, clocks, ys = _path_clock_series(rest, axis_day=_TWIN_AXIS_DAY)
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines",
             name="rest of that day",
             line=dict(color=color, width=1.6, dash="dash"),
             opacity=0.55,
+            customdata=clocks,
             hovertemplate=(
-                f"{twin['day']:%b %d} (later): "
+                f"{twin['day']:%b %d} (later) %{{customdata}}: "
                 "<b>%{y:+.2f}%</b><extra></extra>"
             ),
         ))
     if now_m is not None:
         fig.add_vline(
-            x=now_m, line_color=_TV_MUTED, line_width=1, line_dash="dot",
+            x=_minute_to_dt(_TWIN_AXIS_DAY, now_m),
+            line_color=_TV_MUTED, line_width=1, line_dash="dot",
         )
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
 
-    tick_vals, tick_text = _session_clock_ticks(90)
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin["final_pct"] is not None else "close n/a"
@@ -2849,17 +2907,8 @@ def _twin_fig(
             f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
         ),
         hovermode="x unified",
-        xaxis=dict(
-            tickmode="array", tickvals=tick_vals, ticktext=tick_text,
-            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
-        yaxis=dict(
-            tickformat="+.2f", ticksuffix="%",
-            hoverformat="+.2f",
-            side="right", gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
+        xaxis=_session_axis_layout(),
+        yaxis=_pct_axis_layout(),
     ))
     return fig
 
@@ -2876,27 +2925,33 @@ def _yesterday_match_fig(
     """
     fig = go.Figure()
     if yesterday_path:
+        xs, clocks, ys = _path_clock_series(
+            yesterday_path, axis_day=_TWIN_AXIS_DAY,
+        )
         fig.add_trace(go.Scatter(
-            x=[p["minutes_from_open"] for p in yesterday_path],
-            y=[p["pct"] for p in yesterday_path],
-            mode="lines",
+            x=xs, y=ys, mode="lines",
             name=f"Yesterday ({yesterday:%b %d})",
             line=dict(color=_TV_SPIKE, width=1.8),
-            hovertemplate="Yesterday: <b>%{y:+.2f}%</b><extra></extra>",
+            customdata=clocks,
+            hovertemplate=(
+                "Yesterday %{customdata}: <b>%{y:+.2f}%</b><extra></extra>"
+            ),
         ))
     if twin.get("path"):
+        xs, clocks, ys = _path_clock_series(
+            twin["path"], axis_day=_TWIN_AXIS_DAY,
+        )
         fig.add_trace(go.Scatter(
-            x=[p["minutes_from_open"] for p in twin["path"]],
-            y=[p["pct"] for p in twin["path"]],
-            mode="lines",
+            x=xs, y=ys, mode="lines",
             name=f"Closest match ({twin['day']:%b %d})",
             line=dict(color=color, width=2.2),
+            customdata=clocks,
             hovertemplate=(
-                f"{twin['day']:%b %d}: <b>%{{y:+.2f}}%</b><extra></extra>"
+                f"{twin['day']:%b %d} %{{customdata}}: "
+                "<b>%{y:+.2f}%</b><extra></extra>"
             ),
         ))
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
-    tick_vals, tick_text = _session_clock_ticks(90)
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin.get("final_pct") is not None else "close n/a"
@@ -2907,17 +2962,8 @@ def _yesterday_match_fig(
             f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
         ),
         hovermode="x unified",
-        xaxis=dict(
-            tickmode="array", tickvals=tick_vals, ticktext=tick_text,
-            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
-        yaxis=dict(
-            tickformat="+.2f", ticksuffix="%",
-            hoverformat="+.2f",
-            side="right", gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
+        xaxis=_session_axis_layout(),
+        yaxis=_pct_axis_layout(),
     ))
     return fig
 
@@ -2937,16 +2983,19 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
             _TV_UP if (next_close is not None and next_close >= 0)
             else _TV_DOWN
         )
+        xs, clocks, ys = _path_clock_series(
+            next_path, axis_day=_TWIN_AXIS_DAY,
+        )
         fig.add_trace(go.Scatter(
-            x=[p["minutes_from_open"] for p in next_path],
-            y=[p["pct"] for p in next_path],
-            mode="lines",
+            x=xs, y=ys, mode="lines",
             name=f"{next_day:%b %d}",
             line=dict(color=next_color, width=2.4),
             fill="tozeroy",
             fillcolor=(_TV_UP_FILL if next_color == _TV_UP else _TV_DOWN_FILL),
+            customdata=clocks,
             hovertemplate=(
-                f"{next_day:%b %d}: <b>%{{y:+.2f}}%</b><extra></extra>"
+                f"{next_day:%b %d} %{{customdata}}: "
+                "<b>%{y:+.2f}%</b><extra></extra>"
             ),
             showlegend=False,
         ))
@@ -2959,7 +3008,6 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
         )
 
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
-    tick_vals, tick_text = _session_clock_ticks(90)
     if next_day is not None and twin.get("next_final_pct") is not None:
         title = (
             f"Next day after twin — {next_day:%a %b %d}  ·  "
@@ -2975,17 +3023,8 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
     fig.update_layout(**_tv_layout(
         **_twin_chart_chrome(title, show_legend=False),
         hovermode="x",
-        xaxis=dict(
-            tickmode="array", tickvals=tick_vals, ticktext=tick_text,
-            range=[0, _SESSION_MINUTES], gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
-        yaxis=dict(
-            tickformat="+.2f", ticksuffix="%",
-            hoverformat="+.2f",
-            side="right", gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED,
-        ),
+        xaxis=_session_axis_layout(),
+        yaxis=_pct_axis_layout(),
     ))
     return fig
 
@@ -3044,11 +3083,8 @@ def _session_chicklet_fig(
     open_pct = high_pct = low_pct = close_pct = None
 
     if path:
-        # Datetime x so hover/spike show clock time, not minutes-from-open.
-        mins = [p["minutes_from_open"] for p in path]
-        xs = [_minute_to_dt(day, m) for m in mins]
-        clocks = [_fmt_session_clock(m) for m in mins]
-        ys = [p["pct"] for p in path]
+        # Datetime x so hover/spike show clock time; pct rounded to 2dp.
+        xs, clocks, ys = _path_clock_series(path, axis_day=day)
         open_pct = ys[0]
         high_pct = max(ys)
         low_pct = min(ys)
@@ -3144,15 +3180,11 @@ def _session_chicklet_fig(
             gridcolor=_TV_GRID,
             zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
             fixedrange=True,
-            # Axis spike / unified hover — not minutes-from-open.
             hoverformat="%-I:%M%p",
         ),
-        yaxis=dict(
+        yaxis=_pct_axis_layout(
             range=[lo_y, hi_y],
-            tickformat="+.2f", ticksuffix="%",
-            hoverformat="+.2f",
-            side="right", gridcolor=_TV_GRID,
-            zeroline=False, color=_TV_MUTED, tickfont=dict(size=9),
+            tickfont=dict(size=9),
             fixedrange=True,
             nticks=5,
         ),
