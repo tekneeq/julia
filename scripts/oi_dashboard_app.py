@@ -109,6 +109,28 @@ def _png_for(ticker: str, exp: date) -> Path:
     return PLOTS_DIR / f"oi-dashboard-{ticker}-{exp.isoformat()}.png"
 
 
+# Plotly defaults to dragmode="zoom", so a finger swipe meant to scroll the
+# page box-zooms the chart. Keep scroll-zoom off and disable drag-zoom;
+# intentional zoom stays available via the mode bar when it is shown.
+_PLOTLY_CONFIG: dict = {
+    "scrollZoom": False,
+    "displaylogo": False,
+}
+
+
+def _show_plotly(
+    fig: go.Figure,
+    *,
+    config: dict | None = None,
+    **kwargs,
+) -> None:
+    """Render a Plotly chart without accidental drag/touch zoom."""
+    if fig.layout.dragmode is None:
+        fig.update_layout(dragmode=False)
+    merged = {**_PLOTLY_CONFIG, **(config or {})}
+    st.plotly_chart(fig, use_container_width=True, config=merged, **kwargs)
+
+
 def _format_age(secs: int) -> str:
     """Turn an integer number of seconds into a compact 'N ago' string."""
     if secs < 0:
@@ -461,7 +483,7 @@ def _render_implied_move_chart(
         t0 = ts[0]
         fig.update_xaxes(range=[t0 - timedelta(hours=6), t0 + timedelta(hours=6)])
 
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
     first = history[0]
     d_iv = last["iv"] - first["iv"]
@@ -933,7 +955,7 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
     fig.update_xaxes(type="category")
     fig.update_yaxes(ticksuffix="%", tickformat="+.2f")
 
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
     scored = [
         h for h in history
@@ -1404,7 +1426,7 @@ def _render_positioning_chart(
         pad = max((hi - lo) * 1.5, hi * 0.2, 1000)
         fig.update_yaxes(range=[max(0, lo - pad), hi + pad])
 
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
     first, last = history[0], history[-1]
     d_call = last["call_val"] - first["call_val"]
@@ -1534,7 +1556,7 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
     fig.update_layout(**layout_kwargs)
     fig.update_yaxes(tickformat="$.2f")
 
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
     col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
@@ -2292,6 +2314,9 @@ def _tv_layout(**kwargs) -> dict:
         # Keep Streamlit's chrome from painting a white frame around the
         # dark plot — margin color inherits from paper_bgcolor.
         margin=dict(t=48, l=10, r=64, b=36),
+        # Disable box-zoom on drag/touch so scrolling the page doesn't
+        # accidentally zoom the chart (Plotly's default is "zoom").
+        dragmode=False,
         hoverlabel=dict(
             bgcolor="#1e222d",
             bordercolor=_TV_MUTED,
@@ -2412,10 +2437,11 @@ def _plotly_chart_with_pulse(fig: go.Figure, *, height: int = 480) -> None:
     a static chart when there are no frames.
     """
     if not fig.frames:
-        st.plotly_chart(fig, use_container_width=True)
+        _show_plotly(fig)
         return
     # Hide any leftover animation chrome; JS drives the loop.
-    fig.update_layout(updatemenus=[])
+    # dragmode=False: don't box-zoom on accidental touch while scrolling.
+    fig.update_layout(updatemenus=[], dragmode=False)
     spec = fig.to_json()
     components.html(
         f"""
@@ -2426,7 +2452,8 @@ const fig = {spec};
 const el = document.getElementById("tv-live");
 Plotly.newPlot(el, fig.data, fig.layout, {{
   responsive: true,
-  displayModeBar: false
+  displayModeBar: false,
+  scrollZoom: false
 }}).then(gd => Plotly.addFrames(gd, fig.frames || []))
   .then(gd => {{
     const opts = {{
@@ -3228,12 +3255,11 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
         for col, day in zip(cols, row_days):
             with col:
                 path = daily_moves_store.get_session_path(ticker, day)
-                st.plotly_chart(
+                _show_plotly(
                     _session_chicklet_fig(
                         day, path, iva_by_day.get(day),
                         is_today=False,
                     ),
-                    use_container_width=True,
                     config={"displayModeBar": False},
                 )
 
@@ -3270,12 +3296,11 @@ def _render_today_twin_row(ticker: str, today: date) -> None:
     cols = st.columns(2)
     for i, twin in enumerate(result["twins"][:2]):
         with cols[i]:
-            st.plotly_chart(
+            _show_plotly(
                 _twin_fig(
                     ticker, today, today_path, twin,
                     i + 1, _TWIN_COLORS[i % len(_TWIN_COLORS)],
                 ),
-                use_container_width=True,
             )
             twin_now = _interpolate_pct(twin["path"], now_m)
             if twin_now is not None:
@@ -3320,11 +3345,10 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
     twin = result["twins"][0]
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(
+        _show_plotly(
             _yesterday_match_fig(
                 yesterday, ypath, twin, _TWIN_COLORS[0],
             ),
-            use_container_width=True,
         )
         st.caption(
             f"Closest match **{twin['day']:%a %b %d}**  ·  "
@@ -3335,9 +3359,8 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
             )
         )
     with right:
-        st.plotly_chart(
+        _show_plotly(
             _nextday_only_fig(twin),
-            use_container_width=True,
         )
         if twin.get("next_day") is not None and twin.get("next_final_pct") is not None:
             st.caption(
