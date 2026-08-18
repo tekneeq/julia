@@ -1765,14 +1765,14 @@ def _fetch_rh_5min(ticker: str, span: str) -> list[dict]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_rh_daily_closes(ticker: str, span: str = "month") -> dict[str, float]:
+def _fetch_rh_daily_closes(ticker: str) -> dict[str, float]:
     """date-iso → regular-session close from Robinhood daily bars."""
     if not _rh_market_data_ready():
         return {}
     import robin_stocks.robinhood as rh
     try:
         bars = rh.stocks.get_stock_historicals(
-            ticker, interval="day", span=span, bounds="regular",
+            ticker, interval="day", span="month", bounds="regular",
         ) or []
     except Exception:
         return {}
@@ -2560,54 +2560,101 @@ def _today_price_series(ticker: str, today: date) -> list[dict]:
     return series
 
 
-# Daily moving-average levels on the live session chart. Periods are
-# in TRADING DAYS (daily closes), matching a daily-chart SMA 9 / EMA 27.
-_SMA_DAYS = 9
-_EMA_DAYS = 27
-_SMA_COLOR = "#ff9800"  # amber — readable on the TV dark palette
-_EMA_COLOR = "#2962ff"  # TradingView blue
+# SMA 9 / EMA 27 overlays — periods in 5-MINUTE BARS, matching a
+# TradingView 5m chart with "SMA 9 close" / "EMA 27 close" applied.
+_SMA_BARS = 9
+_EMA_BARS = 27
+_SMA_COLOR = "#2962ff"  # blue, like TradingView's default MA
+_EMA_COLOR = "#f5f5f5"  # white
 
 
-def _daily_ma_levels(
-    ticker: str, today: date, live_price: float,
-) -> dict[str, float]:
-    """Current SMA-9 / EMA-27 of DAILY closes, today's live price as
-    the developing close (TradingView convention for an in-progress bar).
+def _five_min_bars(series: list[dict], today: date) -> list[dict]:
+    """Aggregate today's best-available prices into 5-minute OHLC bars.
 
-    A year of daily bars gives the EMA plenty of warm-up beyond its
-    SMA-seeded first 27 days. Empty dict when history is unavailable
-    or too short.
+    Buckets align to 09:30 like exchange bars; the last bar is the
+    developing one (its close is the live price).
     """
-    closes = _fetch_rh_daily_closes(ticker, span="year")
-    hist: list[tuple[date, float]] = []
-    for d_iso, close in closes.items():
-        try:
-            d = date.fromisoformat(d_iso)
-        except ValueError:
-            continue
-        if d < today:
-            hist.append((d, close))
-    hist.sort()
-    vals = [c for _, c in hist] + [live_price]
+    session_open = datetime.combine(today, daily_moves_store.MARKET_OPEN)
+    by_bucket: dict[int, dict] = {}
+    for e in series:
+        idx = int((e["ts"] - session_open).total_seconds() // 300)
+        if idx < 0:
+            idx = 0
+        p = float(e["price"])
+        b = by_bucket.get(idx)
+        if b is None:
+            by_bucket[idx] = {"o": p, "h": p, "l": p, "c": p}
+        else:
+            b["h"] = max(b["h"], p)
+            b["l"] = min(b["l"], p)
+            b["c"] = p
+    return [
+        {"ts": session_open + timedelta(minutes=5 * idx), **by_bucket[idx]}
+        for idx in sorted(by_bucket)
+    ]
 
-    out: dict[str, float] = {}
-    if len(vals) >= _SMA_DAYS:
-        out["sma"] = sum(vals[-_SMA_DAYS:]) / _SMA_DAYS
-    if len(vals) >= _EMA_DAYS:
-        ema = sum(vals[:_EMA_DAYS]) / _EMA_DAYS  # SMA seed
-        alpha = 2.0 / (_EMA_DAYS + 1)
-        for v in vals[_EMA_DAYS:]:
-            ema = alpha * v + (1.0 - alpha) * ema
-        out["ema"] = ema
-    return out
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _prior_5min_closes(ticker: str, today_iso: str) -> list[float]:
+    """Closes of regular-session 5-minute bars BEFORE today, oldest
+    first — warm-up history so SMA/EMA are correct from the open
+    (a 27-bar EMA otherwise needs 2h15m of today before it exists).
+
+    Regular hours are 13:30–20:00 UTC, so the UTC date prefix of
+    ``begins_at`` matches the ET session date.
+    """
+    out: list[tuple[str, float]] = []
+    for c in _fetch_rh_5min(ticker, "week"):
+        begins = c.get("begins_at") or ""
+        close = c.get("close_price")
+        if not begins or begins[:10] >= today_iso or close is None:
+            continue
+        try:
+            out.append((begins, float(close)))
+        except (TypeError, ValueError):
+            continue
+    out.sort()
+    return [c for _, c in out]
+
+
+def _ma_over_bars(
+    prior_closes: list[float], bar_closes: list[float],
+) -> tuple[list[float | None], list[float | None]]:
+    """(SMA-9, EMA-27) aligned to ``bar_closes``, warmed up with
+    ``prior_closes``. ``None`` where the window isn't filled yet.
+    EMA seeds with the SMA of its first period (charting convention).
+    """
+    closes = prior_closes + bar_closes
+    n = len(closes)
+    n_prior = len(prior_closes)
+
+    sma_full: list[float | None] = [None] * n
+    if n >= _SMA_BARS:
+        window = sum(closes[:_SMA_BARS])
+        sma_full[_SMA_BARS - 1] = window / _SMA_BARS
+        for i in range(_SMA_BARS, n):
+            window += closes[i] - closes[i - _SMA_BARS]
+            sma_full[i] = window / _SMA_BARS
+
+    ema_full: list[float | None] = [None] * n
+    if n >= _EMA_BARS:
+        ema = sum(closes[:_EMA_BARS]) / _EMA_BARS
+        ema_full[_EMA_BARS - 1] = ema
+        alpha = 2.0 / (_EMA_BARS + 1)
+        for i in range(_EMA_BARS, n):
+            ema = alpha * closes[i] + (1.0 - alpha) * ema
+            ema_full[i] = ema
+
+    return sma_full[n_prior:], ema_full[n_prior:]
 
 
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
-    green/red tint, H/L markers labeled with P(day extreme), daily
-    SMA-9 / EMA-27 levels, and a last-price tag (with %) on the price
-    axis. No twins here — they get their own panels below.
+    green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
+    EMA 27 curves on 5-minute bars, and a last-price tag (with %) on
+    the price axis. Toggles between 5-min candles (TradingView-like)
+    and the tick line. No twins here — they get their own panels below.
     """
     series = _today_price_series(ticker, today)
     ref = status.get("today_ref")
@@ -2657,6 +2704,16 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                     "`./restart-price-poller.sh --status`."
                 )
 
+    view = st.radio(
+        "Chart view",
+        ["5-min candles", "Tick line"],
+        horizontal=True,
+        key=f"today_chart_view_{ticker}",
+        label_visibility="collapsed",
+    )
+    use_candles = view == "5-min candles"
+    bars5 = _five_min_bars(series, today)
+
     fig = go.Figure()
     if ref:
         fig.add_hline(
@@ -2665,59 +2722,86 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             annotation_position="top left",
             annotation_font=dict(size=11, color=_TV_MUTED),
         )
-        # Invisible baseline sharing the price trace's x-grid — the
-        # price trace fills to it, tinting the gap vs prev close
-        # green/red like TradingView's baseline style.
+
+    if use_candles:
+        fig.add_trace(go.Candlestick(
+            x=[b["ts"] for b in bars5],
+            open=[b["o"] for b in bars5],
+            high=[b["h"] for b in bars5],
+            low=[b["l"] for b in bars5],
+            close=[b["c"] for b in bars5],
+            name=ticker,
+            increasing=dict(
+                line=dict(color=_TV_UP, width=1), fillcolor=_TV_UP,
+            ),
+            decreasing=dict(
+                line=dict(color=_TV_DOWN, width=1), fillcolor=_TV_DOWN,
+            ),
+            whiskerwidth=0.4,
+            showlegend=False,
+        ))
+    else:
+        if ref:
+            # Invisible baseline sharing the price trace's x-grid — the
+            # price trace fills to it, tinting the gap vs prev close
+            # green/red like TradingView's baseline style.
+            fig.add_trace(go.Scatter(
+                x=xs, y=[ref] * len(xs),
+                mode="lines", line=dict(width=0),
+                hoverinfo="skip", showlegend=False,
+            ))
+        # Pre-formatted in Python: plotly can't apply d3 number formats
+        # to customdata columns once the array mixes floats and strings.
+        hover_notes = [
+            (f"({(y - ref) / ref * 100.0:+.2f}%)  ·  " if ref else "")
+            + e["source"]
+            for y, e in zip(ys, series)
+        ]
         fig.add_trace(go.Scatter(
-            x=xs, y=[ref] * len(xs),
-            mode="lines", line=dict(width=0),
-            hoverinfo="skip", showlegend=False,
+            x=xs, y=ys,
+            mode="lines",
+            name=ticker,
+            line=dict(color=line_color, width=1.7),
+            fill="tonexty" if ref else None,
+            fillcolor=(_TV_UP_FILL if up else _TV_DOWN_FILL) if ref else None,
+            text=hover_notes,
+            hovertemplate=(
+                "<b>$%{y:,.2f}</b>  %{text}  ·  %{x|%H:%M:%S}<extra></extra>"
+            ),
+            showlegend=False,
         ))
 
-    # Pre-formatted in Python: plotly can't apply d3 number formats to
-    # customdata columns once the array mixes floats and strings.
-    hover_notes = [
-        (f"({(y - ref) / ref * 100.0:+.2f}%)  ·  " if ref else "")
-        + e["source"]
-        for y, e in zip(ys, series)
-    ]
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys,
-        mode="lines",
-        name=ticker,
-        line=dict(color=line_color, width=1.7),
-        fill="tonexty" if ref else None,
-        fillcolor=(_TV_UP_FILL if up else _TV_DOWN_FILL) if ref else None,
-        text=hover_notes,
-        hovertemplate=(
-            "<b>$%{y:,.2f}</b>  %{text}  ·  %{x|%H:%M:%S}<extra></extra>"
-        ),
-        showlegend=False,
-    ))
-
-    # Daily SMA 9 / EMA 27 levels (periods in trading days, today's
-    # live price as the developing close) — flat lines like a daily
-    # MA seen through an intraday zoom.
-    ma_levels = _daily_ma_levels(ticker, today, last_price)
+    # SMA 9 / EMA 27 curves on 5-minute closes, warmed up with prior
+    # sessions so both exist from the open — same values TradingView
+    # shows on a 5m chart.
+    prior_closes = _prior_5min_closes(ticker, today.isoformat())
+    sma_ys, ema_ys = _ma_over_bars(prior_closes, [b["c"] for b in bars5])
+    ma_xs = [b["ts"] for b in bars5]
     ma_values: list[float] = []
-    for key, label, color in (
-        ("sma", f"SMA {_SMA_DAYS}d", _SMA_COLOR),
-        ("ema", f"EMA {_EMA_DAYS}d", _EMA_COLOR),
+    for label, curve, color in (
+        (f"SMA {_SMA_BARS}", sma_ys, _SMA_COLOR),
+        (f"EMA {_EMA_BARS}", ema_ys, _EMA_COLOR),
     ):
-        level = ma_levels.get(key)
-        if level is None:
+        if not any(v is not None for v in curve):
             continue
         fig.add_trace(go.Scatter(
-            x=[session_open, session_close], y=[level, level],
+            x=ma_xs, y=curve,
             mode="lines",
-            name=f"{label} {level:,.2f}",
-            line=dict(color=color, width=1.2, dash="dash"),
+            name=label,
+            line=dict(color=color, width=1.3),
+            connectgaps=False,
             hovertemplate=(
-                f"{label}  <b>${level:,.2f}</b><extra></extra>"
+                f"{label}  <b>$%{{y:,.2f}}</b>  ·  %{{x|%H:%M}}"
+                "<extra></extra>"
             ),
             showlegend=True,
         ))
-        ma_values.append(level)
+        ma_values.extend(v for v in curve if v is not None)
+    if not prior_closes and any(v is None for v in ema_ys):
+        st.caption(
+            "MA warm-up history unavailable (Robinhood login needed) — "
+            "SMA/EMA appear once enough of today's 5-min bars exist."
+        )
 
     # Session high / low markers — with P(this is the day's extreme)
     hi_i = max(range(len(ys)), key=lambda i: ys[i])
@@ -2811,6 +2895,8 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             color=_TV_MUTED,
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
+            # Candlestick traces enable a rangeslider by default.
+            rangeslider=dict(visible=False),
         ),
         yaxis=dict(
             side="right",
