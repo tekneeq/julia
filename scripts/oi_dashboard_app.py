@@ -1765,14 +1765,14 @@ def _fetch_rh_5min(ticker: str, span: str) -> list[dict]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_rh_daily_closes(ticker: str) -> dict[str, float]:
+def _fetch_rh_daily_closes(ticker: str, span: str = "month") -> dict[str, float]:
     """date-iso → regular-session close from Robinhood daily bars."""
     if not _rh_market_data_ready():
         return {}
     import robin_stocks.robinhood as rh
     try:
         bars = rh.stocks.get_stock_historicals(
-            ticker, interval="day", span="month", bounds="regular",
+            ticker, interval="day", span=span, bounds="regular",
         ) or []
     except Exception:
         return {}
@@ -2560,69 +2560,54 @@ def _today_price_series(ticker: str, today: date) -> list[dict]:
     return series
 
 
-# Moving-average overlays on the live session chart (1-minute closes).
-_SMA_PERIOD = 9
-_EMA_PERIOD = 27
+# Daily moving-average levels on the live session chart. Periods are
+# in TRADING DAYS (daily closes), matching a daily-chart SMA 9 / EMA 27.
+_SMA_DAYS = 9
+_EMA_DAYS = 27
 _SMA_COLOR = "#ff9800"  # amber — readable on the TV dark palette
 _EMA_COLOR = "#2962ff"  # TradingView blue
 
 
-def _minute_closes(series: list[dict]) -> tuple[list[datetime], list[float]]:
-    """Last price in each clock minute — stable period for SMA/EMA.
+def _daily_ma_levels(
+    ticker: str, today: date, live_price: float,
+) -> dict[str, float]:
+    """Current SMA-9 / EMA-27 of DAILY closes, today's live price as
+    the developing close (TradingView convention for an in-progress bar).
 
-    Tick density varies with the poller, so averaging raw points would
-    make "SMA 9" mean anything from ~45s to ~45min. One close per
-    minute keeps the periods meaningful on an intraday chart.
+    A year of daily bars gives the EMA plenty of warm-up beyond its
+    SMA-seeded first 27 days. Empty dict when history is unavailable
+    or too short.
     """
-    by_minute: dict[datetime, float] = {}
-    for e in series:
-        ts = e["ts"]
-        key = ts.replace(second=0, microsecond=0)
-        by_minute[key] = float(e["price"])
-    xs = sorted(by_minute)
-    return xs, [by_minute[t] for t in xs]
+    closes = _fetch_rh_daily_closes(ticker, span="year")
+    hist: list[tuple[date, float]] = []
+    for d_iso, close in closes.items():
+        try:
+            d = date.fromisoformat(d_iso)
+        except ValueError:
+            continue
+        if d < today:
+            hist.append((d, close))
+    hist.sort()
+    vals = [c for _, c in hist] + [live_price]
 
-
-def _sma(values: list[float], period: int) -> list[float | None]:
-    """Simple moving average; ``None`` until ``period`` values are available."""
-    out: list[float | None] = [None] * len(values)
-    if period <= 0 or len(values) < period:
-        return out
-    window = 0.0
-    for i, v in enumerate(values):
-        window += v
-        if i >= period:
-            window -= values[i - period]
-        if i >= period - 1:
-            out[i] = window / period
-    return out
-
-
-def _ema(values: list[float], period: int) -> list[float | None]:
-    """Exponential moving average seeded with the SMA of the first period.
-
-    ``None`` until the seed window is complete (standard charting
-    convention). Alpha = 2 / (period + 1).
-    """
-    out: list[float | None] = [None] * len(values)
-    if period <= 0 or len(values) < period:
-        return out
-    seed = sum(values[:period]) / period
-    out[period - 1] = seed
-    alpha = 2.0 / (period + 1)
-    prev = seed
-    for i in range(period, len(values)):
-        prev = alpha * values[i] + (1.0 - alpha) * prev
-        out[i] = prev
+    out: dict[str, float] = {}
+    if len(vals) >= _SMA_DAYS:
+        out["sma"] = sum(vals[-_SMA_DAYS:]) / _SMA_DAYS
+    if len(vals) >= _EMA_DAYS:
+        ema = sum(vals[:_EMA_DAYS]) / _EMA_DAYS  # SMA seed
+        alpha = 2.0 / (_EMA_DAYS + 1)
+        for v in vals[_EMA_DAYS:]:
+            ema = alpha * v + (1.0 - alpha) * ema
+        out["ema"] = ema
     return out
 
 
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
-    green/red tint, H/L markers labeled with P(day extreme), and a
-    last-price tag (with %) on the price axis. No twins here — they
-    get their own panels below.
+    green/red tint, H/L markers labeled with P(day extreme), daily
+    SMA-9 / EMA-27 levels, and a last-price tag (with %) on the price
+    axis. No twins here — they get their own panels below.
     """
     series = _today_price_series(ticker, today)
     ref = status.get("today_ref")
@@ -2710,39 +2695,29 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         showlegend=False,
     ))
 
-    # SMA 9 / EMA 27 on 1-minute closes (not raw ticks — see helpers).
-    ma_xs, minute_ys = _minute_closes(series)
-    sma_ys = _sma(minute_ys, _SMA_PERIOD)
-    ema_ys = _ema(minute_ys, _EMA_PERIOD)
+    # Daily SMA 9 / EMA 27 levels (periods in trading days, today's
+    # live price as the developing close) — flat lines like a daily
+    # MA seen through an intraday zoom.
+    ma_levels = _daily_ma_levels(ticker, today, last_price)
     ma_values: list[float] = []
-    if any(v is not None for v in sma_ys):
+    for key, label, color in (
+        ("sma", f"SMA {_SMA_DAYS}d", _SMA_COLOR),
+        ("ema", f"EMA {_EMA_DAYS}d", _EMA_COLOR),
+    ):
+        level = ma_levels.get(key)
+        if level is None:
+            continue
         fig.add_trace(go.Scatter(
-            x=ma_xs, y=sma_ys,
+            x=[session_open, session_close], y=[level, level],
             mode="lines",
-            name=f"SMA {_SMA_PERIOD}",
-            line=dict(color=_SMA_COLOR, width=1.2),
-            connectgaps=False,
+            name=f"{label} {level:,.2f}",
+            line=dict(color=color, width=1.2, dash="dash"),
             hovertemplate=(
-                f"SMA {_SMA_PERIOD}  <b>$%{{y:,.2f}}</b>"
-                "  ·  %{x|%H:%M}<extra></extra>"
+                f"{label}  <b>${level:,.2f}</b><extra></extra>"
             ),
             showlegend=True,
         ))
-        ma_values.extend(v for v in sma_ys if v is not None)
-    if any(v is not None for v in ema_ys):
-        fig.add_trace(go.Scatter(
-            x=ma_xs, y=ema_ys,
-            mode="lines",
-            name=f"EMA {_EMA_PERIOD}",
-            line=dict(color=_EMA_COLOR, width=1.2),
-            connectgaps=False,
-            hovertemplate=(
-                f"EMA {_EMA_PERIOD}  <b>$%{{y:,.2f}}</b>"
-                "  ·  %{x|%H:%M}<extra></extra>"
-            ),
-            showlegend=True,
-        ))
-        ma_values.extend(v for v in ema_ys if v is not None)
+        ma_values.append(level)
 
     # Session high / low markers — with P(this is the day's extreme)
     hi_i = max(range(len(ys)), key=lambda i: ys[i])
