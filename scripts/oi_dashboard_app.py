@@ -2560,6 +2560,63 @@ def _today_price_series(ticker: str, today: date) -> list[dict]:
     return series
 
 
+# Moving-average overlays on the live session chart (1-minute closes).
+_SMA_PERIOD = 9
+_EMA_PERIOD = 27
+_SMA_COLOR = "#ff9800"  # amber — readable on the TV dark palette
+_EMA_COLOR = "#2962ff"  # TradingView blue
+
+
+def _minute_closes(series: list[dict]) -> tuple[list[datetime], list[float]]:
+    """Last price in each clock minute — stable period for SMA/EMA.
+
+    Tick density varies with the poller, so averaging raw points would
+    make "SMA 9" mean anything from ~45s to ~45min. One close per
+    minute keeps the periods meaningful on an intraday chart.
+    """
+    by_minute: dict[datetime, float] = {}
+    for e in series:
+        ts = e["ts"]
+        key = ts.replace(second=0, microsecond=0)
+        by_minute[key] = float(e["price"])
+    xs = sorted(by_minute)
+    return xs, [by_minute[t] for t in xs]
+
+
+def _sma(values: list[float], period: int) -> list[float | None]:
+    """Simple moving average; ``None`` until ``period`` values are available."""
+    out: list[float | None] = [None] * len(values)
+    if period <= 0 or len(values) < period:
+        return out
+    window = 0.0
+    for i, v in enumerate(values):
+        window += v
+        if i >= period:
+            window -= values[i - period]
+        if i >= period - 1:
+            out[i] = window / period
+    return out
+
+
+def _ema(values: list[float], period: int) -> list[float | None]:
+    """Exponential moving average seeded with the SMA of the first period.
+
+    ``None`` until the seed window is complete (standard charting
+    convention). Alpha = 2 / (period + 1).
+    """
+    out: list[float | None] = [None] * len(values)
+    if period <= 0 or len(values) < period:
+        return out
+    seed = sum(values[:period]) / period
+    out[period - 1] = seed
+    alpha = 2.0 / (period + 1)
+    prev = seed
+    for i in range(period, len(values)):
+        prev = alpha * values[i] + (1.0 - alpha) * prev
+        out[i] = prev
+    return out
+
+
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
@@ -2653,6 +2710,40 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         showlegend=False,
     ))
 
+    # SMA 9 / EMA 27 on 1-minute closes (not raw ticks — see helpers).
+    ma_xs, minute_ys = _minute_closes(series)
+    sma_ys = _sma(minute_ys, _SMA_PERIOD)
+    ema_ys = _ema(minute_ys, _EMA_PERIOD)
+    ma_values: list[float] = []
+    if any(v is not None for v in sma_ys):
+        fig.add_trace(go.Scatter(
+            x=ma_xs, y=sma_ys,
+            mode="lines",
+            name=f"SMA {_SMA_PERIOD}",
+            line=dict(color=_SMA_COLOR, width=1.2),
+            connectgaps=False,
+            hovertemplate=(
+                f"SMA {_SMA_PERIOD}  <b>$%{{y:,.2f}}</b>"
+                "  ·  %{x|%H:%M}<extra></extra>"
+            ),
+            showlegend=True,
+        ))
+        ma_values.extend(v for v in sma_ys if v is not None)
+    if any(v is not None for v in ema_ys):
+        fig.add_trace(go.Scatter(
+            x=ma_xs, y=ema_ys,
+            mode="lines",
+            name=f"EMA {_EMA_PERIOD}",
+            line=dict(color=_EMA_COLOR, width=1.2),
+            connectgaps=False,
+            hovertemplate=(
+                f"EMA {_EMA_PERIOD}  <b>$%{{y:,.2f}}</b>"
+                "  ·  %{x|%H:%M}<extra></extra>"
+            ),
+            showlegend=True,
+        ))
+        ma_values.extend(v for v in ema_ys if v is not None)
+
     # Session high / low markers — with P(this is the day's extreme)
     hi_i = max(range(len(ys)), key=lambda i: ys[i])
     lo_i = min(range(len(ys)), key=lambda i: ys[i])
@@ -2709,7 +2800,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         bgcolor=line_color, borderpad=1,
     )
 
-    y_all = ys + ([ref] if ref else [])
+    y_all = ys + ([ref] if ref else []) + ma_values
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
@@ -2721,9 +2812,16 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         title=f"{ticker} — {today:%a %b %d} regular session",
         height=480,
         hovermode="x",
-        showlegend=False,
+        showlegend=bool(ma_values),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right", x=1.0,
+            font=dict(size=11, color=_TV_TEXT),
+            bgcolor="rgba(19, 23, 34, 0.6)",
+        ) if ma_values else dict(font=dict(color=_TV_TEXT)),
         margin=dict(
-            t=48,
+            t=56 if ma_values else 48,
             l=56 if ref else 10,
             r=110 if last_pct is not None else 64,
             b=36,
