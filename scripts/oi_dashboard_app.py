@@ -3119,8 +3119,8 @@ def _aggregate_4h_bars(hourly: list[dict]) -> list[dict]:
             daily_moves_store.MARKET_OPEN.hour * 60
             + daily_moves_store.MARKET_OPEN.minute
         )
-        # Drop pre-open / clearly post-close hourly stamps.
-        if minutes < -1 or minutes >= _SESSION_MINUTES + 1:
+        # Drop pre-open and 16:00+ hourly stamps (session is 09:30–16:00).
+        if minutes < -1 or minutes >= _SESSION_MINUTES:
             continue
         key = _four_h_key(ts)
         existing = buckets.get(key)
@@ -3227,6 +3227,7 @@ def _render_htf_candle_chart(
     visible: int,
     empty_note: str,
     today: date,
+    hide_overnight: bool = False,
 ) -> None:
     """TradingView-style candles + SMA 9 / EMA 27 on this timeframe."""
     if not bars:
@@ -3339,6 +3340,13 @@ def _render_htf_candle_chart(
             showspikes=True, spikemode="across", spikesnap="cursor",
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
             rangeslider=dict(visible=False),
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                *(
+                    [dict(bounds=[16, 9.5], pattern="hour")]
+                    if hide_overnight else []
+                ),
+            ],
         ),
         yaxis=dict(
             side="right",
@@ -3386,6 +3394,7 @@ def _render_htf_price_charts(ticker: str, today: date) -> None:
             "needed for hourly bars (aggregated to 4h)."
         ),
         today=today,
+        hide_overnight=True,
     )
 
     st.markdown(f"**{ticker} · daily candles**")
