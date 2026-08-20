@@ -2619,29 +2619,32 @@ def _prior_5min_closes(ticker: str, today_iso: str) -> list[float]:
 
 def _ma_over_bars(
     prior_closes: list[float], bar_closes: list[float],
+    *, sma_bars: int = _SMA_BARS, ema_bars: int = _EMA_BARS,
 ) -> tuple[list[float | None], list[float | None]]:
-    """(SMA-9, EMA-27) aligned to ``bar_closes``, warmed up with
-    ``prior_closes``. ``None`` where the window isn't filled yet.
-    EMA seeds with the SMA of its first period (charting convention).
+    """(SMA, EMA) aligned to ``bar_closes``, warmed up with
+    ``prior_closes``. Periods default to 9 / 27 of whatever
+    timeframe the closes belong to. ``None`` where the window
+    isn't filled yet. EMA seeds with the SMA of its first
+    period (charting convention).
     """
     closes = prior_closes + bar_closes
     n = len(closes)
     n_prior = len(prior_closes)
 
     sma_full: list[float | None] = [None] * n
-    if n >= _SMA_BARS:
-        window = sum(closes[:_SMA_BARS])
-        sma_full[_SMA_BARS - 1] = window / _SMA_BARS
-        for i in range(_SMA_BARS, n):
-            window += closes[i] - closes[i - _SMA_BARS]
-            sma_full[i] = window / _SMA_BARS
+    if sma_bars > 0 and n >= sma_bars:
+        window = sum(closes[:sma_bars])
+        sma_full[sma_bars - 1] = window / sma_bars
+        for i in range(sma_bars, n):
+            window += closes[i] - closes[i - sma_bars]
+            sma_full[i] = window / sma_bars
 
     ema_full: list[float | None] = [None] * n
-    if n >= _EMA_BARS:
-        ema = sum(closes[:_EMA_BARS]) / _EMA_BARS
-        ema_full[_EMA_BARS - 1] = ema
-        alpha = 2.0 / (_EMA_BARS + 1)
-        for i in range(_EMA_BARS, n):
+    if ema_bars > 0 and n >= ema_bars:
+        ema = sum(closes[:ema_bars]) / ema_bars
+        ema_full[ema_bars - 1] = ema
+        alpha = 2.0 / (ema_bars + 1)
+        for i in range(ema_bars, n):
             ema = alpha * closes[i] + (1.0 - alpha) * ema
             ema_full[i] = ema
 
@@ -3018,6 +3021,400 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 "bars, then scheduler snapshots."
             ),
         )
+
+
+# How many HTF candles to draw (MAs still use the full fetched history
+# so SMA 9 / EMA 27 exist from the left edge of the window).
+_HTF_4H_VISIBLE = 50
+_HTF_DAILY_VISIBLE = 90
+_FOUR_H_MINUTES = 240  # 09:30–13:30; leftover session is the 2nd bar
+
+
+def _rh_bar_local_ts(begins_at: str, *, interval: str) -> datetime:
+    """Robinhood ``begins_at`` → naive ET datetime for the session.
+
+    Daily bars are midnight UTC of the *session* date (so the UTC
+    date prefix is the trading day; converting to ET would shift it
+    to the previous evening). Intraday bars are real clock times.
+    """
+    if interval == "day":
+        d = date.fromisoformat(begins_at[:10])
+        return datetime.combine(d, daily_moves_store.MARKET_OPEN)
+    return _parse_utc(begins_at).astimezone().replace(tzinfo=None)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_rh_ohlc(ticker: str, interval: str, span: str) -> list[dict]:
+    """Normalized ``{ts, o, h, l, c}`` bars in naive ET, oldest first."""
+    if not _rh_market_data_ready():
+        return []
+    import robin_stocks.robinhood as rh
+    try:
+        raw = rh.stocks.get_stock_historicals(
+            ticker, interval=interval, span=span, bounds="regular",
+        ) or []
+    except Exception:
+        return []
+    out: list[dict] = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        begins = c.get("begins_at") or ""
+        try:
+            ts = _rh_bar_local_ts(begins, interval=interval)
+            out.append({
+                "ts": ts,
+                "o": float(c["open_price"]),
+                "h": float(c["high_price"]),
+                "l": float(c["low_price"]),
+                "c": float(c["close_price"]),
+            })
+        except (TypeError, ValueError, KeyError):
+            continue
+    out.sort(key=lambda b: b["ts"])
+    return out
+
+
+def _fetch_rh_ohlc_merged(
+    ticker: str, interval: str, spans: tuple[str, ...],
+) -> list[dict]:
+    """Union of the same interval across spans; later spans win ties."""
+    by_ts: dict[datetime, dict] = {}
+    for span in spans:
+        for b in _fetch_rh_ohlc(ticker, interval, span):
+            by_ts[b["ts"]] = b
+    return [by_ts[k] for k in sorted(by_ts)]
+
+
+def _four_h_key(ts: datetime) -> tuple[date, int]:
+    """(session date, slot) — slot 0 = 09:30–13:30, slot 1 = 13:30–close."""
+    minutes = ts.hour * 60 + ts.minute - (
+        daily_moves_store.MARKET_OPEN.hour * 60
+        + daily_moves_store.MARKET_OPEN.minute
+    )
+    slot = 0 if minutes < _FOUR_H_MINUTES else 1
+    return ts.date(), slot
+
+
+def _four_h_bar_ts(session: date, slot: int) -> datetime:
+    return (
+        datetime.combine(session, daily_moves_store.MARKET_OPEN)
+        + timedelta(minutes=_FOUR_H_MINUTES * slot)
+    )
+
+
+def _aggregate_4h_bars(hourly: list[dict]) -> list[dict]:
+    """Roll regular-session hourly OHLC into two 4h candles per day.
+
+    US cash session is 6.5h, so the second bar is the leftover
+    13:30–16:00 window — same convention TradingView uses on a
+    regular-hours 4h equity chart.
+    """
+    buckets: dict[tuple[date, int], dict] = {}
+    for b in hourly:
+        ts = b["ts"]
+        if ts.weekday() >= 5:
+            continue
+        minutes = ts.hour * 60 + ts.minute - (
+            daily_moves_store.MARKET_OPEN.hour * 60
+            + daily_moves_store.MARKET_OPEN.minute
+        )
+        # Drop pre-open and 16:00+ hourly stamps (session is 09:30–16:00).
+        if minutes < -1 or minutes >= _SESSION_MINUTES:
+            continue
+        key = _four_h_key(ts)
+        existing = buckets.get(key)
+        if existing is None:
+            buckets[key] = {
+                "ts": _four_h_bar_ts(*key),
+                "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"],
+            }
+        else:
+            existing["h"] = max(existing["h"], b["h"])
+            existing["l"] = min(existing["l"], b["l"])
+            existing["c"] = b["c"]
+    return [buckets[k] for k in sorted(buckets)]
+
+
+def _apply_live_to_4h(
+    bars: list[dict], today: date, series: list[dict],
+) -> list[dict]:
+    """Fold today's live prints into the developing 4h candle(s)."""
+    if not series:
+        return bars
+    by_key: dict[tuple[date, int], dict] = {
+        _four_h_key(b["ts"]): dict(b) for b in bars
+    }
+    for e in series:
+        ts = e["ts"]
+        if ts.date() != today:
+            continue
+        key = _four_h_key(ts)
+        if key[0] != today:
+            continue
+        price = float(e["price"])
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = {
+                "ts": _four_h_bar_ts(*key),
+                "o": price, "h": price, "l": price, "c": price,
+            }
+        else:
+            existing["h"] = max(existing["h"], price)
+            existing["l"] = min(existing["l"], price)
+            existing["c"] = price
+    return [by_key[k] for k in sorted(by_key)]
+
+
+def _apply_live_to_daily(
+    bars: list[dict], today: date, series: list[dict],
+) -> list[dict]:
+    """Replace today's daily close with the live print; expand H/L."""
+    if not series:
+        return bars
+    prices = [float(e["price"]) for e in series]
+    live_o, live_h, live_l, live_c = (
+        prices[0], max(prices), min(prices), prices[-1],
+    )
+    today_ts = datetime.combine(today, daily_moves_store.MARKET_OPEN)
+    out: list[dict] = []
+    seen_today = False
+    for b in bars:
+        if b["ts"].date() != today:
+            out.append(b)
+            continue
+        seen_today = True
+        out.append({
+            "ts": today_ts,
+            "o": b["o"],
+            "h": max(b["h"], live_h),
+            "l": min(b["l"], live_l),
+            "c": live_c,
+        })
+    if not seen_today:
+        out.append({
+            "ts": today_ts,
+            "o": live_o, "h": live_h, "l": live_l, "c": live_c,
+        })
+        out.sort(key=lambda b: b["ts"])
+    return out
+
+
+def _htf_4h_bars(ticker: str, today: date, series: list[dict]) -> list[dict]:
+    """4-hour regular-session candles, today's bar kept live."""
+    # 3month can 400 on hour; empty span is ignored, month+week still merge.
+    hourly = _fetch_rh_ohlc_merged(
+        ticker, "hour", ("3month", "month", "week"),
+    )
+    bars = _aggregate_4h_bars(hourly)
+    return _apply_live_to_4h(bars, today, series)
+
+
+def _htf_daily_bars(ticker: str, today: date, series: list[dict]) -> list[dict]:
+    """Daily regular-session candles, today's close = live price."""
+    bars = _fetch_rh_ohlc_merged(ticker, "day", ("year", "3month", "month"))
+    return _apply_live_to_daily(bars, today, series)
+
+
+def _render_htf_candle_chart(
+    ticker: str,
+    bars: list[dict],
+    *,
+    title: str,
+    timeframe: str,
+    x_tickformat: str,
+    hover_x_fmt: str,
+    visible: int,
+    empty_note: str,
+    today: date,
+    hide_overnight: bool = False,
+) -> None:
+    """TradingView-style candles + SMA 9 / EMA 27 on this timeframe."""
+    if not bars:
+        st.info(empty_note)
+        return
+
+    sma_all, ema_all = _ma_over_bars([], [b["c"] for b in bars])
+    if len(bars) > visible:
+        bars = bars[-visible:]
+        sma_all = sma_all[-visible:]
+        ema_all = ema_all[-visible:]
+
+    xs = [b["ts"] for b in bars]
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=xs,
+        open=[b["o"] for b in bars],
+        high=[b["h"] for b in bars],
+        low=[b["l"] for b in bars],
+        close=[b["c"] for b in bars],
+        name=ticker,
+        increasing=dict(
+            line=dict(color=_TV_UP, width=1), fillcolor=_TV_UP,
+        ),
+        decreasing=dict(
+            line=dict(color=_TV_DOWN, width=1), fillcolor=_TV_DOWN,
+        ),
+        whiskerwidth=0.4,
+        showlegend=False,
+    ))
+
+    ma_values: list[float] = []
+    for label, curve, color in (
+        (f"SMA {_SMA_BARS}", sma_all, _SMA_COLOR),
+        (f"EMA {_EMA_BARS}", ema_all, _EMA_COLOR),
+    ):
+        if not any(v is not None for v in curve):
+            continue
+        fig.add_trace(go.Scatter(
+            x=xs, y=curve,
+            mode="lines",
+            name=label,
+            line=dict(color=color, width=1.3),
+            connectgaps=False,
+            hovertemplate=(
+                f"{label}  <b>$%{{y:,.2f}}</b>  ·  %{{x|{hover_x_fmt}}}"
+                "<extra></extra>"
+            ),
+            showlegend=True,
+        ))
+        ma_values.extend(v for v in curve if v is not None)
+
+    last = bars[-1]
+    last_ts, last_price = last["ts"], last["c"]
+    prev_close = bars[-2]["c"] if len(bars) >= 2 else last["o"]
+    last_pct = (
+        (last_price - prev_close) / prev_close * 100.0
+        if prev_close else None
+    )
+    up = last_price >= prev_close
+    line_color = _TV_UP if up else _TV_DOWN
+    live = last_ts.date() == today
+    if live:
+        _attach_live_price_pulse(
+            fig, last_ts=last_ts, last_price=last_price, color=line_color,
+        )
+    last_tag = (
+        f" {last_price:,.2f} ({last_pct:+.2f}%) "
+        if last_pct is not None
+        else f" {last_price:,.2f} "
+    )
+    fig.add_annotation(
+        xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
+        text=last_tag, showarrow=False,
+        font=dict(size=11, color="#ffffff"),
+        bgcolor=line_color, borderpad=1,
+    )
+
+    y_all = (
+        [b["l"] for b in bars] + [b["h"] for b in bars] + ma_values
+        + [last_price]
+    )
+    lo_y, hi_y = min(y_all), max(y_all)
+    pad = max((hi_y - lo_y) * 0.08, 0.15)
+    y_lo, y_hi = lo_y - pad, hi_y + pad
+
+    fig.update_layout(**_tv_layout(
+        title=title,
+        height=420,
+        hovermode="x",
+        showlegend=bool(ma_values),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right", x=1.0,
+            font=dict(size=11, color=_TV_TEXT),
+            bgcolor="rgba(19, 23, 34, 0.6)",
+        ) if ma_values else dict(font=dict(color=_TV_TEXT)),
+        margin=dict(
+            t=56 if ma_values else 48,
+            l=10,
+            r=110 if last_pct is not None else 64,
+            b=36,
+        ),
+        xaxis=dict(
+            tickformat=x_tickformat,
+            gridcolor=_TV_GRID,
+            zeroline=False,
+            color=_TV_MUTED,
+            showspikes=True, spikemode="across", spikesnap="cursor",
+            spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
+            rangeslider=dict(visible=False),
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                *(
+                    [dict(bounds=[16, 9.5], pattern="hour")]
+                    if hide_overnight else []
+                ),
+            ],
+        ),
+        yaxis=dict(
+            side="right",
+            range=[y_lo, y_hi],
+            tickprefix="$", tickformat=",.2f",
+            gridcolor=_TV_GRID,
+            zeroline=False,
+            color=_TV_MUTED,
+            showspikes=True, spikemode="across", spikesnap="cursor",
+            spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
+        ),
+    ))
+    if live:
+        _plotly_chart_with_pulse(fig, height=420)
+    else:
+        _show_plotly(fig)
+    if not ma_values:
+        st.caption(
+            f"SMA {_SMA_BARS} / EMA {_EMA_BARS} need more {timeframe} "
+            "history (Robinhood login) before the overlays appear."
+        )
+
+
+def _render_htf_price_charts(ticker: str, today: date) -> None:
+    """4-hour and daily candle twins of today's price-action chart."""
+    series = _today_price_series(ticker, today)
+    bars_4h = _htf_4h_bars(ticker, today, series)
+    bars_d = _htf_daily_bars(ticker, today, series)
+
+    st.markdown(f"**{ticker} · 4-hour candles**")
+    st.caption(
+        f"SMA {_SMA_BARS} / EMA {_EMA_BARS} counted in **4-hour bars** "
+        "(~2 per regular session: 09:30–13:30 and 13:30–16:00). "
+        "Today's developing 4h candle uses the live print."
+    )
+    _render_htf_candle_chart(
+        ticker, bars_4h,
+        title=f"{ticker} — 4-hour",
+        timeframe="4-hour",
+        x_tickformat="%b %d %H:%M",
+        hover_x_fmt="%b %d %H:%M",
+        visible=_HTF_4H_VISIBLE,
+        empty_note=(
+            f"No 4-hour history for {ticker}. Robinhood login is "
+            "needed for hourly bars (aggregated to 4h)."
+        ),
+        today=today,
+        hide_overnight=True,
+    )
+
+    st.markdown(f"**{ticker} · daily candles**")
+    st.caption(
+        f"SMA {_SMA_BARS} / EMA {_EMA_BARS} counted in **daily bars** "
+        "(trading days). Today's candle close is the live price."
+    )
+    _render_htf_candle_chart(
+        ticker, bars_d,
+        title=f"{ticker} — daily",
+        timeframe="daily",
+        x_tickformat="%b %d",
+        hover_x_fmt="%b %d",
+        visible=_HTF_DAILY_VISIBLE,
+        empty_note=(
+            f"No daily history for {ticker}. Robinhood login is "
+            "needed for daily bars."
+        ),
+        today=today,
+    )
 
 
 def _twin_fig(
@@ -3548,6 +3945,7 @@ def _render_today_and_twins(ticker: str) -> None:
 
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
+    _render_htf_price_charts(ticker, today)
     _render_recent_session_chiclets(ticker, today)
     _render_twin_panels(ticker, today)
 
@@ -3687,7 +4085,9 @@ st.caption(
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
     "H/L labels include a **% chance that extreme is the day's "
-    "high/low**. Hover for crosshair details. Historical twins are "
+    "high/low**. Hover for crosshair details. The **4-hour** and "
+    "**daily** candle charts underneath keep the same SMA 9 / "
+    "EMA 27, counted in that chart's bars. Historical twins are "
     "charted separately below — never overlaid on the price."
 )
 for ticker in tickers:
