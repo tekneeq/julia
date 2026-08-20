@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -2429,105 +2430,124 @@ def _pct_axis_layout(**extra) -> dict:
     return base
 
 
-def _plotly_chart_with_pulse(fig: go.Figure, *, height: int = 480) -> None:
-    """Render ``fig`` and auto-loop its animation frames (live-price blink).
+def _naive_et_epoch_ms(dt: datetime) -> int:
+    """Unix epoch ms for a naive ET datetime (container clock is ET)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("America/New_York"))
+    return int(dt.timestamp() * 1000)
 
-    ``st.plotly_chart`` does not autoplay frames, so we embed Plotly in a
-    small component and call ``Plotly.animate`` in a loop. Falls back to
-    a static chart when there are no frames.
+
+def _fmt_mmss(seconds: float) -> str:
+    s = max(0, int(seconds))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _current_bar_close(
+    now: datetime, today: date, timeframe: str,
+) -> datetime:
+    """Close of the in-progress regular-session bar for ``timeframe``.
+
+    ``timeframe`` is ``5min``, ``4h``, or ``day``. After the bell the
+    close is 16:00 (timer reads 00:00).
     """
-    if not fig.frames:
-        _show_plotly(fig)
-        return
-    # Hide any leftover animation chrome; JS drives the loop.
-    # dragmode=False: don't box-zoom on accidental touch while scrolling.
+    open_dt = datetime.combine(today, daily_moves_store.MARKET_OPEN)
+    close_dt = datetime.combine(today, daily_moves_store.MARKET_CLOSE)
+    if now >= close_dt:
+        return close_dt
+    if timeframe == "5min":
+        start = open_dt if now >= open_dt else open_dt
+        elapsed = max(0.0, (now - start).total_seconds())
+        idx = int(elapsed // 300)
+        end = open_dt + timedelta(seconds=300 * (idx + 1))
+        return min(end, close_dt)
+    if timeframe == "4h":
+        mid = open_dt + timedelta(hours=4)  # 13:30
+        if now < mid:
+            return mid
+        return close_dt
+    return close_dt
+
+
+def _attach_last_price_line(
+    fig: go.Figure,
+    *,
+    last_price: float,
+    color: str,
+    price_label: str,
+    timer_label: str | None,
+) -> int:
+    """Dotted last-price ray + right-axis box (price over bar countdown).
+
+    Returns the annotation index so JS can tick the timer in place.
+    """
+    fig.add_hline(
+        y=last_price,
+        line_color=_TV_SPIKE,
+        line_width=1,
+        line_dash="dot",
+    )
+    fig.add_annotation(
+        xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
+        text=(
+            f"{price_label}<br>{timer_label}"
+            if timer_label else price_label
+        ),
+        showarrow=False,
+        align="center",
+        font=dict(size=11, color="#ffffff"),
+        bgcolor=color,
+        borderpad=3,
+    )
+    anns = fig.layout.annotations or ()
+    return len(anns) - 1
+
+
+def _plotly_chart_with_bar_timer(
+    fig: go.Figure,
+    *,
+    height: int,
+    bar_close_ms: int,
+    price_label: str,
+    annotation_index: int,
+) -> None:
+    """Render ``fig`` and tick the last-price box countdown every second."""
     fig.update_layout(updatemenus=[], dragmode=False)
     spec = fig.to_json()
+    uid = f"tv-live-{uuid.uuid4().hex[:10]}"
+    # Escape for embedding inside a JS string (price is numeric + comma).
+    price_js = price_label.replace("\\", "\\\\").replace("'", "\\'")
     components.html(
         f"""
-<div id="tv-live" style="width:100%;height:{height}px;"></div>
+<div id="{uid}" style="width:100%;height:{height}px;"></div>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script>
 const fig = {spec};
-const el = document.getElementById("tv-live");
+const el = document.getElementById("{uid}");
+const barCloseMs = {bar_close_ms};
+const priceLabel = '{price_js}';
+const annIdx = {annotation_index};
+function pad(n) {{ return String(n).padStart(2, '0'); }}
+function remaining() {{
+  const s = Math.max(0, Math.floor((barCloseMs - Date.now()) / 1000));
+  return pad(Math.floor(s / 60)) + ':' + pad(s % 60);
+}}
+function tag() {{ return priceLabel + '<br>' + remaining(); }}
 Plotly.newPlot(el, fig.data, fig.layout, {{
   responsive: true,
   displayModeBar: false,
   scrollZoom: false
-}}).then(gd => Plotly.addFrames(gd, fig.frames || []))
-  .then(gd => {{
-    const opts = {{
-      frame: {{duration: 700, redraw: false}},
-      transition: {{duration: 600, easing: "cubic-in-out"}},
-      mode: "immediate"
-    }};
-    function loop() {{
-      Plotly.animate(gd, null, opts).then(
-        () => window.setTimeout(loop, 40)
-      );
-    }}
-    loop();
-  }});
+}}).then(gd => {{
+  function tick() {{
+    const key = 'annotations[' + annIdx + '].text';
+    Plotly.relayout(gd, {{[key]: tag()}});
+  }}
+  tick();
+  window.setInterval(tick, 1000);
+}});
 </script>
 """,
         height=height + 10,
     )
-
-
-def _attach_live_price_pulse(
-    fig: go.Figure,
-    *,
-    last_ts: datetime,
-    last_price: float,
-    color: str,
-) -> None:
-    """Add a solid live dot + expanding halo, with blink animation frames."""
-    halo_i = len(fig.data)
-    fig.add_trace(go.Scatter(
-        x=[last_ts], y=[last_price], mode="markers",
-        marker=dict(size=16, color=color, opacity=0.35, line=dict(width=0)),
-        hoverinfo="skip", showlegend=False,
-    ))
-    core_i = len(fig.data)
-    fig.add_trace(go.Scatter(
-        x=[last_ts], y=[last_price], mode="markers",
-        marker=dict(
-            size=9, color=color,
-            line=dict(width=1.5, color="#ffffff"),
-        ),
-        hoverinfo="skip", showlegend=False,
-    ))
-    frames: list[go.Frame] = []
-    n = 14
-    for i in range(n):
-        # 0 → 1 → 0 over the cycle: ring expands and fades.
-        t = 0.5 - 0.5 * math.cos(2 * math.pi * i / n)
-        frames.append(go.Frame(
-            name=str(i),
-            data=[
-                go.Scatter(
-                    x=[last_ts], y=[last_price],
-                    mode="markers",
-                    marker=dict(
-                        size=12 + 18 * t,
-                        color=color,
-                        opacity=max(0.05, 0.40 * (1.0 - t)),
-                        line=dict(width=0),
-                    ),
-                ),
-                go.Scatter(
-                    x=[last_ts], y=[last_price],
-                    mode="markers",
-                    marker=dict(
-                        size=8 + 3 * t,
-                        color=color,
-                        line=dict(width=1.5, color="#ffffff"),
-                    ),
-                ),
-            ],
-            traces=[halo_i, core_i],
-        ))
-    fig.frames = frames
 
 
 def _today_price_series(ticker: str, today: date) -> list[dict]:
@@ -2655,9 +2675,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
     green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
-    EMA 27 curves on 5-minute bars, and a last-price tag (with %) on
-    the price axis. Toggles between 5-min candles (TradingView-like)
-    and the tick line. No twins here — they get their own panels below.
+    EMA 27 curves on 5-minute bars, and a dotted last-price line with
+    a right-axis box (price + time left on the 5-min bar). Toggles
+    between 5-min candles (TradingView-like) and the tick line. No
+    twins here — they get their own panels below.
     """
     series = _today_price_series(ticker, today)
     ref = status.get("today_ref")
@@ -2846,20 +2867,16 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             showlegend=False,
         ))
 
-    # Last price: blinking core + halo so it stays visible near H/L.
-    _attach_live_price_pulse(
-        fig, last_ts=last_ts, last_price=last_price, color=line_color,
-    )
-    last_tag = (
-        f" {last_price:,.2f} ({last_pct:+.2f}%) "
-        if last_pct is not None
-        else f" {last_price:,.2f} "
-    )
-    fig.add_annotation(
-        xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
-        text=last_tag, showarrow=False,
-        font=dict(size=11, color="#ffffff"),
-        bgcolor=line_color, borderpad=1,
+    # Last price: dotted ray across the pane + right-axis box with
+    # the live print and MM:SS left on this 5-minute candle.
+    bar_close = _current_bar_close(now, today, "5min")
+    price_label = f"{last_price:,.2f}"
+    timer_ann = _attach_last_price_line(
+        fig,
+        last_price=last_price,
+        color=line_color,
+        price_label=price_label,
+        timer_label=_fmt_mmss((bar_close - now).total_seconds()),
     )
 
     y_all = ys + ([ref] if ref else []) + ma_values
@@ -2885,7 +2902,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         margin=dict(
             t=56 if ma_values else 48,
             l=56 if ref else 10,
-            r=110 if last_pct is not None else 64,
+            r=72,
             b=36,
         ),
         xaxis=dict(
@@ -2933,7 +2950,13 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
-    _plotly_chart_with_pulse(fig, height=480)
+    _plotly_chart_with_bar_timer(
+        fig,
+        height=480,
+        bar_close_ms=_naive_et_epoch_ms(bar_close),
+        price_label=price_label,
+        annotation_index=timer_ann,
+    )
     if extreme_probs is not None:
         fresh = []
         if extreme_probs["at_high"]:
@@ -3283,27 +3306,21 @@ def _render_htf_candle_chart(
     last = bars[-1]
     last_ts, last_price = last["ts"], last["c"]
     prev_close = bars[-2]["c"] if len(bars) >= 2 else last["o"]
-    last_pct = (
-        (last_price - prev_close) / prev_close * 100.0
-        if prev_close else None
-    )
     up = last_price >= prev_close
     line_color = _TV_UP if up else _TV_DOWN
     live = last_ts.date() == today
-    if live:
-        _attach_live_price_pulse(
-            fig, last_ts=last_ts, last_price=last_price, color=line_color,
-        )
-    last_tag = (
-        f" {last_price:,.2f} ({last_pct:+.2f}%) "
-        if last_pct is not None
-        else f" {last_price:,.2f} "
-    )
-    fig.add_annotation(
-        xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
-        text=last_tag, showarrow=False,
-        font=dict(size=11, color="#ffffff"),
-        bgcolor=line_color, borderpad=1,
+    now = datetime.now()
+    tf_key = "4h" if timeframe.startswith("4") else "day"
+    bar_close = _current_bar_close(now, today, tf_key)
+    price_label = f"{last_price:,.2f}"
+    timer_ann = _attach_last_price_line(
+        fig,
+        last_price=last_price,
+        color=line_color,
+        price_label=price_label,
+        timer_label=(
+            _fmt_mmss((bar_close - now).total_seconds()) if live else None
+        ),
     )
 
     y_all = (
@@ -3329,7 +3346,7 @@ def _render_htf_candle_chart(
         margin=dict(
             t=56 if ma_values else 48,
             l=10,
-            r=110 if last_pct is not None else 64,
+            r=72,
             b=36,
         ),
         xaxis=dict(
@@ -3360,7 +3377,13 @@ def _render_htf_candle_chart(
         ),
     ))
     if live:
-        _plotly_chart_with_pulse(fig, height=420)
+        _plotly_chart_with_bar_timer(
+            fig,
+            height=420,
+            bar_close_ms=_naive_et_epoch_ms(bar_close),
+            price_label=price_label,
+            annotation_index=timer_ann,
+        )
     else:
         _show_plotly(fig)
     if not ma_values:
@@ -4079,8 +4102,9 @@ st.divider()
 st.header("📈 Today's price action")
 st.caption(
     "TradingView-style live session chart — **right axis = $ price**, "
-    "**left axis = % vs prev close**. The **blinking** last-price dot "
-    "is the live print (easy to spot when sitting on the high/low). "
+    "**left axis = % vs prev close**. A **dotted last-price line** "
+    "tracks the live print; the right-axis box shows the price and "
+    "how much time is left on the current candle. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
