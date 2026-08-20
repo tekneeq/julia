@@ -2671,6 +2671,101 @@ def _ma_over_bars(
     return sma_full[n_prior:], ema_full[n_prior:]
 
 
+_X_WINDOWS_5M = ["Session", "→ Now", "3h", "2h", "1h"]
+
+
+def _five_min_x_range(
+    choice: str,
+    *,
+    session_open: datetime,
+    session_close: datetime,
+    now: datetime,
+) -> tuple[datetime, datetime]:
+    """Visible x-window for the 5-min chart. Narrower → fatter candles."""
+    pad = timedelta(minutes=5)
+    end_now = min(session_close, max(now, session_open) + pad)
+    if choice == "Session":
+        return session_open, session_close
+    if choice == "→ Now":
+        return session_open, end_now
+    hours = {"3h": 3, "2h": 2, "1h": 1}[choice]
+    start = end_now - timedelta(hours=hours)
+    if start < session_open:
+        start = session_open
+    return start, end_now
+
+
+def _zoom_y_range(
+    values: list[float],
+    zoom: float,
+    *,
+    center: float | None = None,
+) -> tuple[float, float]:
+    """Price-axis range. ``zoom`` > 1 tightens (taller candles); < 1 adds air."""
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return 0.0, 1.0
+    lo, hi = min(vals), max(vals)
+    span = max(hi - lo, 0.15)
+    mid = center if center is not None else (lo + hi) / 2.0
+    z = max(float(zoom), 0.1)
+    half = (span / 2.0) / z
+    pad = max(span * 0.08 / z, 0.08)
+    y_lo, y_hi = mid - half - pad, mid + half + pad
+    if z <= 1.0:
+        y_lo = min(y_lo, lo - pad)
+        y_hi = max(y_hi, hi + pad)
+    return y_lo, y_hi
+
+
+def _axis_controls(
+    *,
+    key: str,
+    x_kind: str,
+    x_default: str | int,
+    x_min: int | None = None,
+    x_max: int | None = None,
+) -> tuple[str | int, float]:
+    """X window + Y zoom. Returns (x_choice_or_count, y_zoom)."""
+    col_x, col_y = st.columns([2.2, 1])
+    with col_x:
+        if x_kind == "5min":
+            x_val: str | int = st.radio(
+                "X · time",
+                _X_WINDOWS_5M,
+                index=_X_WINDOWS_5M.index(str(x_default)),
+                horizontal=True,
+                key=f"{key}_x",
+                help=(
+                    "How much of the session to show. A tighter window "
+                    "makes each 5-min candle wider."
+                ),
+            )
+        else:
+            x_val = st.slider(
+                "X · candles",
+                min_value=int(x_min or 8),
+                max_value=int(x_max or 80),
+                value=int(x_default),
+                key=f"{key}_x",
+                help="Fewer candles → each bar is drawn wider.",
+            )
+    with col_y:
+        y_zoom = st.slider(
+            "Y · zoom",
+            min_value=0.5,
+            max_value=2.5,
+            value=1.0,
+            step=0.1,
+            key=f"{key}_y",
+            help=(
+                "1.0 fits the visible bars. Higher zooms into price "
+                "(taller candles), lower adds headroom."
+            ),
+        )
+    return x_val, y_zoom
+
+
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
@@ -2735,8 +2830,19 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         key=f"today_chart_view_{ticker}",
         label_visibility="collapsed",
     )
+    x_win, y_zoom = _axis_controls(
+        key=f"today_axis_{ticker}",
+        x_kind="5min",
+        x_default="Session",
+    )
     use_candles = view == "5-min candles"
     bars5 = _five_min_bars(series, today)
+    x_lo, x_hi = _five_min_x_range(
+        str(x_win),
+        session_open=session_open,
+        session_close=session_close,
+        now=now,
+    )
 
     fig = go.Figure()
     if ref:
@@ -2879,10 +2985,26 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         timer_label=_fmt_mmss((bar_close - now).total_seconds()),
     )
 
-    y_all = ys + ([ref] if ref else []) + ma_values
-    lo_y, hi_y = min(y_all), max(y_all)
-    pad = max((hi_y - lo_y) * 0.08, 0.15)
-    y_lo, y_hi = lo_y - pad, hi_y + pad
+    vis_ys = [y for x, y in zip(xs, ys) if x_lo <= x <= x_hi] or ys
+    vis_ma: list[float] = []
+    for t, s, e in zip(ma_xs, sma_ys, ema_ys):
+        if x_lo <= t <= x_hi:
+            if s is not None:
+                vis_ma.append(s)
+            if e is not None:
+                vis_ma.append(e)
+    y_all = vis_ys + vis_ma + [last_price]
+    if use_candles:
+        y_all.extend(
+            v for b in bars5 if x_lo <= b["ts"] <= x_hi
+            for v in (b["h"], b["l"])
+        )
+    if ref and x_win == "Session":
+        y_all.append(ref)
+    y_lo, y_hi = _zoom_y_range(
+        y_all, float(y_zoom),
+        center=last_price if float(y_zoom) > 1.0 else None,
+    )
 
     # Left axis mirrors the same price range as % vs prev close so you
     # can read the move at a glance without hovering. No second grid —
@@ -2906,10 +3028,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             b=36,
         ),
         xaxis=dict(
-            range=[session_open, session_close],
+            range=[x_lo, x_hi],
             tickformat="%H:%M",
             tick0=session_open,
-            dtick=30 * 60 * 1000,  # 30-min gridlines anchored at 09:30
+            dtick=(
+                15 * 60 * 1000
+                if (x_hi - x_lo).total_seconds() <= 2.5 * 3600
+                else 30 * 60 * 1000
+            ),
             gridcolor=_TV_GRID,
             zeroline=False,
             color=_TV_MUTED,
@@ -3257,6 +3383,17 @@ def _render_htf_candle_chart(
         st.info(empty_note)
         return
 
+    n_bars = len(bars)
+    x_min = min(8, n_bars)
+    visible, y_zoom = _axis_controls(
+        key=f"htf_axis_{ticker}_{timeframe}",
+        x_kind="htf",
+        x_default=min(max(int(visible), x_min), n_bars),
+        x_min=x_min,
+        x_max=n_bars,
+    )
+    visible = int(visible)
+
     sma_all, ema_all = _ma_over_bars([], [b["c"] for b in bars])
     if len(bars) > visible:
         bars = bars[-visible:]
@@ -3327,9 +3464,10 @@ def _render_htf_candle_chart(
         [b["l"] for b in bars] + [b["h"] for b in bars] + ma_values
         + [last_price]
     )
-    lo_y, hi_y = min(y_all), max(y_all)
-    pad = max((hi_y - lo_y) * 0.08, 0.15)
-    y_lo, y_hi = lo_y - pad, hi_y + pad
+    y_lo, y_hi = _zoom_y_range(
+        y_all, float(y_zoom),
+        center=last_price if float(y_zoom) > 1.0 else None,
+    )
 
     fig.update_layout(**_tv_layout(
         title=title,
@@ -3350,6 +3488,13 @@ def _render_htf_candle_chart(
             b=36,
         ),
         xaxis=dict(
+            range=[
+                bars[0]["ts"],
+                bars[-1]["ts"] + (
+                    timedelta(hours=2) if hide_overnight
+                    else timedelta(days=1)
+                ),
+            ],
             tickformat=x_tickformat,
             gridcolor=_TV_GRID,
             zeroline=False,
@@ -4105,6 +4250,8 @@ st.caption(
     "**left axis = % vs prev close**. A **dotted last-price line** "
     "tracks the live print; the right-axis box shows the price and "
     "how much time is left on the current candle. "
+    "**X · time / candles** zooms the window (fewer bars → wider "
+    "candles). **Y · zoom** stretches price (higher → taller candles). "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
