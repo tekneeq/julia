@@ -17,11 +17,11 @@ http://localhost:8501).
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import time
-import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -2502,52 +2502,220 @@ def _attach_last_price_line(
     return len(anns) - 1
 
 
-def _plotly_chart_with_bar_timer(
+# Interactive price-chart shell: pan the pane, drag axes to zoom.
+# Placeholders are swapped in by ``_plotly_interactive_price_chart``.
+_PRICE_CHART_HTML = """
+<div id="__UID__" style="width:100%;height:__HEIGHT__px;touch-action:none;"></div>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<script>
+const fig = __FIG__;
+const el = document.getElementById("__UID__");
+const barCloseMs = __BAR_CLOSE_MS__;
+const priceLabel = __PRICE_LABEL__;
+const annIdx = __ANN_IDX__;
+const persistKey = __PERSIST_KEY__;
+const refPrice = __REF_PRICE__;
+const anchorPrice = __ANCHOR_PRICE__;
+fig.layout = fig.layout || {};
+fig.layout.dragmode = "pan";
+fig.layout.uirevision = persistKey;
+
+function store() {
+  try { return window.parent && window.parent.sessionStorage
+    ? window.parent.sessionStorage : window.sessionStorage; } catch (e) { return null; }
+}
+function saveRanges(gd) {
+  const s = store();
+  if (!s || !gd._fullLayout || !gd._fullLayout.xaxis) return;
+  try {
+    s.setItem(persistKey, JSON.stringify({
+      x: gd._fullLayout.xaxis.range,
+      y: gd._fullLayout.yaxis.range
+    }));
+  } catch (e) {}
+}
+function loadRanges() {
+  const s = store();
+  if (!s) return null;
+  try { return JSON.parse(s.getItem(persistKey) || "null"); } catch (e) { return null; }
+}
+function pad(n) { return String(n).padStart(2, "0"); }
+function remaining() {
+  if (!barCloseMs) return "";
+  const s = Math.max(0, Math.floor((barCloseMs - Date.now()) / 1000));
+  return pad(Math.floor(s / 60)) + ":" + pad(s % 60);
+}
+function tag() { return priceLabel + "<br>" + remaining(); }
+
+function lin(ax, v) { return +ax.r2l(v); }
+function unlin(ax, v) { return ax.l2r(v); }
+
+function attachAxisZoom(gd) {
+  let mode = null, lastX = 0, lastY = 0;
+  function hit(px, py) {
+    const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+    if (!xa || !ya) return null;
+    const x0 = xa._offset, x1 = xa._offset + xa._length;
+    const y0 = ya._offset, y1 = ya._offset + ya._length;
+    const pad = 16;
+    if (px >= x0 && px <= x1 && py >= y1 - pad && py <= gd._fullLayout.height) return "x";
+    if (py >= y0 && py <= y1 && px >= x1 - pad && px <= gd._fullLayout.width) return "y";
+    return null;
+  }
+  function cursorFor(px, py) {
+    const h = hit(px, py);
+    if (h === "x") return "ew-resize";
+    if (h === "y") return "ns-resize";
+    return "grab";
+  }
+  function zoomX(factor) {
+    const xa = gd._fullLayout.xaxis;
+    const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
+    const right = Math.max(a, b);
+    let span = Math.abs(b - a) * factor;
+    if (span < 10 * 60 * 1000) span = 10 * 60 * 1000;
+    Plotly.relayout(gd, {"xaxis.range": [unlin(xa, right - span), unlin(xa, right)]});
+  }
+  function zoomY(factor) {
+    const ya = gd._fullLayout.yaxis;
+    const a = lin(ya, ya.range[0]), b = lin(ya, ya.range[1]);
+    const lo0 = Math.min(a, b), hi0 = Math.max(a, b);
+    let mid = (lo0 + hi0) / 2;
+    if (anchorPrice != null && anchorPrice >= lo0 && anchorPrice <= hi0) mid = anchorPrice;
+    let half = (hi0 - lo0) / 2 * factor;
+    if (half < 1e-4) half = 1e-4;
+    const lo = mid - half, hi = mid + half;
+    const upd = {"yaxis.range": [unlin(ya, lo), unlin(ya, hi)]};
+    if (refPrice && gd._fullLayout.yaxis2) {
+      upd["yaxis2.range"] = [
+        (lo - refPrice) / refPrice * 100,
+        (hi - refPrice) / refPrice * 100
+      ];
+    }
+    Plotly.relayout(gd, upd);
+  }
+  function onMoveCursor(ev) {
+    if (mode) return;
+    const r = gd.getBoundingClientRect();
+    gd.style.cursor = cursorFor(ev.clientX - r.left, ev.clientY - r.top);
+  }
+  function onDown(ev) {
+    const t = ev.touches ? ev.touches[0] : ev;
+    const r = gd.getBoundingClientRect();
+    const h = hit(t.clientX - r.left, t.clientY - r.top);
+    if (!h) return;
+    mode = h;
+    lastX = t.clientX;
+    lastY = t.clientY;
+    gd.style.cursor = h === "x" ? "ew-resize" : "ns-resize";
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+  }
+  function onMove(ev) {
+    if (!mode) return;
+    const t = ev.touches ? ev.touches[0] : ev;
+    const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
+    if (mode === "x" && xa) {
+      const dx = t.clientX - lastX;
+      zoomX(Math.exp(dx / Math.max(xa._length, 1) * 1.8));
+    } else if (mode === "y" && ya) {
+      const dy = t.clientY - lastY;
+      zoomY(Math.exp(dy / Math.max(ya._length, 1) * 1.8));
+    }
+    lastX = t.clientX;
+    lastY = t.clientY;
+    ev.preventDefault();
+  }
+  function onUp() { mode = null; }
+  gd.addEventListener("mousemove", onMoveCursor);
+  gd.addEventListener("mousedown", onDown, true);
+  gd.addEventListener("touchstart", onDown, {capture: true, passive: false});
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("touchmove", onMove, {passive: false});
+  window.addEventListener("mouseup", onUp);
+  window.addEventListener("touchend", onUp);
+  gd.on("plotly_relayout", () => saveRanges(gd));
+  gd.on("plotly_doubleclick", () => {
+    const s = store();
+    if (s) try { s.removeItem(persistKey); } catch (e) {}
+  });
+}
+
+Plotly.newPlot(el, fig.data, fig.layout, {
+  responsive: true,
+  displayModeBar: false,
+  scrollZoom: false,
+  doubleClick: "reset"
+}).then(gd => {
+  const saved = loadRanges();
+  const apply = saved
+    ? Plotly.relayout(gd, Object.assign(
+        {"xaxis.range": saved.x, "yaxis.range": saved.y},
+        (refPrice && saved.y && gd._fullLayout.yaxis2)
+          ? {"yaxis2.range": [
+              (saved.y[0] - refPrice) / refPrice * 100,
+              (saved.y[1] - refPrice) / refPrice * 100
+            ]}
+          : {}
+      ))
+    : Promise.resolve();
+  return apply.then(() => {
+    attachAxisZoom(gd);
+    if (priceLabel && annIdx >= 0 && barCloseMs) {
+      function tick() {
+        Plotly.relayout(gd, {["annotations[" + annIdx + "].text"]: tag()});
+      }
+      tick();
+      window.setInterval(tick, 1000);
+    }
+  });
+});
+</script>
+"""
+
+
+def _plotly_interactive_price_chart(
     fig: go.Figure,
     *,
     height: int,
-    bar_close_ms: int,
-    price_label: str,
-    annotation_index: int,
+    persist_key: str,
+    ref_price: float | None = None,
+    last_price: float | None = None,
+    bar_close_ms: int | None = None,
+    price_label: str | None = None,
+    annotation_index: int | None = None,
 ) -> None:
-    """Render ``fig`` and tick the last-price box countdown every second."""
-    fig.update_layout(updatemenus=[], dragmode=False)
-    spec = fig.to_json()
-    uid = f"tv-live-{uuid.uuid4().hex[:10]}"
-    # Escape for embedding inside a JS string (price is numeric + comma).
-    price_js = price_label.replace("\\", "\\\\").replace("'", "\\'")
-    components.html(
-        f"""
-<div id="{uid}" style="width:100%;height:{height}px;"></div>
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-<script>
-const fig = {spec};
-const el = document.getElementById("{uid}");
-const barCloseMs = {bar_close_ms};
-const priceLabel = '{price_js}';
-const annIdx = {annotation_index};
-function pad(n) {{ return String(n).padStart(2, '0'); }}
-function remaining() {{
-  const s = Math.max(0, Math.floor((barCloseMs - Date.now()) / 1000));
-  return pad(Math.floor(s / 60)) + ':' + pad(s % 60);
-}}
-function tag() {{ return priceLabel + '<br>' + remaining(); }}
-Plotly.newPlot(el, fig.data, fig.layout, {{
-  responsive: true,
-  displayModeBar: false,
-  scrollZoom: false
-}}).then(gd => {{
-  function tick() {{
-    const key = 'annotations[' + annIdx + '].text';
-    Plotly.relayout(gd, {{[key]: tag()}});
-  }}
-  tick();
-  window.setInterval(tick, 1000);
-}});
-</script>
-""",
-        height=height + 10,
+    """Pan the pane; drag the X/Y axes to zoom. Timer optional."""
+    fig.update_layout(
+        updatemenus=[],
+        dragmode="pan",
+        uirevision=persist_key,
     )
+    spec = fig.to_json()
+    uid = f"tv-live-{persist_key}"
+    html = (
+        _PRICE_CHART_HTML
+        .replace("__UID__", uid)
+        .replace("__HEIGHT__", str(int(height)))
+        .replace("__FIG__", spec)
+        .replace("__BAR_CLOSE_MS__", str(int(bar_close_ms or 0)))
+        .replace(
+            "__PRICE_LABEL__",
+            json.dumps(price_label or ""),
+        )
+        .replace("__ANN_IDX__", str(-1 if annotation_index is None else int(annotation_index)))
+        .replace("__PERSIST_KEY__", json.dumps(persist_key))
+        .replace(
+            "__REF_PRICE__",
+            "null" if ref_price is None else f"{float(ref_price):.6f}",
+        )
+        .replace(
+            "__ANCHOR_PRICE__",
+            "null" if last_price is None else f"{float(last_price):.6f}",
+        )
+    )
+    components.html(html, height=height + 10)
 
 
 def _today_price_series(ticker: str, today: date) -> list[dict]:
@@ -2671,101 +2839,6 @@ def _ma_over_bars(
     return sma_full[n_prior:], ema_full[n_prior:]
 
 
-_X_WINDOWS_5M = ["Session", "→ Now", "3h", "2h", "1h"]
-
-
-def _five_min_x_range(
-    choice: str,
-    *,
-    session_open: datetime,
-    session_close: datetime,
-    now: datetime,
-) -> tuple[datetime, datetime]:
-    """Visible x-window for the 5-min chart. Narrower → fatter candles."""
-    pad = timedelta(minutes=5)
-    end_now = min(session_close, max(now, session_open) + pad)
-    if choice == "Session":
-        return session_open, session_close
-    if choice == "→ Now":
-        return session_open, end_now
-    hours = {"3h": 3, "2h": 2, "1h": 1}[choice]
-    start = end_now - timedelta(hours=hours)
-    if start < session_open:
-        start = session_open
-    return start, end_now
-
-
-def _zoom_y_range(
-    values: list[float],
-    zoom: float,
-    *,
-    center: float | None = None,
-) -> tuple[float, float]:
-    """Price-axis range. ``zoom`` > 1 tightens (taller candles); < 1 adds air."""
-    vals = [float(v) for v in values if v is not None]
-    if not vals:
-        return 0.0, 1.0
-    lo, hi = min(vals), max(vals)
-    span = max(hi - lo, 0.15)
-    mid = center if center is not None else (lo + hi) / 2.0
-    z = max(float(zoom), 0.1)
-    half = (span / 2.0) / z
-    pad = max(span * 0.08 / z, 0.08)
-    y_lo, y_hi = mid - half - pad, mid + half + pad
-    if z <= 1.0:
-        y_lo = min(y_lo, lo - pad)
-        y_hi = max(y_hi, hi + pad)
-    return y_lo, y_hi
-
-
-def _axis_controls(
-    *,
-    key: str,
-    x_kind: str,
-    x_default: str | int,
-    x_min: int | None = None,
-    x_max: int | None = None,
-) -> tuple[str | int, float]:
-    """X window + Y zoom. Returns (x_choice_or_count, y_zoom)."""
-    col_x, col_y = st.columns([2.2, 1])
-    with col_x:
-        if x_kind == "5min":
-            x_val: str | int = st.radio(
-                "X · time",
-                _X_WINDOWS_5M,
-                index=_X_WINDOWS_5M.index(str(x_default)),
-                horizontal=True,
-                key=f"{key}_x",
-                help=(
-                    "How much of the session to show. A tighter window "
-                    "makes each 5-min candle wider."
-                ),
-            )
-        else:
-            x_val = st.slider(
-                "X · candles",
-                min_value=int(x_min or 8),
-                max_value=int(x_max or 80),
-                value=int(x_default),
-                key=f"{key}_x",
-                help="Fewer candles → each bar is drawn wider.",
-            )
-    with col_y:
-        y_zoom = st.slider(
-            "Y · zoom",
-            min_value=0.5,
-            max_value=2.5,
-            value=1.0,
-            step=0.1,
-            key=f"{key}_y",
-            help=(
-                "1.0 fits the visible bars. Higher zooms into price "
-                "(taller candles), lower adds headroom."
-            ),
-        )
-    return x_val, y_zoom
-
-
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
@@ -2830,19 +2903,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         key=f"today_chart_view_{ticker}",
         label_visibility="collapsed",
     )
-    x_win, y_zoom = _axis_controls(
-        key=f"today_axis_{ticker}",
-        x_kind="5min",
-        x_default="Session",
+    st.caption(
+        "Drag the plot to move. Drag the bottom (time) or right (price) "
+        "axis to zoom. Double-click to reset."
     )
     use_candles = view == "5-min candles"
     bars5 = _five_min_bars(series, today)
-    x_lo, x_hi = _five_min_x_range(
-        str(x_win),
-        session_open=session_open,
-        session_close=session_close,
-        now=now,
-    )
 
     fig = go.Figure()
     if ref:
@@ -2985,26 +3051,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         timer_label=_fmt_mmss((bar_close - now).total_seconds()),
     )
 
-    vis_ys = [y for x, y in zip(xs, ys) if x_lo <= x <= x_hi] or ys
-    vis_ma: list[float] = []
-    for t, s, e in zip(ma_xs, sma_ys, ema_ys):
-        if x_lo <= t <= x_hi:
-            if s is not None:
-                vis_ma.append(s)
-            if e is not None:
-                vis_ma.append(e)
-    y_all = vis_ys + vis_ma + [last_price]
+    y_all = ys + ([ref] if ref else []) + ma_values
     if use_candles:
-        y_all.extend(
-            v for b in bars5 if x_lo <= b["ts"] <= x_hi
-            for v in (b["h"], b["l"])
-        )
-    if ref and x_win == "Session":
-        y_all.append(ref)
-    y_lo, y_hi = _zoom_y_range(
-        y_all, float(y_zoom),
-        center=last_price if float(y_zoom) > 1.0 else None,
-    )
+        y_all.extend(v for b in bars5 for v in (b["h"], b["l"]))
+    lo_y, hi_y = min(y_all), max(y_all)
+    pad = max((hi_y - lo_y) * 0.08, 0.15)
+    y_lo, y_hi = lo_y - pad, hi_y + pad
 
     # Left axis mirrors the same price range as % vs prev close so you
     # can read the move at a glance without hovering. No second grid —
@@ -3024,18 +3076,15 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         margin=dict(
             t=56 if ma_values else 48,
             l=56 if ref else 10,
-            r=72,
-            b=36,
+            r=80,
+            b=52,
         ),
         xaxis=dict(
-            range=[x_lo, x_hi],
+            range=[session_open, session_close],
             tickformat="%H:%M",
             tick0=session_open,
-            dtick=(
-                15 * 60 * 1000
-                if (x_hi - x_lo).total_seconds() <= 2.5 * 3600
-                else 30 * 60 * 1000
-            ),
+            dtick=30 * 60 * 1000,
+            fixedrange=False,
             gridcolor=_TV_GRID,
             zeroline=False,
             color=_TV_MUTED,
@@ -3048,6 +3097,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             side="right",
             range=[y_lo, y_hi],
             tickprefix="$", tickformat=",.2f",
+            fixedrange=False,
             gridcolor=_TV_GRID,
             zeroline=False,
             color=_TV_MUTED,
@@ -3063,6 +3113,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 (y_lo - ref) / ref * 100.0,
                 (y_hi - ref) / ref * 100.0,
             ],
+            fixedrange=True,
             tickformat="+.2f",
             ticksuffix="%",
             hoverformat="+.2f",
@@ -3076,9 +3127,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
-    _plotly_chart_with_bar_timer(
+    _plotly_interactive_price_chart(
         fig,
         height=480,
+        persist_key=f"px-{ticker}-5min",
+        ref_price=ref,
+        last_price=last_price,
         bar_close_ms=_naive_et_epoch_ms(bar_close),
         price_label=price_label,
         annotation_index=timer_ann,
@@ -3383,17 +3437,6 @@ def _render_htf_candle_chart(
         st.info(empty_note)
         return
 
-    n_bars = len(bars)
-    x_min = min(8, n_bars)
-    visible, y_zoom = _axis_controls(
-        key=f"htf_axis_{ticker}_{timeframe}",
-        x_kind="htf",
-        x_default=min(max(int(visible), x_min), n_bars),
-        x_min=x_min,
-        x_max=n_bars,
-    )
-    visible = int(visible)
-
     sma_all, ema_all = _ma_over_bars([], [b["c"] for b in bars])
     if len(bars) > visible:
         bars = bars[-visible:]
@@ -3464,10 +3507,9 @@ def _render_htf_candle_chart(
         [b["l"] for b in bars] + [b["h"] for b in bars] + ma_values
         + [last_price]
     )
-    y_lo, y_hi = _zoom_y_range(
-        y_all, float(y_zoom),
-        center=last_price if float(y_zoom) > 1.0 else None,
-    )
+    lo_y, hi_y = min(y_all), max(y_all)
+    pad = max((hi_y - lo_y) * 0.08, 0.15)
+    y_lo, y_hi = lo_y - pad, hi_y + pad
 
     fig.update_layout(**_tv_layout(
         title=title,
@@ -3484,8 +3526,8 @@ def _render_htf_candle_chart(
         margin=dict(
             t=56 if ma_values else 48,
             l=10,
-            r=72,
-            b=36,
+            r=80,
+            b=52,
         ),
         xaxis=dict(
             range=[
@@ -3495,6 +3537,7 @@ def _render_htf_candle_chart(
                     else timedelta(days=1)
                 ),
             ],
+            fixedrange=False,
             tickformat=x_tickformat,
             gridcolor=_TV_GRID,
             zeroline=False,
@@ -3514,6 +3557,7 @@ def _render_htf_candle_chart(
             side="right",
             range=[y_lo, y_hi],
             tickprefix="$", tickformat=",.2f",
+            fixedrange=False,
             gridcolor=_TV_GRID,
             zeroline=False,
             color=_TV_MUTED,
@@ -3521,16 +3565,15 @@ def _render_htf_candle_chart(
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
         ),
     ))
-    if live:
-        _plotly_chart_with_bar_timer(
-            fig,
-            height=420,
-            bar_close_ms=_naive_et_epoch_ms(bar_close),
-            price_label=price_label,
-            annotation_index=timer_ann,
-        )
-    else:
-        _show_plotly(fig)
+    _plotly_interactive_price_chart(
+        fig,
+        height=420,
+        persist_key=f"px-{ticker}-{timeframe}",
+        last_price=last_price,
+        bar_close_ms=_naive_et_epoch_ms(bar_close) if live else None,
+        price_label=price_label if live else None,
+        annotation_index=timer_ann if live else None,
+    )
     if not ma_values:
         st.caption(
             f"SMA {_SMA_BARS} / EMA {_EMA_BARS} need more {timeframe} "
@@ -4250,8 +4293,9 @@ st.caption(
     "**left axis = % vs prev close**. A **dotted last-price line** "
     "tracks the live print; the right-axis box shows the price and "
     "how much time is left on the current candle. "
-    "**X · time / candles** zooms the window (fewer bars → wider "
-    "candles). **Y · zoom** stretches price (higher → taller candles). "
+    "**Drag the chart to pan.** Drag the **time axis** (bottom) or "
+    "**price axis** (right) to zoom — candles widen/tallify with the "
+    "view. Double-click a chart to reset. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
