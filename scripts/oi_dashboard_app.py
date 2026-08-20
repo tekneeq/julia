@@ -2903,6 +2903,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         key=f"today_chart_view_{ticker}",
         label_visibility="collapsed",
     )
+    st.caption(
+        "Drag the plot to move. Drag the bottom (time) or right (price) "
+        "axis to zoom. Double-click to reset."
+    )
     use_candles = view == "5-min candles"
     bars5 = _five_min_bars(series, today)
 
