@@ -2846,8 +2846,10 @@ def _is_regular_bar_ts(ts: datetime) -> bool:
     return daily_moves_store.MARKET_OPEN <= t < daily_moves_store.MARKET_CLOSE
 
 
-def _store_prior_5min_bars(ticker: str, today: date) -> list[dict]:
+@st.cache_data(ttl=300, show_spinner=False)
+def _store_prior_5min_bars(ticker: str, today_iso: str) -> list[dict]:
     """Rebuild prior-session 5-minute OHLC from the local minute path."""
+    today = date.fromisoformat(today_iso)
     bars: list[dict] = []
     for s in daily_moves_store.list_sessions(ticker):
         try:
@@ -2880,7 +2882,7 @@ def _history_5min_bars(
     live ticks win over both so the developing candle stays real-time.
     """
     by_ts: dict[datetime, dict] = {}
-    for b in _store_prior_5min_bars(ticker, today):
+    for b in _store_prior_5min_bars(ticker, today.isoformat()):
         if _is_regular_bar_ts(b["ts"]):
             by_ts[b["ts"]] = b
     # Official RH bars overwrite reconstructed store OHLC; include
@@ -2959,7 +2961,9 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
     EMA 27 curves on 5-minute bars, and a dotted last-price line with
     a right-axis box (price + time left on the 5-min bar). Toggles
-    between 5-min candles (TradingView-like) and the tick line. No
+    between 5-min candles (TradingView-like) and the tick line.
+    Default window is today's session; prior 5-minute bars are on the
+    same traces so zooming/panning the time axis reveals them. No
     twins here — they get their own panels below.
     """
     series = _today_price_series(ticker, today)
