@@ -2568,13 +2568,53 @@ function attachAxisZoom(gd) {
     if (h === "y") return "ns-resize";
     return "grab";
   }
+  function yRangeForVisibleX(xLinLo, xLinHi) {
+    let lo = Infinity, hi = -Infinity;
+    const xa = gd._fullLayout.xaxis;
+    function consider(y) {
+      if (y == null || y === "") return;
+      const n = +y;
+      if (!isFinite(n)) return;
+      if (n < lo) lo = n;
+      if (n > hi) hi = n;
+    }
+    for (const t of gd.data || []) {
+      if (!t || t.visible === false || t.visible === "legendonly") continue;
+      const xs = t.x || [];
+      for (let i = 0; i < xs.length; i++) {
+        const xv = lin(xa, xs[i]);
+        if (!isFinite(xv) || xv < xLinLo || xv > xLinHi) continue;
+        if (t.type === "candlestick") {
+          consider(t.high && t.high[i]);
+          consider(t.low && t.low[i]);
+        } else {
+          consider(t.y && t.y[i]);
+        }
+      }
+    }
+    if (!isFinite(lo) || !isFinite(hi)) return {};
+    const pad = Math.max((hi - lo) * 0.08, 0.15);
+    const yLo = lo - pad, yHi = hi + pad;
+    const upd = {"yaxis.range": [yLo, yHi]};
+    if (refPrice && gd._fullLayout.yaxis2) {
+      upd["yaxis2.range"] = [
+        (yLo - refPrice) / refPrice * 100,
+        (yHi - refPrice) / refPrice * 100
+      ];
+    }
+    return upd;
+  }
   function zoomX(factor) {
     const xa = gd._fullLayout.xaxis;
     const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
     const right = Math.max(a, b);
     let span = Math.abs(b - a) * factor;
     if (span < 10 * 60 * 1000) span = 10 * 60 * 1000;
-    Plotly.relayout(gd, {"xaxis.range": [unlin(xa, right - span), unlin(xa, right)]});
+    const left = right - span;
+    Plotly.relayout(gd, Object.assign(
+      {"xaxis.range": [unlin(xa, left), unlin(xa, right)]},
+      yRangeForVisibleX(left, right)
+    ));
   }
   function zoomY(factor) {
     const ya = gd._fullLayout.yaxis;
@@ -2635,7 +2675,23 @@ function attachAxisZoom(gd) {
   window.addEventListener("touchmove", onMove, {passive: false});
   window.addEventListener("mouseup", onUp);
   window.addEventListener("touchend", onUp);
-  gd.on("plotly_relayout", () => saveRanges(gd));
+  let fittingY = false;
+  gd.on("plotly_relayout", (ev) => {
+    if (
+      !fittingY
+      && ev
+      && (ev["xaxis.range[0]"] != null || ev["xaxis.range"] != null)
+    ) {
+      const xa = gd._fullLayout.xaxis;
+      const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
+      const yUpd = yRangeForVisibleX(Math.min(a, b), Math.max(a, b));
+      if (Object.keys(yUpd).length) {
+        fittingY = true;
+        Plotly.relayout(gd, yUpd).then(() => { fittingY = false; });
+      }
+    }
+    saveRanges(gd);
+  });
   gd.on("plotly_doubleclick", () => {
     const s = store();
     if (s) try { s.removeItem(persistKey); } catch (e) {}
@@ -2782,6 +2838,64 @@ def _five_min_bars(series: list[dict], today: date) -> list[dict]:
     ]
 
 
+def _is_regular_bar_ts(ts: datetime) -> bool:
+    """True for a regular-session 5-minute bar open (weekdays 09:30–15:55)."""
+    if ts.weekday() >= 5:
+        return False
+    t = ts.time()
+    return daily_moves_store.MARKET_OPEN <= t < daily_moves_store.MARKET_CLOSE
+
+
+def _store_prior_5min_bars(ticker: str, today: date) -> list[dict]:
+    """Rebuild prior-session 5-minute OHLC from the local minute path."""
+    bars: list[dict] = []
+    for s in daily_moves_store.list_sessions(ticker):
+        try:
+            d = date.fromisoformat(s["session_date"])
+        except ValueError:
+            continue
+        if d >= today:
+            continue
+        path = daily_moves_store.get_session_path(ticker, d)
+        if not path:
+            continue
+        series = [
+            {
+                "ts": _minute_to_dt(d, p["minutes_from_open"]),
+                "price": p["spot"],
+            }
+            for p in path
+        ]
+        bars.extend(_five_min_bars(series, d))
+    bars.sort(key=lambda b: b["ts"])
+    return bars
+
+
+def _history_5min_bars(
+    ticker: str, today: date, series: list[dict],
+) -> list[dict]:
+    """Prior-session 5-minute OHLC plus today's live-aggregated bars.
+
+    Robinhood official bars win over reconstructed store bars; today's
+    live ticks win over both so the developing candle stays real-time.
+    """
+    by_ts: dict[datetime, dict] = {}
+    for b in _store_prior_5min_bars(ticker, today):
+        if _is_regular_bar_ts(b["ts"]):
+            by_ts[b["ts"]] = b
+    # Official RH bars overwrite reconstructed store OHLC; include
+    # today so a late poller start still has the morning.
+    for b in _fetch_rh_ohlc_merged(
+        ticker, "5minute", ("month", "week", "day"),
+    ):
+        if not _is_regular_bar_ts(b["ts"]):
+            continue
+        by_ts[b["ts"]] = b
+    for b in _five_min_bars(series, today):
+        by_ts[b["ts"]] = b
+    return [by_ts[k] for k in sorted(by_ts)]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _prior_5min_closes(ticker: str, today_iso: str) -> list[float]:
     """Closes of regular-session 5-minute bars BEFORE today, oldest
@@ -2904,11 +3018,15 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         label_visibility="collapsed",
     )
     st.caption(
-        "Drag the plot to move. Drag the bottom (time) or right (price) "
-        "axis to zoom. Double-click to reset."
+        "Drag the plot to move. Drag the bottom (time) axis to zoom — "
+        "zoom out (or pan left) to see prior sessions, as far as the "
+        "loaded history goes. Drag the right (price) axis to zoom "
+        "price. Double-click to reset."
     )
     use_candles = view == "5-min candles"
-    bars5 = _five_min_bars(series, today)
+    bars5 = _history_5min_bars(ticker, today, series)
+    today_bars = [b for b in bars5 if b["ts"].date() == today]
+    prior_bars = [b for b in bars5 if b["ts"].date() < today]
 
     fig = go.Figure()
     if ref:
@@ -2937,6 +3055,18 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             showlegend=False,
         ))
     else:
+        if prior_bars:
+            fig.add_trace(go.Scatter(
+                x=[b["ts"] for b in prior_bars],
+                y=[b["c"] for b in prior_bars],
+                mode="lines",
+                name=f"{ticker} prior",
+                line=dict(color=_TV_MUTED, width=1.2),
+                hovertemplate=(
+                    "<b>$%{y:,.2f}</b>  ·  %{x|%b %d %H:%M}<extra></extra>"
+                ),
+                showlegend=False,
+            ))
         if ref:
             # Invisible baseline sharing the price trace's x-grid — the
             # price trace fills to it, tinting the gap vs prev close
@@ -2967,10 +3097,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             showlegend=False,
         ))
 
-    # SMA 9 / EMA 27 curves on 5-minute closes, warmed up with prior
-    # sessions so both exist from the open — same values TradingView
-    # shows on a 5m chart.
-    prior_closes = _prior_5min_closes(ticker, today.isoformat())
+    # SMA 9 / EMA 27 on every plotted 5-minute close — history is on
+    # the chart so the MAs exist from today's open without a hidden
+    # warm-up prefix. Fall back to unplotted RH closes if we only
+    # have today.
+    prior_closes = (
+        [] if prior_bars
+        else _prior_5min_closes(ticker, today.isoformat())
+    )
     sma_ys, ema_ys = _ma_over_bars(prior_closes, [b["c"] for b in bars5])
     ma_xs = [b["ts"] for b in bars5]
     ma_values: list[float] = []
@@ -2987,13 +3121,13 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             line=dict(color=color, width=1.3),
             connectgaps=False,
             hovertemplate=(
-                f"{label}  <b>$%{{y:,.2f}}</b>  ·  %{{x|%H:%M}}"
+                f"{label}  <b>$%{{y:,.2f}}</b>  ·  %{{x|%b %d %H:%M}}"
                 "<extra></extra>"
             ),
             showlegend=True,
         ))
         ma_values.extend(v for v in curve if v is not None)
-    if not prior_closes and any(v is None for v in ema_ys):
+    if not prior_bars and not prior_closes and any(v is None for v in ema_ys):
         st.caption(
             "MA warm-up history unavailable (Robinhood login needed) — "
             "SMA/EMA appear once enough of today's 5-min bars exist."
@@ -3051,9 +3185,19 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         timer_label=_fmt_mmss((bar_close - now).total_seconds()),
     )
 
-    y_all = ys + ([ref] if ref else []) + ma_values
+    # Default Y fits today's session (plus MAs in that window) so a
+    # month of history doesn't squash the live view. Axis-zoom on X
+    # refits Y to whatever is in the new time window.
+    today_ma = [
+        v for v, x in zip(sma_ys, ma_xs)
+        if v is not None and x.date() == today
+    ] + [
+        v for v, x in zip(ema_ys, ma_xs)
+        if v is not None and x.date() == today
+    ]
+    y_all = ys + ([ref] if ref else []) + today_ma
     if use_candles:
-        y_all.extend(v for b in bars5 for v in (b["h"], b["l"]))
+        y_all.extend(v for b in today_bars for v in (b["h"], b["l"]))
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
@@ -3081,9 +3225,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         ),
         xaxis=dict(
             range=[session_open, session_close],
-            tickformat="%H:%M",
-            tick0=session_open,
-            dtick=30 * 60 * 1000,
+            # Let Plotly pick tick spacing as the window grows from
+            # one session to weeks; labels pick up the date when the
+            # visible span is longer than a few hours.
+            tickformatstops=[
+                dict(dtickrange=[None, 3_600_000], value="%H:%M"),
+                dict(dtickrange=[3_600_000, 86_400_000], value="%b %d %H:%M"),
+                dict(dtickrange=[86_400_000, None], value="%b %d"),
+            ],
             fixedrange=False,
             gridcolor=_TV_GRID,
             zeroline=False,
@@ -3092,6 +3241,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             spikecolor=_TV_SPIKE, spikethickness=1, spikedash="solid",
             # Candlestick traces enable a rangeslider by default.
             rangeslider=dict(visible=False),
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                dict(bounds=[16, 9.5], pattern="hour"),
+            ],
         ),
         yaxis=dict(
             side="right",
@@ -4293,9 +4446,10 @@ st.caption(
     "**left axis = % vs prev close**. A **dotted last-price line** "
     "tracks the live print; the right-axis box shows the price and "
     "how much time is left on the current candle. "
-    "**Drag the chart to pan.** Drag the **time axis** (bottom) or "
-    "**price axis** (right) to zoom — candles widen/tallify with the "
-    "view. Double-click a chart to reset. "
+    "**Drag the chart to pan.** Drag the **time axis** (bottom) to "
+    "zoom — zoom out or pan left to see prior sessions, not just "
+    "today. Drag the **price axis** (right) to zoom price. "
+    "Double-click a chart to reset. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
