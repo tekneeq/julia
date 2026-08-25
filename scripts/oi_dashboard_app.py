@@ -2850,8 +2850,10 @@ _VOL_SMA_BARS = 20
 _VOL_SMA_COLOR = "#ff9800"
 _VOL_UP_DIM = "rgba(8, 153, 129, 0.28)"
 _VOL_DOWN_DIM = "rgba(242, 54, 69, 0.28)"
-_VOL_PROFILE = "rgba(41, 98, 255, 0.30)"
-_VOL_PROFILE_POC = "rgba(41, 98, 255, 0.62)"
+_VOL_PROFILE = "rgba(41, 98, 255, 0.38)"
+_VOL_PROFILE_POC = "rgba(41, 98, 255, 0.82)"
+# Fraction of the price pane (from the right / $ axis) the profile spans.
+_VOL_PROFILE_SPAN = 0.30
 _TODAY_CHART_HEIGHT = 580
 
 
@@ -2956,6 +2958,84 @@ def _volume_profile_bins(
     ]
 
 
+def _add_volume_profile(
+    fig: go.Figure,
+    today_bars: list[dict],
+    *,
+    y_lo: float,
+    y_hi: float,
+    x_hover,
+) -> dict | None:
+    """Volume-at-price histogram glued to the right / $ axis.
+
+    Drawn in the price pane's x-domain (not a second time axis) so
+    each bar sits at a price: longest bar = POC. Returns the POC
+    bin or None.
+    """
+    profile = _volume_profile_bins(today_bars, y_lo=y_lo, y_hi=y_hi)
+    if not profile:
+        return None
+    poc = max(profile, key=lambda p: p["v"])
+    vmax = poc["v"]
+    if vmax <= 0:
+        return None
+    for p in profile:
+        frac = p["v"] / vmax
+        x0 = 1.0 - _VOL_PROFILE_SPAN * frac
+        fig.add_shape(
+            type="rect",
+            xref="x domain", yref="y",
+            x0=x0, x1=1.0,
+            y0=p["price"] - p["width"] * 0.46,
+            y1=p["price"] + p["width"] * 0.46,
+            fillcolor=(
+                _VOL_PROFILE_POC if p is poc else _VOL_PROFILE
+            ),
+            line=dict(width=0),
+            layer="below",
+            row=1, col=1,
+        )
+    fig.add_hline(
+        y=poc["price"],
+        line_color=_SMA_COLOR,
+        line_width=1,
+        line_dash="dot",
+        row=1, col=1,
+    )
+    fig.add_annotation(
+        xref="x domain", x=1.0, xanchor="right",
+        y=poc["price"], yref="y",
+        text=f"POC ${poc['price']:,.2f} · {_fmt_volume(poc['v'])}",
+        showarrow=False,
+        font=dict(size=11, color=_SMA_COLOR),
+        bgcolor="rgba(19, 23, 34, 0.7)",
+        borderpad=3,
+        xshift=-4,
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[x_hover] * len(profile),
+            y=[p["price"] for p in profile],
+            mode="markers",
+            marker=dict(size=10, color="rgba(0,0,0,0)"),
+            text=[
+                (
+                    f"{_fmt_volume(p['v'])}"
+                    + ("  ·  most volume (POC)" if p is poc else "")
+                )
+                for p in profile
+            ],
+            hovertemplate=(
+                "Vol at $%{y:,.2f}: <b>%{text}</b><extra></extra>"
+            ),
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
+    return poc
+
+
 def _add_volume_layers(
     fig: go.Figure,
     bars: list[dict],
@@ -2963,16 +3043,17 @@ def _add_volume_layers(
     today_bars: list[dict],
     y_lo: float,
     y_hi: float,
-) -> bool:
-    """Volume histogram (row 2) + Y-axis profile on the price pane.
+    x_hover,
+) -> dict | None:
+    """Time-series volume (row 2) + Y-axis volume-at-price profile.
 
     Bright volume bars are above the 20-bar average (the move has
-    participation); faded bars are below it. Returns True when any
-    volume was plotted.
+    participation); faded bars are below it. Returns ``{"poc": ...}``
+    when any volume was plotted, else None.
     """
     vols = [b.get("v") for b in bars]
     if not any(v is not None and v > 0 for v in vols):
-        return False
+        return None
     sma = _rolling_mean(
         [float(v) if v is not None else 0.0 for v in vols],
         _VOL_SMA_BARS,
@@ -3025,47 +3106,6 @@ def _add_volume_layers(
             ),
             row=2, col=1,
         )
-
-    profile = _volume_profile_bins(today_bars, y_lo=y_lo, y_hi=y_hi)
-    if profile:
-        poc = max(profile, key=lambda p: p["v"])
-        fig.add_trace(go.Bar(
-            x=[p["v"] for p in profile],
-            y=[p["price"] for p in profile],
-            orientation="h",
-            width=[p["width"] * 0.92 for p in profile],
-            marker=dict(
-                color=[
-                    _VOL_PROFILE_POC if p is poc else _VOL_PROFILE
-                    for p in profile
-                ],
-            ),
-            xaxis="x2",
-            yaxis="y",
-            hovertemplate=(
-                "Profile  <b>%{x:,.0f}</b> @ $%{y:,.2f}<extra></extra>"
-            ),
-            showlegend=False,
-        ))
-        fig.add_annotation(
-            x=0.0, xref="x2", xanchor="left",
-            y=poc["price"], yref="y",
-            text=f"POC {_fmt_volume(poc['v'])}",
-            showarrow=False,
-            font=dict(size=10, color=_SMA_COLOR),
-            bgcolor="rgba(19, 23, 34, 0.55)",
-            borderpad=2,
-        )
-        fig.update_layout(xaxis2=dict(
-            overlaying="x",
-            side="top",
-            range=[0, poc["v"] * 4.0],
-            showticklabels=False,
-            showgrid=False,
-            zeroline=False,
-            fixedrange=True,
-            showspikes=False,
-        ))
     fig.update_yaxes(
         title=dict(text="Vol", font=dict(size=10, color=_TV_MUTED)),
         rangemode="tozero",
@@ -3077,7 +3117,10 @@ def _add_volume_layers(
         showspikes=False,
         row=2, col=1,
     )
-    return True
+    poc = _add_volume_profile(
+        fig, today_bars, y_lo=y_lo, y_hi=y_hi, x_hover=x_hover,
+    )
+    return {"poc": poc}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -3264,10 +3307,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "Drag the plot to move. Drag the bottom (time) axis to zoom — "
         "zoom out (or pan left) to see prior sessions, as far as the "
         "loaded history goes. Drag the right (price) axis to zoom "
-        "price. Double-click to reset. Volume bars: **bright** = "
-        "above the 20-bar average (move is supported); **faded** = "
-        "light participation. The left-side profile is today's "
-        "volume-at-price; the bright bin is the POC."
+        "price. Double-click to reset. The **histogram on the $ "
+        "axis** is volume-at-price (longest bar = most volume / "
+        "POC). The strip under the candles is volume-over-time: "
+        "**bright** = above the 20-bar average, **faded** = light."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
@@ -3464,15 +3507,25 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
 
-    has_volume = False
+    vol_info = None
     if has_vol_data:
-        has_volume = _add_volume_layers(
-            fig, bars5, today_bars=today_bars, y_lo=y_lo, y_hi=y_hi,
+        vol_info = _add_volume_layers(
+            fig, bars5,
+            today_bars=today_bars, y_lo=y_lo, y_hi=y_hi,
+            x_hover=session_close,
         )
+    has_volume = vol_info is not None
     if not has_volume:
         st.caption(
             "Volume needs Robinhood 5-minute bars (login) — the "
             "histogram and profile stay empty until those load."
+        )
+    elif vol_info.get("poc"):
+        poc = vol_info["poc"]
+        st.caption(
+            f"Most volume today printed around "
+            f"**${poc['price']:,.2f}** (POC, {_fmt_volume(poc['v'])}) "
+            "— the longest bar on the **right / $ axis**."
         )
     show_leg = bool(ma_values or has_volume)
 
@@ -4730,9 +4783,10 @@ st.caption(
     "**Drag the chart to pan.** Drag the **time axis** (bottom) to "
     "zoom — zoom out or pan left to see prior sessions, not just "
     "today. Drag the **price axis** (right) to zoom price. "
-    "Volume under the candles (vs its 20-bar average) shows whether "
-    "a move had participation; the **volume profile** on the left "
-    "is today's volume-at-price. Double-click a chart to reset. "
+    "The **volume profile sits on the $ / Y axis** — longest bar "
+    "is the price with the most volume (POC). The strip under the "
+    "candles is volume-over-time vs its 20-bar average. "
+    "Double-click a chart to reset. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
