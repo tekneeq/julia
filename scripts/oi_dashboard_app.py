@@ -31,6 +31,7 @@ import math
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 from scipy.stats import norm
@@ -2475,16 +2476,22 @@ def _attach_last_price_line(
     color: str,
     price_label: str,
     timer_label: str | None,
+    row: int | None = None,
 ) -> int:
     """Dotted last-price ray + right-axis box (price over bar countdown).
 
     Returns the annotation index so JS can tick the timer in place.
     """
+    hline_kw: dict = {}
+    if row is not None:
+        hline_kw["row"] = row
+        hline_kw["col"] = 1
     fig.add_hline(
         y=last_price,
         line_color=_TV_SPIKE,
         line_width=1,
         line_dash="dot",
+        **hline_kw,
     )
     fig.add_annotation(
         xref="paper", x=1.0, xanchor="left", y=last_price, yref="y",
@@ -2558,7 +2565,10 @@ function attachAxisZoom(gd) {
     const x0 = xa._offset, x1 = xa._offset + xa._length;
     const y0 = ya._offset, y1 = ya._offset + ya._length;
     const pad = 16;
-    if (px >= x0 && px <= x1 && py >= y1 - pad && py <= gd._fullLayout.height) return "x";
+    // Time-axis strip sits under the bottom pane (volume, if present).
+    const bottomAx = gd._fullLayout.yaxis3 || ya;
+    const bottom = bottomAx._offset + bottomAx._length;
+    if (px >= x0 && px <= x1 && py >= bottom - pad && py <= gd._fullLayout.height) return "x";
     if (py >= y0 && py <= y1 && px >= x1 - pad && px <= gd._fullLayout.width) return "y";
     return null;
   }
@@ -2580,6 +2590,8 @@ function attachAxisZoom(gd) {
     }
     for (const t of gd.data || []) {
       if (!t || t.visible === false || t.visible === "legendonly") continue;
+      const ax = t.xaxis || "x", ay = t.yaxis || "y";
+      if ((ax !== "x" && ax !== "x1") || (ay !== "y" && ay !== "y1")) continue;
       const xs = t.x || [];
       for (let i = 0; i < xs.length; i++) {
         const xv = lin(xa, xs[i]);
@@ -2604,6 +2616,25 @@ function attachAxisZoom(gd) {
     }
     return upd;
   }
+  function volRangeForVisibleX(xLinLo, xLinHi) {
+    const xa = gd._fullLayout.xaxis;
+    if (!gd._fullLayout.yaxis3) return {};
+    let hi = 0;
+    for (const t of gd.data || []) {
+      if (!t || t.type !== "bar") continue;
+      const ay = t.yaxis || "y";
+      if (ay !== "y3") continue;
+      const xs = t.x || [], ys = t.y || [];
+      for (let i = 0; i < xs.length; i++) {
+        const xv = lin(xa, xs[i]);
+        if (!isFinite(xv) || xv < xLinLo || xv > xLinHi) continue;
+        const n = +ys[i];
+        if (isFinite(n) && n > hi) hi = n;
+      }
+    }
+    if (hi <= 0) return {};
+    return {"yaxis3.range": [0, hi * 1.15]};
+  }
   function zoomX(factor) {
     const xa = gd._fullLayout.xaxis;
     const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
@@ -2613,7 +2644,8 @@ function attachAxisZoom(gd) {
     const left = right - span;
     Plotly.relayout(gd, Object.assign(
       {"xaxis.range": [unlin(xa, left), unlin(xa, right)]},
-      yRangeForVisibleX(left, right)
+      yRangeForVisibleX(left, right),
+      volRangeForVisibleX(left, right)
     ));
   }
   function zoomY(factor) {
@@ -2684,7 +2716,8 @@ function attachAxisZoom(gd) {
     ) {
       const xa = gd._fullLayout.xaxis;
       const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
-      const yUpd = yRangeForVisibleX(Math.min(a, b), Math.max(a, b));
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      const yUpd = Object.assign(yRangeForVisibleX(lo, hi), volRangeForVisibleX(lo, hi));
       if (Object.keys(yUpd).length) {
         fittingY = true;
         Plotly.relayout(gd, yUpd).then(() => { fittingY = false; });
@@ -2810,6 +2843,16 @@ _SMA_BARS = 9
 _EMA_BARS = 27
 _SMA_COLOR = "#2962ff"  # blue, like TradingView's default MA
 _EMA_COLOR = "#f5f5f5"  # white
+# Volume: time-series bars + SMA so a spike is "supported" when the
+# bar is taller than recent average; profile on the price axis shows
+# where that volume actually traded.
+_VOL_SMA_BARS = 20
+_VOL_SMA_COLOR = "#ff9800"
+_VOL_UP_DIM = "rgba(8, 153, 129, 0.28)"
+_VOL_DOWN_DIM = "rgba(242, 54, 69, 0.28)"
+_VOL_PROFILE = "rgba(41, 98, 255, 0.30)"
+_VOL_PROFILE_POC = "rgba(41, 98, 255, 0.62)"
+_TODAY_CHART_HEIGHT = 580
 
 
 def _five_min_bars(series: list[dict], today: date) -> list[dict]:
@@ -2844,6 +2887,197 @@ def _is_regular_bar_ts(ts: datetime) -> bool:
         return False
     t = ts.time()
     return daily_moves_store.MARKET_OPEN <= t < daily_moves_store.MARKET_CLOSE
+
+
+def _fmt_volume(v: float) -> str:
+    """Compact volume label (1.2M / 340.5K / 870)."""
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if av >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    return f"{v:.0f}"
+
+
+def _rolling_mean(
+    values: list[float | None], period: int,
+) -> list[float | None]:
+    """SMA over ``period`` points; ``None`` until the window is full.
+
+    Missing slots are treated as 0 so a gap doesn't kill the average.
+    """
+    if period <= 0:
+        return [None] * len(values)
+    out: list[float | None] = [None] * len(values)
+    running = 0.0
+    for i, raw in enumerate(values):
+        running += float(raw or 0.0)
+        if i >= period:
+            running -= float(values[i - period] or 0.0)
+        if i >= period - 1:
+            out[i] = running / period
+    return out
+
+
+def _volume_profile_bins(
+    bars: list[dict], *, y_lo: float, y_hi: float, n_bins: int = 28,
+) -> list[dict]:
+    """Volume-at-price bins. Each bar's volume is split across the
+    price bins its [low, high] range covers.
+    """
+    if n_bins <= 0 or y_hi <= y_lo:
+        return []
+    width = (y_hi - y_lo) / n_bins
+    vols = [0.0] * n_bins
+    for b in bars:
+        try:
+            v = float(b["v"])
+            lo = float(b["l"])
+            hi = float(b["h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if v <= 0 or hi < y_lo or lo > y_hi:
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        i0 = int((lo - y_lo) / width)
+        i1 = int((hi - y_lo) / width)
+        i0 = max(0, min(n_bins - 1, i0))
+        i1 = max(0, min(n_bins - 1, i1))
+        if i1 < i0:
+            i0, i1 = i1, i0
+        share = v / (i1 - i0 + 1)
+        for i in range(i0, i1 + 1):
+            vols[i] += share
+    return [
+        {"price": y_lo + (i + 0.5) * width, "v": vols[i], "width": width}
+        for i in range(n_bins)
+        if vols[i] > 0
+    ]
+
+
+def _add_volume_layers(
+    fig: go.Figure,
+    bars: list[dict],
+    *,
+    today_bars: list[dict],
+    y_lo: float,
+    y_hi: float,
+) -> bool:
+    """Volume histogram (row 2) + Y-axis profile on the price pane.
+
+    Bright volume bars are above the 20-bar average (the move has
+    participation); faded bars are below it. Returns True when any
+    volume was plotted.
+    """
+    vols = [b.get("v") for b in bars]
+    if not any(v is not None and v > 0 for v in vols):
+        return False
+    sma = _rolling_mean(
+        [float(v) if v is not None else 0.0 for v in vols],
+        _VOL_SMA_BARS,
+    )
+    colors: list[str] = []
+    hovers: list[str] = []
+    ys: list[float] = []
+    for b, avg in zip(bars, sma):
+        v = float(b["v"]) if b.get("v") is not None else 0.0
+        ys.append(v)
+        up = float(b["c"]) >= float(b["o"])
+        supported = avg is not None and v > avg
+        if up:
+            colors.append(_TV_UP if supported else _VOL_UP_DIM)
+        else:
+            colors.append(_TV_DOWN if supported else _VOL_DOWN_DIM)
+        ratio = (
+            f"  ·  {v / avg:.1f}× avg" if avg and avg > 0 else ""
+        )
+        hovers.append(
+            f"Vol {_fmt_volume(v)}{ratio}"
+            + ("  ·  supported" if supported else "  ·  light")
+        )
+    fig.add_trace(
+        go.Bar(
+            x=[b["ts"] for b in bars],
+            y=ys,
+            marker=dict(color=colors),
+            width=4 * 60 * 1000,
+            name="Volume",
+            text=hovers,
+            hovertemplate="%{text}  ·  %{x|%b %d %H:%M}<extra></extra>",
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+    if any(v is not None for v in sma):
+        fig.add_trace(
+            go.Scatter(
+                x=[b["ts"] for b in bars],
+                y=sma,
+                mode="lines",
+                name=f"Vol SMA {_VOL_SMA_BARS}",
+                line=dict(color=_VOL_SMA_COLOR, width=1.2),
+                hovertemplate=(
+                    f"Vol SMA {_VOL_SMA_BARS}  <b>%{{y:,.0f}}</b>"
+                    "  ·  %{x|%b %d %H:%M}<extra></extra>"
+                ),
+                showlegend=True,
+            ),
+            row=2, col=1,
+        )
+
+    profile = _volume_profile_bins(today_bars, y_lo=y_lo, y_hi=y_hi)
+    if profile:
+        poc = max(profile, key=lambda p: p["v"])
+        fig.add_trace(go.Bar(
+            x=[p["v"] for p in profile],
+            y=[p["price"] for p in profile],
+            orientation="h",
+            width=[p["width"] * 0.92 for p in profile],
+            marker=dict(
+                color=[
+                    _VOL_PROFILE_POC if p is poc else _VOL_PROFILE
+                    for p in profile
+                ],
+            ),
+            xaxis="x2",
+            yaxis="y",
+            hovertemplate=(
+                "Profile  <b>%{x:,.0f}</b> @ $%{y:,.2f}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+        fig.add_annotation(
+            x=0.0, xref="x2", xanchor="left",
+            y=poc["price"], yref="y",
+            text=f"POC {_fmt_volume(poc['v'])}",
+            showarrow=False,
+            font=dict(size=10, color=_SMA_COLOR),
+            bgcolor="rgba(19, 23, 34, 0.55)",
+            borderpad=2,
+        )
+        fig.update_layout(xaxis2=dict(
+            overlaying="x",
+            side="top",
+            range=[0, poc["v"] * 4.0],
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            fixedrange=True,
+            showspikes=False,
+        ))
+    fig.update_yaxes(
+        title=dict(text="Vol", font=dict(size=10, color=_TV_MUTED)),
+        rangemode="tozero",
+        fixedrange=True,
+        showgrid=False,
+        zeroline=False,
+        color=_TV_MUTED,
+        tickfont=dict(size=10),
+        showspikes=False,
+        row=2, col=1,
+    )
+    return True
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2894,6 +3128,11 @@ def _history_5min_bars(
             continue
         by_ts[b["ts"]] = b
     for b in _five_min_bars(series, today):
+        prev = by_ts.get(b["ts"])
+        # Live ticks replace OHLC but keep Robinhood volume so the
+        # developing candle still has a participation read.
+        if prev is not None and prev.get("v") is not None:
+            b = {**b, "v": prev["v"]}
         by_ts[b["ts"]] = b
     return [by_ts[k] for k in sorted(by_ts)]
 
@@ -3025,20 +3264,38 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "Drag the plot to move. Drag the bottom (time) axis to zoom — "
         "zoom out (or pan left) to see prior sessions, as far as the "
         "loaded history goes. Drag the right (price) axis to zoom "
-        "price. Double-click to reset."
+        "price. Double-click to reset. Volume bars: **bright** = "
+        "above the 20-bar average (move is supported); **faded** = "
+        "light participation. The left-side profile is today's "
+        "volume-at-price; the bright bin is the POC."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
     today_bars = [b for b in bars5 if b["ts"].date() == today]
     prior_bars = [b for b in bars5 if b["ts"].date() < today]
+    has_vol_data = any(
+        b.get("v") is not None and float(b["v"]) > 0 for b in bars5
+    )
+    chart_h = _TODAY_CHART_HEIGHT if has_vol_data else 480
 
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2 if has_vol_data else 1, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.76, 0.24] if has_vol_data else [1.0],
+        specs=(
+            [[{"secondary_y": True}], [{"secondary_y": False}]]
+            if has_vol_data else
+            [[{"secondary_y": True}]]
+        ),
+    )
     if ref:
         fig.add_hline(
             y=ref, line_color=_TV_MUTED, line_width=1, line_dash="dot",
             annotation_text=f"prev close {ref:,.2f} ({ref_src})",
             annotation_position="top left",
             annotation_font=dict(size=11, color=_TV_MUTED),
+            row=1, col=1,
         )
 
     if use_candles:
@@ -3057,7 +3314,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             ),
             whiskerwidth=0.4,
             showlegend=False,
-        ))
+        ), row=1, col=1)
     else:
         if prior_bars:
             fig.add_trace(go.Scatter(
@@ -3070,7 +3327,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                     "<b>$%{y:,.2f}</b>  ·  %{x|%b %d %H:%M}<extra></extra>"
                 ),
                 showlegend=False,
-            ))
+            ), row=1, col=1)
         if ref:
             # Invisible baseline sharing the price trace's x-grid — the
             # price trace fills to it, tinting the gap vs prev close
@@ -3079,7 +3336,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 x=xs, y=[ref] * len(xs),
                 mode="lines", line=dict(width=0),
                 hoverinfo="skip", showlegend=False,
-            ))
+            ), row=1, col=1)
         # Pre-formatted in Python: plotly can't apply d3 number formats
         # to customdata columns once the array mixes floats and strings.
         hover_notes = [
@@ -3099,7 +3356,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 "<b>$%{y:,.2f}</b>  %{text}  ·  %{x|%H:%M:%S}<extra></extra>"
             ),
             showlegend=False,
-        ))
+        ), row=1, col=1)
 
     # SMA 9 / EMA 27 on every plotted 5-minute close — history is on
     # the chart so the MAs exist from today's open without a hidden
@@ -3129,7 +3386,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 "<extra></extra>"
             ),
             showlegend=True,
-        ))
+        ), row=1, col=1)
         ma_values.extend(v for v in curve if v is not None)
     if not prior_bars and not prior_closes and any(v is None for v in ema_ys):
         st.caption(
@@ -3175,7 +3432,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             cliponaxis=False,
             hovertemplate=hover,
             showlegend=False,
-        ))
+        ), row=1, col=1)
 
     # Last price: dotted ray across the pane + right-axis box with
     # the live print and MM:SS left on this 5-minute candle.
@@ -3187,6 +3444,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         color=line_color,
         price_label=price_label,
         timer_label=_fmt_mmss((bar_close - now).total_seconds()),
+        row=1,
     )
 
     # Default Y fits today's session (plus MAs in that window) so a
@@ -3206,26 +3464,38 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
 
+    has_volume = False
+    if has_vol_data:
+        has_volume = _add_volume_layers(
+            fig, bars5, today_bars=today_bars, y_lo=y_lo, y_hi=y_hi,
+        )
+    if not has_volume:
+        st.caption(
+            "Volume needs Robinhood 5-minute bars (login) — the "
+            "histogram and profile stay empty until those load."
+        )
+    show_leg = bool(ma_values or has_volume)
+
     # Left axis mirrors the same price range as % vs prev close so you
     # can read the move at a glance without hovering. No second grid —
     # only the $ axis draws gridlines.
     layout_kw: dict = dict(
         title=f"{ticker} — {today:%a %b %d} regular session",
-        height=480,
+        height=chart_h,
         hovermode="x",
-        showlegend=bool(ma_values),
+        showlegend=show_leg,
         legend=dict(
             orientation="h",
             yanchor="bottom", y=1.02,
             xanchor="right", x=1.0,
             font=dict(size=11, color=_TV_TEXT),
             bgcolor="rgba(19, 23, 34, 0.6)",
-        ) if ma_values else dict(font=dict(color=_TV_TEXT)),
+        ) if show_leg else dict(font=dict(color=_TV_TEXT)),
         margin=dict(
-            t=56 if ma_values else 48,
+            t=56 if show_leg else 48,
             l=56 if ref else 10,
             r=80,
-            b=52,
+            b=56,
         ),
         xaxis=dict(
             range=[session_open, session_close],
@@ -3284,9 +3554,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
+    fig.update_xaxes(rangeslider_visible=False)
     _plotly_interactive_price_chart(
         fig,
-        height=480,
+        height=chart_h,
         persist_key=f"px-{ticker}-5min",
         ref_price=ref,
         last_price=last_price,
@@ -3405,7 +3676,7 @@ def _rh_bar_local_ts(begins_at: str, *, interval: str) -> datetime:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_rh_ohlc(ticker: str, interval: str, span: str) -> list[dict]:
-    """Normalized ``{ts, o, h, l, c}`` bars in naive ET, oldest first."""
+    """Normalized ``{ts, o, h, l, c, v}`` bars in naive ET, oldest first."""
     if not _rh_market_data_ready():
         return []
     import robin_stocks.robinhood as rh
@@ -3422,12 +3693,18 @@ def _fetch_rh_ohlc(ticker: str, interval: str, span: str) -> list[dict]:
         begins = c.get("begins_at") or ""
         try:
             ts = _rh_bar_local_ts(begins, interval=interval)
+            vol_raw = c.get("volume")
+            try:
+                vol = float(vol_raw) if vol_raw is not None else None
+            except (TypeError, ValueError):
+                vol = None
             out.append({
                 "ts": ts,
                 "o": float(c["open_price"]),
                 "h": float(c["high_price"]),
                 "l": float(c["low_price"]),
                 "c": float(c["close_price"]),
+                "v": vol,
             })
         except (TypeError, ValueError, KeyError):
             continue
@@ -4453,7 +4730,9 @@ st.caption(
     "**Drag the chart to pan.** Drag the **time axis** (bottom) to "
     "zoom — zoom out or pan left to see prior sessions, not just "
     "today. Drag the **price axis** (right) to zoom price. "
-    "Double-click a chart to reset. "
+    "Volume under the candles (vs its 20-bar average) shows whether "
+    "a move had participation; the **volume profile** on the left "
+    "is today's volume-at-price. Double-click a chart to reset. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
