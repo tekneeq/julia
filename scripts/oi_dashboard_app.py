@@ -2512,7 +2512,15 @@ def _attach_last_price_line(
 # Interactive price-chart shell: pan the pane, drag axes to zoom.
 # Placeholders are swapped in by ``_plotly_interactive_price_chart``.
 _PRICE_CHART_HTML = """
+<div style="position:relative;width:100%;">
+<button id="__UID__-reset" type="button"
+  style="position:absolute;z-index:5;top:6px;left:8px;padding:3px 10px;
+         font:12px/1.3 sans-serif;color:#d1d4dc;background:#1e222d;
+         border:1px solid #363a45;border-radius:4px;cursor:pointer;">
+  __RESET_LABEL__
+</button>
 <div id="__UID__" style="width:100%;height:__HEIGHT__px;touch-action:none;"></div>
+</div>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script>
 const fig = __FIG__;
@@ -2526,12 +2534,23 @@ const anchorPrice = __ANCHOR_PRICE__;
 fig.layout = fig.layout || {};
 fig.layout.dragmode = "pan";
 fig.layout.uirevision = persistKey;
+const homeX = (fig.layout.xaxis && fig.layout.xaxis.range)
+  ? fig.layout.xaxis.range.slice() : null;
+const homeY = (fig.layout.yaxis && fig.layout.yaxis.range)
+  ? fig.layout.yaxis.range.slice() : null;
+let alive = true;
+window.addEventListener("pagehide", () => { alive = false; });
 
 function store() {
   try { return window.parent && window.parent.sessionStorage
     ? window.parent.sessionStorage : window.sessionStorage; } catch (e) { return null; }
 }
+function clearRanges() {
+  const s = store();
+  if (s) try { s.removeItem(persistKey); } catch (e) {}
+}
 function saveRanges(gd) {
+  if (!alive) return;
   const s = store();
   if (!s || !gd._fullLayout || !gd._fullLayout.xaxis) return;
   try {
@@ -2545,6 +2564,32 @@ function loadRanges() {
   const s = store();
   if (!s) return null;
   try { return JSON.parse(s.getItem(persistKey) || "null"); } catch (e) { return null; }
+}
+function isViewRelayout(ev) {
+  if (!ev) return false;
+  return ev["xaxis.range[0]"] != null || ev["xaxis.range"] != null
+    || ev["xaxis.range[1]"] != null
+    || ev["yaxis.range[0]"] != null || ev["yaxis.range"] != null
+    || ev["yaxis.range[1]"] != null;
+}
+function homeUpdate() {
+  const upd = {};
+  if (homeX) upd["xaxis.range"] = homeX;
+  if (homeY) {
+    upd["yaxis.range"] = homeY;
+    if (refPrice) {
+      upd["yaxis2.range"] = [
+        (homeY[0] - refPrice) / refPrice * 100,
+        (homeY[1] - refPrice) / refPrice * 100
+      ];
+    }
+  }
+  return upd;
+}
+function resetHome(gd) {
+  clearRanges();
+  const upd = homeUpdate();
+  if (Object.keys(upd).length) Plotly.relayout(gd, upd);
 }
 function pad(n) { return String(n).padStart(2, "0"); }
 function remaining() {
@@ -2564,11 +2609,11 @@ function attachAxisZoom(gd) {
     if (!xa || !ya) return null;
     const x0 = xa._offset, x1 = xa._offset + xa._length;
     const y0 = ya._offset, y1 = ya._offset + ya._length;
-    const pad = 16;
-    // Time-axis strip sits under the bottom pane (volume, if present).
-    const bottomAx = gd._fullLayout.yaxis3 || ya;
-    const bottom = bottomAx._offset + bottomAx._length;
-    if (px >= x0 && px <= x1 && py >= bottom - pad && py <= gd._fullLayout.height) return "x";
+    const pad = 28;
+    // Anything below the price pane (volume strip + time labels) is
+    // time-axis zoom — the old 16px strip was too easy to miss, and
+    // a miss panned the chart into prior sessions.
+    if (px >= x0 && px <= x1 && py >= y1 - 8 && py <= gd._fullLayout.height) return "x";
     if (py >= y0 && py <= y1 && px >= x1 - pad && px <= gd._fullLayout.width) return "y";
     return null;
   }
@@ -2639,6 +2684,8 @@ function attachAxisZoom(gd) {
     const xa = gd._fullLayout.xaxis;
     const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
     const right = Math.max(a, b);
+    if (factor > 1.12) factor = 1.12;
+    if (factor < 1 / 1.12) factor = 1 / 1.12;
     let span = Math.abs(b - a) * factor;
     if (span < 10 * 60 * 1000) span = 10 * 60 * 1000;
     const left = right - span;
@@ -2690,10 +2737,10 @@ function attachAxisZoom(gd) {
     const xa = gd._fullLayout.xaxis, ya = gd._fullLayout.yaxis;
     if (mode === "x" && xa) {
       const dx = t.clientX - lastX;
-      zoomX(Math.exp(dx / Math.max(xa._length, 1) * 1.8));
+      zoomX(Math.exp(dx / Math.max(xa._length, 1) * 0.7));
     } else if (mode === "y" && ya) {
       const dy = t.clientY - lastY;
-      zoomY(Math.exp(dy / Math.max(ya._length, 1) * 1.8));
+      zoomY(Math.exp(dy / Math.max(ya._length, 1) * 1.2));
     }
     lastX = t.clientX;
     lastY = t.clientY;
@@ -2709,6 +2756,7 @@ function attachAxisZoom(gd) {
   window.addEventListener("touchend", onUp);
   let fittingY = false;
   gd.on("plotly_relayout", (ev) => {
+    if (!alive) return;
     if (
       !fittingY
       && ev
@@ -2723,19 +2771,27 @@ function attachAxisZoom(gd) {
         Plotly.relayout(gd, yUpd).then(() => { fittingY = false; });
       }
     }
-    saveRanges(gd);
+    // Skip annotation-only ticks so a dying iframe cannot overwrite
+    // a newer view with a stale multi-day range on refresh.
+    if (isViewRelayout(ev)) saveRanges(gd);
   });
-  gd.on("plotly_doubleclick", () => {
-    const s = store();
-    if (s) try { s.removeItem(persistKey); } catch (e) {}
-  });
+  gd.on("plotly_doubleclick", () => { resetHome(gd); });
+  const resetBtn = document.getElementById("__UID__-reset");
+  if (resetBtn) {
+    if (!homeX && !homeY) resetBtn.style.display = "none";
+    else resetBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      resetHome(gd);
+    });
+  }
 }
 
 Plotly.newPlot(el, fig.data, fig.layout, {
   responsive: true,
   displayModeBar: false,
   scrollZoom: false,
-  doubleClick: "reset"
+  doubleClick: false
 }).then(gd => {
   const saved = loadRanges();
   const apply = saved
@@ -2753,6 +2809,7 @@ Plotly.newPlot(el, fig.data, fig.layout, {
     attachAxisZoom(gd);
     if (priceLabel && annIdx >= 0 && barCloseMs) {
       function tick() {
+        if (!alive) return;
         Plotly.relayout(gd, {["annotations[" + annIdx + "].text"]: tag()});
       }
       tick();
@@ -2774,6 +2831,7 @@ def _plotly_interactive_price_chart(
     bar_close_ms: int | None = None,
     price_label: str | None = None,
     annotation_index: int | None = None,
+    reset_label: str = "Reset view",
 ) -> None:
     """Pan the pane; drag the X/Y axes to zoom. Timer optional."""
     fig.update_layout(
@@ -2803,6 +2861,7 @@ def _plotly_interactive_price_chart(
             "__ANCHOR_PRICE__",
             "null" if last_price is None else f"{float(last_price):.6f}",
         )
+        .replace("__RESET_LABEL__", reset_label)
     )
     components.html(html, height=height + 10)
 
@@ -3296,20 +3355,33 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                     "`./restart-price-poller.sh --status`."
                 )
 
-    view = st.radio(
-        "Chart view",
-        ["5-min candles", "Tick line"],
-        horizontal=True,
-        key=f"today_chart_view_{ticker}",
-        label_visibility="collapsed",
-    )
+    ctl, rst = st.columns([4, 1])
+    with ctl:
+        view = st.radio(
+            "Chart view",
+            ["5-min candles", "Tick line"],
+            horizontal=True,
+            key=f"today_chart_view_{ticker}",
+            label_visibility="collapsed",
+        )
+    with rst:
+        if st.button(
+            "Reset to today",
+            key=f"today_reset_{ticker}",
+            help="Restore today's regular session and the default price scale.",
+        ):
+            st.session_state[f"px_reset_{ticker}"] = (
+                int(st.session_state.get(f"px_reset_{ticker}", 0)) + 1
+            )
+    reset_n = int(st.session_state.get(f"px_reset_{ticker}", 0))
     st.caption(
-        "Drag the plot to move. Drag the bottom (time) axis to zoom — "
-        "zoom out (or pan left) to see prior sessions, as far as the "
-        "loaded history goes. Drag the right (price) axis to zoom "
-        "price. Double-click to reset. The **histogram on the $ "
-        "axis** is volume-at-price (longest bar = most volume / "
-        "POC). The strip under the candles is volume-over-time: "
+        "Drag the plot to move. Drag the **volume strip or time "
+        "labels** (under the candles) to zoom time — zoom out or "
+        "pan left for prior sessions. Drag the right (price) axis "
+        "to zoom price. **Reset to today** (or double-click) "
+        "returns to this session. The **histogram on the $ axis** "
+        "is volume-at-price (longest bar = most volume / POC). "
+        "The strip under the candles is volume-over-time: "
         "**bright** = above the 20-bar average, **faded** = light."
     )
     use_candles = view == "5-min candles"
@@ -3611,12 +3683,13 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     _plotly_interactive_price_chart(
         fig,
         height=chart_h,
-        persist_key=f"px-{ticker}-5min",
+        persist_key=f"px-{ticker}-5min-r{reset_n}",
         ref_price=ref,
         last_price=last_price,
         bar_close_ms=_naive_et_epoch_ms(bar_close),
         price_label=price_label,
         annotation_index=timer_ann,
+        reset_label="Reset to today",
     )
     if extreme_probs is not None:
         fresh = []
@@ -4786,7 +4859,8 @@ st.caption(
     "The **volume profile sits on the $ / Y axis** — longest bar "
     "is the price with the most volume (POC). The strip under the "
     "candles is volume-over-time vs its 20-bar average. "
-    "Double-click a chart to reset. "
+    "**Reset to today** (or double-click) restores this session "
+    "after you pan or zoom. "
     "Fed by the dedicated price poller (`scripts/price_poller.py`, "
     "~5s cadence — its own loop, independent of the 30-minute OI "
     "scheduler); the dashboard auto-refreshes every 5s to match. "
