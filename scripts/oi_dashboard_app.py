@@ -2534,10 +2534,23 @@ const anchorPrice = __ANCHOR_PRICE__;
 fig.layout = fig.layout || {};
 fig.layout.dragmode = "pan";
 fig.layout.uirevision = persistKey;
-const homeX = (fig.layout.xaxis && fig.layout.xaxis.range)
-  ? fig.layout.xaxis.range.slice() : null;
-const homeY = (fig.layout.yaxis && fig.layout.yaxis.range)
-  ? fig.layout.yaxis.range.slice() : null;
+const homeX = __HOME_X__ || (fig.layout.xaxis && fig.layout.xaxis.range
+  ? fig.layout.xaxis.range.slice() : null);
+const homeY = __HOME_Y__ || (fig.layout.yaxis && fig.layout.yaxis.range
+  ? fig.layout.yaxis.range.slice() : null);
+// Candlestick + shared subplot axes will autorange to ALL loaded
+// history (a month of empty calendar) unless every xaxis is pinned.
+if (homeX) {
+  ["xaxis", "xaxis2", "xaxis3"].forEach(k => {
+    if (!fig.layout[k]) return;
+    fig.layout[k].range = homeX;
+    fig.layout[k].autorange = false;
+  });
+}
+if (homeY && fig.layout.yaxis) {
+  fig.layout.yaxis.range = homeY;
+  fig.layout.yaxis.autorange = false;
+}
 let alive = true;
 window.addEventListener("pagehide", () => { alive = false; });
 
@@ -2554,8 +2567,10 @@ function saveRanges(gd) {
   const s = store();
   if (!s || !gd._fullLayout || !gd._fullLayout.xaxis) return;
   try {
+    const x = gd._fullLayout.xaxis.range;
+    if (spanMs(x) > MAX_RESTORE_MS) return;
     s.setItem(persistKey, JSON.stringify({
-      x: gd._fullLayout.xaxis.range,
+      x: x,
       y: gd._fullLayout.yaxis.range
     }));
   } catch (e) {}
@@ -2572,11 +2587,26 @@ function isViewRelayout(ev) {
     || ev["yaxis.range[0]"] != null || ev["yaxis.range"] != null
     || ev["yaxis.range[1]"] != null;
 }
+function spanMs(range) {
+  if (!range || range.length < 2) return Infinity;
+  const a = +new Date(range[0]), b = +new Date(range[1]);
+  if (!isFinite(a) || !isFinite(b)) return Infinity;
+  return Math.abs(b - a);
+}
+// Ignore persisted windows wider than ~1.5 sessions. A month-long
+// save is what made Reset look like a no-op (today stayed a sliver).
+const MAX_RESTORE_MS = 36 * 3600 * 1000;
 function homeUpdate() {
   const upd = {};
-  if (homeX) upd["xaxis.range"] = homeX;
+  if (homeX) {
+    upd["xaxis.range"] = homeX;
+    upd["xaxis.autorange"] = false;
+    upd["xaxis2.range"] = homeX;
+    upd["xaxis2.autorange"] = false;
+  }
   if (homeY) {
     upd["yaxis.range"] = homeY;
+    upd["yaxis.autorange"] = false;
     if (refPrice) {
       upd["yaxis2.range"] = [
         (homeY[0] - refPrice) / refPrice * 100,
@@ -2794,17 +2824,25 @@ Plotly.newPlot(el, fig.data, fig.layout, {
   doubleClick: false
 }).then(gd => {
   const saved = loadRanges();
-  const apply = saved
-    ? Plotly.relayout(gd, Object.assign(
-        {"xaxis.range": saved.x, "yaxis.range": saved.y},
-        (refPrice && saved.y && gd._fullLayout.yaxis2)
-          ? {"yaxis2.range": [
-              (saved.y[0] - refPrice) / refPrice * 100,
-              (saved.y[1] - refPrice) / refPrice * 100
-            ]}
-          : {}
-      ))
-    : Promise.resolve();
+  const tight = saved && spanMs(saved.x) <= MAX_RESTORE_MS;
+  const apply = Plotly.relayout(gd, Object.assign(
+    homeUpdate(),
+    (tight && saved.x) ? {
+      "xaxis.range": saved.x,
+      "xaxis2.range": saved.x,
+      "xaxis.autorange": false,
+      "xaxis2.autorange": false
+    } : {},
+    (tight && saved.y) ? {
+      "yaxis.range": saved.y,
+      ...(refPrice && gd._fullLayout.yaxis2 ? {
+        "yaxis2.range": [
+          (saved.y[0] - refPrice) / refPrice * 100,
+          (saved.y[1] - refPrice) / refPrice * 100
+        ]
+      } : {})
+    } : {}
+  ));
   return apply.then(() => {
     attachAxisZoom(gd);
     if (priceLabel && annIdx >= 0 && barCloseMs) {
@@ -2832,6 +2870,8 @@ def _plotly_interactive_price_chart(
     price_label: str | None = None,
     annotation_index: int | None = None,
     reset_label: str = "Reset view",
+    home_x: tuple[datetime, datetime] | None = None,
+    home_y: tuple[float, float] | None = None,
 ) -> None:
     """Pan the pane; drag the X/Y axes to zoom. Timer optional."""
     fig.update_layout(
@@ -2841,6 +2881,17 @@ def _plotly_interactive_price_chart(
     )
     spec = fig.to_json()
     uid = f"tv-live-{persist_key}"
+    if home_x is None:
+        home_x_js = "null"
+    else:
+        home_x_js = json.dumps([
+            home_x[0].replace(microsecond=0).isoformat(sep=" "),
+            home_x[1].replace(microsecond=0).isoformat(sep=" "),
+        ])
+    home_y_js = (
+        "null" if home_y is None
+        else json.dumps([float(home_y[0]), float(home_y[1])])
+    )
     html = (
         _PRICE_CHART_HTML
         .replace("__UID__", uid)
@@ -2862,6 +2913,8 @@ def _plotly_interactive_price_chart(
             "null" if last_price is None else f"{float(last_price):.6f}",
         )
         .replace("__RESET_LABEL__", reset_label)
+        .replace("__HOME_X__", home_x_js)
+        .replace("__HOME_Y__", home_y_js)
     )
     components.html(html, height=height + 10)
 
@@ -3623,6 +3676,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             b=56,
         ),
         xaxis=dict(
+            autorange=False,
             range=[session_open, session_close],
             # Let Plotly pick tick spacing as the window grows from
             # one session to weeks; labels pick up the date when the
@@ -3679,17 +3733,29 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     fig.update_layout(**_tv_layout(**layout_kw))
-    fig.update_xaxes(rangeslider_visible=False)
+    # Pin EVERY subplot x-axis. shared_xaxes still leaves the candle
+    # pane free to autorange across the full month of bars.
+    fig.update_xaxes(
+        autorange=False,
+        range=[session_open, session_close],
+        rangeslider_visible=False,
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[16, 9.5], pattern="hour"),
+        ],
+    )
     _plotly_interactive_price_chart(
         fig,
         height=chart_h,
-        persist_key=f"px-{ticker}-5min-r{reset_n}",
+        persist_key=f"px-{ticker}-5min-t{reset_n}",
         ref_price=ref,
         last_price=last_price,
         bar_close_ms=_naive_et_epoch_ms(bar_close),
         price_label=price_label,
         annotation_index=timer_ann,
         reset_label="Reset to today",
+        home_x=(session_open, session_close),
+        home_y=(y_lo, y_hi),
     )
     if extreme_probs is not None:
         fresh = []
