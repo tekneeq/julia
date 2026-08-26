@@ -2538,10 +2538,11 @@ const homeX = __HOME_X__ || (fig.layout.xaxis && fig.layout.xaxis.range
   ? fig.layout.xaxis.range.slice() : null);
 const homeY = __HOME_Y__ || (fig.layout.yaxis && fig.layout.yaxis.range
   ? fig.layout.yaxis.range.slice() : null);
+const homeVolHi = __HOME_VOL_HI__;
 // Candlestick + shared subplot axes will autorange to ALL loaded
 // history (a month of empty calendar) unless every xaxis is pinned.
 if (homeX) {
-  ["xaxis", "xaxis2", "xaxis3"].forEach(k => {
+  ["xaxis", "xaxis2"].forEach(k => {
     if (!fig.layout[k]) return;
     fig.layout[k].range = homeX;
     fig.layout[k].autorange = false;
@@ -2550,6 +2551,10 @@ if (homeX) {
 if (homeY && fig.layout.yaxis) {
   fig.layout.yaxis.range = homeY;
   fig.layout.yaxis.autorange = false;
+}
+if (homeVolHi && fig.layout.yaxis3) {
+  fig.layout.yaxis3.range = [0, homeVolHi];
+  fig.layout.yaxis3.autorange = false;
 }
 let alive = true;
 window.addEventListener("pagehide", () => { alive = false; });
@@ -2614,6 +2619,10 @@ function homeUpdate() {
       ];
     }
   }
+  if (homeVolHi) {
+    upd["yaxis3.range"] = [0, homeVolHi];
+    upd["yaxis3.autorange"] = false;
+  }
   return upd;
 }
 function resetHome(gd) {
@@ -2631,6 +2640,30 @@ function tag() { return priceLabel + "<br>" + remaining(); }
 
 function lin(ax, v) { return +ax.r2l(v); }
 function unlin(ax, v) { return ax.l2r(v); }
+
+function volDisplayHi(vals) {
+  const xs = vals.filter(v => isFinite(v) && v > 0).sort((a, b) => a - b);
+  if (!xs.length) return 0;
+  const i = Math.min(xs.length - 1, Math.max(0, Math.floor(xs.length * 0.92)));
+  return Math.max(xs[i] * 1.12, xs[0] * 2);
+}
+function volRangeForVisibleX(gd, xLinLo, xLinHi) {
+  const xa = gd._fullLayout && gd._fullLayout.xaxis;
+  if (!xa || !gd._fullLayout.yaxis3) return {};
+  const vals = [];
+  for (const t of gd.data || []) {
+    if (!t || t.type !== "bar" || t.orientation === "h") continue;
+    const xs = t.x || [], ys = t.y || [];
+    for (let i = 0; i < xs.length; i++) {
+      const xv = lin(xa, xs[i]);
+      if (!isFinite(xv) || xv < xLinLo || xv > xLinHi) continue;
+      vals.push(+ys[i]);
+    }
+  }
+  const hi = volDisplayHi(vals);
+  if (hi <= 0) return {};
+  return {"yaxis3.range": [0, hi], "yaxis3.autorange": false};
+}
 
 function attachAxisZoom(gd) {
   let mode = null, lastX = 0, lastY = 0;
@@ -2691,25 +2724,6 @@ function attachAxisZoom(gd) {
     }
     return upd;
   }
-  function volRangeForVisibleX(xLinLo, xLinHi) {
-    const xa = gd._fullLayout.xaxis;
-    if (!gd._fullLayout.yaxis3) return {};
-    let hi = 0;
-    for (const t of gd.data || []) {
-      if (!t || t.type !== "bar") continue;
-      const ay = t.yaxis || "y";
-      if (ay !== "y3") continue;
-      const xs = t.x || [], ys = t.y || [];
-      for (let i = 0; i < xs.length; i++) {
-        const xv = lin(xa, xs[i]);
-        if (!isFinite(xv) || xv < xLinLo || xv > xLinHi) continue;
-        const n = +ys[i];
-        if (isFinite(n) && n > hi) hi = n;
-      }
-    }
-    if (hi <= 0) return {};
-    return {"yaxis3.range": [0, hi * 1.15]};
-  }
   function zoomX(factor) {
     const xa = gd._fullLayout.xaxis;
     const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
@@ -2722,7 +2736,7 @@ function attachAxisZoom(gd) {
     Plotly.relayout(gd, Object.assign(
       {"xaxis.range": [unlin(xa, left), unlin(xa, right)]},
       yRangeForVisibleX(left, right),
-      volRangeForVisibleX(left, right)
+      volRangeForVisibleX(gd, left, right)
     ));
   }
   function zoomY(factor) {
@@ -2795,7 +2809,7 @@ function attachAxisZoom(gd) {
       const xa = gd._fullLayout.xaxis;
       const a = lin(xa, xa.range[0]), b = lin(xa, xa.range[1]);
       const lo = Math.min(a, b), hi = Math.max(a, b);
-      const yUpd = Object.assign(yRangeForVisibleX(lo, hi), volRangeForVisibleX(lo, hi));
+      const yUpd = Object.assign(yRangeForVisibleX(lo, hi), volRangeForVisibleX(gd, lo, hi));
       if (Object.keys(yUpd).length) {
         fittingY = true;
         Plotly.relayout(gd, yUpd).then(() => { fittingY = false; });
@@ -2845,6 +2859,12 @@ Plotly.newPlot(el, fig.data, fig.layout, {
   ));
   return apply.then(() => {
     attachAxisZoom(gd);
+    const xa0 = gd._fullLayout.xaxis;
+    if (xa0 && xa0.range && gd._fullLayout.yaxis3) {
+      const a0 = lin(xa0, xa0.range[0]), b0 = lin(xa0, xa0.range[1]);
+      const vFit = volRangeForVisibleX(gd, Math.min(a0, b0), Math.max(a0, b0));
+      if (Object.keys(vFit).length) Plotly.relayout(gd, vFit);
+    }
     if (priceLabel && annIdx >= 0 && barCloseMs) {
       function tick() {
         if (!alive) return;
@@ -2872,6 +2892,7 @@ def _plotly_interactive_price_chart(
     reset_label: str = "Reset view",
     home_x: tuple[datetime, datetime] | None = None,
     home_y: tuple[float, float] | None = None,
+    home_vol_hi: float | None = None,
 ) -> None:
     """Pan the pane; drag the X/Y axes to zoom. Timer optional."""
     fig.update_layout(
@@ -2915,6 +2936,14 @@ def _plotly_interactive_price_chart(
         .replace("__RESET_LABEL__", reset_label)
         .replace("__HOME_X__", home_x_js)
         .replace("__HOME_Y__", home_y_js)
+        .replace(
+            "__HOME_VOL_HI__",
+            (
+                "null"
+                if home_vol_hi is None or home_vol_hi <= 0
+                else f"{float(home_vol_hi):.6f}"
+            ),
+        )
     )
     components.html(html, height=height + 10)
 
@@ -3011,6 +3040,21 @@ def _fmt_volume(v: float) -> str:
     if av >= 1_000:
         return f"{v / 1_000:.1f}K"
     return f"{v:.0f}"
+
+
+def _volume_display_hi(vols: list[float], *, pct: float = 0.92) -> float:
+    """Y-max for the volume pane so typical bars fill the strip.
+
+    A raw max includes the open/close spike (and any leftover
+    history), which flattens every other bar. Use a high percentile
+    of the given vols; those few taller bars clip at the top.
+    """
+    vals = sorted(v for v in vols if v is not None and v > 0)
+    if not vals:
+        return 1.0
+    idx = int(len(vals) * pct)
+    idx = min(len(vals) - 1, max(0, idx))
+    return max(vals[idx] * 1.12, vals[0] * 2.0)
 
 
 def _rolling_mean(
@@ -3218,8 +3262,17 @@ def _add_volume_layers(
             ),
             row=2, col=1,
         )
+    today_vols = [
+        float(b["v"]) for b in today_bars
+        if b.get("v") is not None and float(b["v"]) > 0
+    ]
+    if not today_vols:
+        today_vols = [float(v) for v in ys if v > 0]
+    vol_hi = _volume_display_hi(today_vols)
     fig.update_yaxes(
         title=dict(text="Vol", font=dict(size=10, color=_TV_MUTED)),
+        autorange=False,
+        range=[0, vol_hi],
         rangemode="tozero",
         fixedrange=True,
         showgrid=False,
@@ -3232,7 +3285,7 @@ def _add_volume_layers(
     poc = _add_volume_profile(
         fig, today_bars, y_lo=y_lo, y_hi=y_hi, x_hover=x_hover,
     )
-    return {"poc": poc}
+    return {"poc": poc, "vol_hi": vol_hi}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -3450,7 +3503,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         rows=2 if has_vol_data else 1, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        row_heights=[0.76, 0.24] if has_vol_data else [1.0],
+        row_heights=[0.70, 0.30] if has_vol_data else [1.0],
         specs=(
             [[{"secondary_y": True}], [{"secondary_y": False}]]
             if has_vol_data else
@@ -3731,6 +3784,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 font=dict(size=11, color=_TV_MUTED),
             ),
         )
+    vol_hi = (vol_info or {}).get("vol_hi")
+    if vol_hi:
+        layout_kw["yaxis3"] = dict(
+            autorange=False,
+            range=[0, float(vol_hi)],
+            rangemode="tozero",
+            fixedrange=True,
+        )
 
     fig.update_layout(**_tv_layout(**layout_kw))
     # Pin EVERY subplot x-axis. shared_xaxes still leaves the candle
@@ -3756,6 +3817,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         reset_label="Reset to today",
         home_x=(session_open, session_close),
         home_y=(y_lo, y_hi),
+        home_vol_hi=(vol_info or {}).get("vol_hi"),
     )
     if extreme_probs is not None:
         fresh = []
