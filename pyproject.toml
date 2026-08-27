@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1.8",
+    "discord>=2.3.2",
     "markupsafe==3.0.2",
     "matplotlib>=3.11.0",
     "numpy>=2.0.2",
@@ -61,9 +62,8 @@ audio = [
     "pydub>=0.25.1",
     "simpleaudio>=1.0.4",
 ]
-# discorder.py / redder.py — Discord + Reddit bot integrations.
+# discorder.py / redder.py — Reddit (Discord is a core dep for the stock bot).
 chat = [
-    "discord>=2.3.2",
     "praw>=7.8.1",
 ]
 # Convenience — pull everything in one go.
@@ -75,7 +75,6 @@ all = [
     "openai>=2.7.2",
     "pydub>=0.25.1",
     "simpleaudio>=1.0.4",
-    "discord>=2.3.2",
     "praw>=7.8.1",
 ]
 
