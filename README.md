@@ -107,6 +107,17 @@ lia cache --clear-ticker SPY
 lia cache --clear-all
 ```
 
+#### Sync Robinhood tradable tickers (sector / industry)
+```bash
+# Populate .options_cache/tickers.db for the dashboard Tickers tab
+# (public Robinhood instruments + fundamentals — no login required)
+lia tickers-sync
+```
+
+The Streamlit dashboard (`scripts/oi_dashboard_app.py`) has a top **Tickers** tab
+that browses this cache Seeking Alpha–style: sector → industry → symbol.
+Use **Sync from Robinhood** on that tab (or `lia tickers-sync`) to refresh.
+
 #### Calculate Implied Move
 ```bash
 lia emove --ticker SPY --days 1,3,5 --confidence 0.68,0.95

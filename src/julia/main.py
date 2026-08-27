@@ -2791,6 +2791,34 @@ def cache(stats, list_cache, clear_all, clear_expired, clear_ticker):
         click.echo(f"  --clear-all      Remove all cached data")
 
 
+@cli.command("tickers-sync")
+@click.option(
+    "--quiet",
+    is_flag=True,
+    help="Only print the final summary line",
+)
+def tickers_sync(quiet):
+    """Refresh the Robinhood tradable-ticker sector/industry cache.
+
+    Pulls the public instruments + fundamentals catalogs (no login) and
+    writes ``.options_cache/tickers.db`` for the dashboard Tickers tab.
+    """
+    from julia.tickers_store import sync_tradable_tickers
+
+    def _progress(stage: str, a: int, b: int) -> None:
+        if quiet:
+            return
+        click.echo(f"  {stage}: {a}/{b}")
+
+    if not quiet:
+        click.echo("Syncing Robinhood tradable tickers (sector/industry)…")
+    stats = sync_tradable_tickers(progress=_progress)
+    click.echo(
+        f"✅ {stats['instruments']} tradable symbols "
+        f"({stats['with_sector']} with sector) · synced {stats['synced_at']}"
+    )
+
+
 def main():
     # Example usage:
     stock_price = 590
