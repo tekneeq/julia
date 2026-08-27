@@ -427,7 +427,16 @@ def run_bot(token: Optional[str] = None) -> None:
             "token in the julia host `.env`."
         )
     client = build_client()
-    client.run(token)
+    try:
+        client.run(token)
+    except discord.errors.PrivilegedIntentsRequired as e:
+        raise SystemExit(
+            "Discord rejected privileged intents.\n"
+            "In https://discord.com/developers/applications → your app → "
+            "Bot → Privileged Gateway Intents, enable **Message Content "
+            "Intent**, save, then re-run ./restart-discord-bot.sh.\n"
+            f"({e})"
+        ) from e
 
 
 if __name__ == "__main__":

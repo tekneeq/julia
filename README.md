@@ -140,8 +140,11 @@ RH_PASSWORD=your_password
 ### Discord stock bot (optional)
 
 Create a **new** Discord application at https://discord.com/developers/applications
-(do not reuse another bot's token), enable **Message Content Intent**, invite the
-bot to your server, then add to `.env`:
+(do not reuse another bot's token), then:
+
+1. **Bot → Privileged Gateway Intents** → enable **Message Content Intent** (required)
+2. Invite the bot (OAuth2 → URL Generator: scope `bot`, Send Messages / Read History)
+3. Add to `.env`:
 
 ```bash
 DISCORD_BOT_TOKEN=...          # required to start the bot
