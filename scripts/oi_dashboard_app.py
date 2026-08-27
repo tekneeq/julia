@@ -51,6 +51,8 @@ from julia.main import (  # noqa: E402
     _prepare_oi_series,
 )
 
+import pandas as pd  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -4863,6 +4865,289 @@ def _render_today_and_twins(ticker: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tickers tab — Seeking Alpha–style sector / industry browser
+# ---------------------------------------------------------------------------
+
+def _fmt_market_cap(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    abs_v = abs(v)
+    if abs_v >= 1e12:
+        return f"${v / 1e12:.2f}T"
+    if abs_v >= 1e9:
+        return f"${v / 1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"${v / 1e6:.2f}M"
+    return f"${v:,.0f}"
+
+
+def _fmt_ratio(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _add_ticker_to_dashboard(symbol: str) -> None:
+    """Append ``symbol`` to the sidebar tickers input (session state)."""
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return
+    current = st.session_state.get("tickers_str", "SPY") or ""
+    existing = [t.strip().upper() for t in current.split(",") if t.strip()]
+    if symbol not in existing:
+        existing.append(symbol)
+    st.session_state["tickers_str"] = ", ".join(existing)
+    st.session_state["_tickers_flash"] = symbol
+
+
+def _render_tickers_page() -> None:
+    """Seeking Alpha–style sector → industry → ticker browser."""
+    from julia import tickers_store
+
+    flash = st.session_state.pop("_tickers_flash", None)
+    if flash:
+        st.success(
+            f"Added **{flash}** to the dashboard ticker list — "
+            "switch to **OI Dashboard** to analyze it."
+        )
+
+    st.header("Tickers")
+    st.caption(
+        "Robinhood-tradable equities and funds, grouped the way Seeking Alpha "
+        "does — **sector → industry → symbol**. Data comes from Robinhood's "
+        "public instruments + fundamentals catalogs (no login) and is cached "
+        "in `.options_cache/tickers.db`. Click a symbol to add it to the "
+        "OI Dashboard ticker list."
+    )
+
+    n = tickers_store.ticker_count()
+    synced = tickers_store.get_meta("last_synced_at") or "never"
+
+    top_l, top_r = st.columns([3, 1])
+    with top_l:
+        st.metric("Tradable symbols cached", f"{n:,}")
+        st.caption(f"Last synced (UTC): {synced}")
+    with top_r:
+        if st.button(
+            "🔄 Sync from Robinhood",
+            use_container_width=True,
+            help="Re-download the full tradable universe (~2–4 minutes).",
+        ):
+            progress = st.progress(0.0, text="Starting sync…")
+            status = st.empty()
+
+            def _cb(stage: str, a: int, b: int) -> None:
+                frac = (a / b) if b else 0.0
+                # Instruments ~40% of the bar, fundamentals the rest.
+                if stage == "instruments":
+                    progress.progress(
+                        min(0.4, 0.4 * frac),
+                        text=f"Instruments… page {a}",
+                    )
+                else:
+                    progress.progress(
+                        0.4 + 0.6 * frac,
+                        text=f"Fundamentals… batch {a}/{b}",
+                    )
+                status.caption(f"{stage}: {a}/{b}")
+
+            with st.spinner("Syncing Robinhood tradable tickers…"):
+                stats = tickers_store.sync_tradable_tickers(progress=_cb)
+            progress.progress(1.0, text="Done")
+            st.success(
+                f"Synced {stats['instruments']:,} symbols "
+                f"({stats['with_sector']:,} with sector) at {stats['synced_at']}"
+            )
+            st.rerun()
+
+    if n == 0:
+        st.warning(
+            "No ticker cache yet. Click **Sync from Robinhood** above "
+            "(or run `lia tickers-sync`) to populate sector / industry lists."
+        )
+        return
+
+    # Filters row
+    f1, f2, f3 = st.columns([2, 2, 3])
+    with f1:
+        universe = st.selectbox(
+            "Universe",
+            ["All", "Stocks", "ETFs & funds"],
+            key="tickers_universe",
+            help=(
+                "Stocks = common shares, ADRs, REITs, MLPs. "
+                "ETFs & funds = ETPs and closed-end funds."
+            ),
+        )
+    with f2:
+        search = st.text_input(
+            "Search symbol or name",
+            key="tickers_search",
+            placeholder="e.g. AAPL or Nvidia",
+        )
+    with f3:
+        st.write("")  # spacer
+        st.caption(
+            "Tip: pick a sector on the left, then an industry, then add "
+            "symbols to the dashboard."
+        )
+
+    type_filter = None
+    if universe == "Stocks":
+        type_filter = ["stock", "adr", "reit", "mlp", "lp"]
+    elif universe == "ETFs & funds":
+        type_filter = ["etp", "cef", "tracking"]
+
+    # When searching, show a flat hit list and skip the sector tree.
+    if search and search.strip():
+        hits = tickers_store.list_tickers(
+            search=search.strip(),
+            instrument_types=type_filter,
+            limit=500,
+        )
+        st.subheader(f"Search results · {len(hits):,} match(es)")
+        _render_tickers_table(hits)
+        return
+
+    left, right = st.columns([1, 3], gap="large")
+
+    sectors = tickers_store.list_sectors(instrument_types=type_filter)
+
+    if "tickers_selected_sector" not in st.session_state and sectors:
+        st.session_state["tickers_selected_sector"] = sectors[0]["sector"]
+    if "tickers_selected_industry" not in st.session_state:
+        st.session_state["tickers_selected_industry"] = None
+
+    # If the active sector vanished under the current filter, reset.
+    sector_names = {s["sector"] for s in sectors}
+    if st.session_state.get("tickers_selected_sector") not in sector_names:
+        st.session_state["tickers_selected_sector"] = (
+            sectors[0]["sector"] if sectors else None
+        )
+        st.session_state["tickers_selected_industry"] = None
+
+    with left:
+        st.markdown("##### Sectors")
+        for sec in sectors:
+            label = f"{sec['sector']}  ({sec['count']:,})"
+            is_active = (
+                st.session_state.get("tickers_selected_sector") == sec["sector"]
+            )
+            if st.button(
+                label,
+                key=f"sec_{sec['sector']}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state["tickers_selected_sector"] = sec["sector"]
+                st.session_state["tickers_selected_industry"] = None
+                st.rerun()
+
+    selected_sector = st.session_state.get("tickers_selected_sector")
+    with right:
+        if not selected_sector:
+            st.info("Select a sector to browse industries.")
+            return
+
+        st.markdown(f"### {selected_sector}")
+        industries = tickers_store.list_industries(
+            selected_sector, instrument_types=type_filter
+        )
+
+        st.markdown("##### Industries")
+        if not industries:
+            st.caption("No industries in this sector for the current filter.")
+            return
+
+        selected_industry = st.session_state.get("tickers_selected_industry")
+        ind_names = {i["industry"] for i in industries}
+        if selected_industry not in ind_names:
+            selected_industry = industries[0]["industry"]
+            st.session_state["tickers_selected_industry"] = selected_industry
+
+        cols_per_row = 3
+        for i in range(0, len(industries), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for col, ind in zip(cols, industries[i : i + cols_per_row]):
+                active = selected_industry == ind["industry"]
+                with col:
+                    if st.button(
+                        f"{ind['industry']} ({ind['count']:,})",
+                        key=f"ind_{selected_sector}_{ind['industry']}",
+                        use_container_width=True,
+                        type="primary" if active else "secondary",
+                    ):
+                        st.session_state["tickers_selected_industry"] = ind[
+                            "industry"
+                        ]
+                        st.rerun()
+
+        st.divider()
+        st.markdown(
+            f"##### {selected_industry} "
+            f"<span style='font-weight:400;color:#888'>in {selected_sector}</span>",
+            unsafe_allow_html=True,
+        )
+        rows = tickers_store.list_tickers(
+            sector=selected_sector,
+            industry=selected_industry,
+            instrument_types=type_filter,
+            limit=5000,
+        )
+        st.caption(f"{len(rows):,} tickers · sorted by market cap")
+        _render_tickers_table(rows)
+
+
+def _render_tickers_table(rows: list[dict]) -> None:
+    """Interactive table + one-click add-to-dashboard for the current list."""
+    if not rows:
+        st.info("No tickers match these filters.")
+        return
+
+    display = pd.DataFrame(
+        [
+            {
+                "Symbol": r["symbol"],
+                "Name": r.get("simple_name") or r.get("name") or "",
+                "Type": (r.get("instrument_type") or "").upper(),
+                "Sector": r.get("sector") or "—",
+                "Industry": r.get("industry") or "—",
+                "Market Cap": _fmt_market_cap(r.get("market_cap")),
+                "P/E": _fmt_ratio(r.get("pe_ratio")),
+                "Div Yield %": _fmt_ratio(r.get("dividend_yield")),
+            }
+            for r in rows
+        ]
+    )
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        height=min(560, 40 + 35 * min(len(display), 15)),
+    )
+
+    add_cols = st.columns([3, 1])
+    with add_cols[0]:
+        pick = st.selectbox(
+            "Add to OI Dashboard",
+            options=[r["symbol"] for r in rows],
+            key=f"tickers_add_pick_{rows[0]['symbol']}_{len(rows)}",
+        )
+    with add_cols[1]:
+        st.write("")
+        if st.button("➕ Add ticker", use_container_width=True, type="primary"):
+            _add_ticker_to_dashboard(pick)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -4870,6 +5155,14 @@ st.set_page_config(page_title="Options OI Dashboard", layout="wide")
 st.title("📊 Options OI — Live Dashboard")
 _git_sha, _git_when = _running_git_revision()
 st.caption(f"Running `{_git_sha}` · committed {_git_when}")
+
+_page = st.radio(
+    "Navigate",
+    ["OI Dashboard", "Tickers"],
+    horizontal=True,
+    key="top_nav",
+    label_visibility="collapsed",
+)
 
 with st.sidebar:
     st.header("Config")
@@ -4910,9 +5203,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Refresh")
-    auto = st.toggle("Auto-refresh every 5s", value=True, key="auto")
-    if auto:
-        st_autorefresh(interval=5_000, key="_autoref")
+    if _page == "OI Dashboard":
+        auto = st.toggle("Auto-refresh every 5s", value=True, key="auto")
+        if auto:
+            st_autorefresh(interval=5_000, key="_autoref")
+    else:
+        auto = False
+        st.caption("Auto-refresh is paused on the Tickers tab.")
 
     col_r1, col_r2 = st.columns(2)
     with col_r1:
@@ -4931,6 +5228,9 @@ with st.sidebar:
             _kickoff_batch(tickers, start, end, refresh_cache)
             st.rerun()
 
+if _page == "Tickers":
+    _render_tickers_page()
+    st.stop()
 
 start, end, exps = _compute_range(days_ahead)
 
