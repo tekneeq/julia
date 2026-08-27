@@ -137,6 +137,31 @@ RH_PASSWORD=your_password
 
 **Note**: The `.env` file is automatically ignored by git for security.
 
+### Discord stock bot (optional)
+
+Create a **new** Discord application at https://discord.com/developers/applications
+(do not reuse another bot's token), enable **Message Content Intent**, invite the
+bot to your server, then add to `.env`:
+
+```bash
+DISCORD_BOT_TOKEN=...          # required to start the bot
+DISCORD_CHANNEL_ID=...         # optional — channel for the ready greeting
+```
+
+On the julia EC2 host, `./deploy.sh` starts the bot inside the dashboard
+container (same lifecycle as the price poller). If `DISCORD_BOT_TOKEN` is
+unset, deploy skips the bot and continues.
+
+```bash
+./restart-discord-bot.sh           # start / restart
+./restart-discord-bot.sh --status
+./restart-discord-bot.sh --logs
+./restart-discord-bot.sh --stop
+```
+
+In Discord: `!help`, `!price AAPL`, `!quote SPY`, `!info MSFT`, `!sectors`,
+`!industries Technology Services`, `!tickers Finance`, `!search nvidia`.
+
 ## Usage
 
 ### Programmatic Usage
