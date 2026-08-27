@@ -1,14 +1,21 @@
-"""Julia Discord stock bot — query price, quote, sector/industry, search.
+"""Julia Discord bot — ``!lia`` command surface.
 
-Run via ``scripts/discord_bot.py`` (PID-managed) or:
+Only messages that start with ``!lia`` are handled. Start small:
 
-    uv run python -m julia.discorder
+    !lia help
+    !lia buy  AAPL 1
+    !lia sell AAPL 0.5
+
+Buy/sell submit **live Robinhood market orders** (fractional-capable) using
+the host ``RH_USERNAME`` / ``RH_PASSWORD``.
 
 Env (``.env`` on the julia EC2 host, loaded by docker ``--env-file``):
 
-    DISCORD_BOT_TOKEN      required — bot token from a *new* Discord app
-    DISCORD_CHANNEL_ID     optional — channel for the ready greeting
-    RH_USERNAME / RH_PASSWORD   for live ``!price`` / ``!quote``
+    DISCORD_BOT_TOKEN         required
+    DISCORD_CHANNEL_ID        optional ready greeting
+    RH_USERNAME / RH_PASSWORD required for buy/sell
+    LIA_DISCORD_ALLOWLIST     optional comma-separated Discord user IDs
+                              allowed to run buy/sell (everyone if unset)
 """
 from __future__ import annotations
 
@@ -20,57 +27,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Discord is an optional install unless folded into core deps / --extra chat.
 try:
     import discord
     from discord import Intents
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
-        "discord package missing — install with "
-        "`uv sync --extra chat` or `pip install discord`"
+        "discord package missing — install with `uv sync` / `pip install discord`"
     ) from e
 
 
-HELP_TEXT = """**Julia stock bot**
+HELP_TEXT = """**Julia · `!lia` commands**
 ```
-!help                         this message
-!ping                         latency check
-!price  TICKER                latest Robinhood price
-!quote  TICKER                price + day change / volume
-!info   TICKER                sector, industry, market cap, P/E
-!sectors                      sector overview (counts)
-!industries <sector>          industries under a sector
-!tickers <sector> [industry]  top tickers by market cap
-!search <query>               symbol / name search
+!lia help                 this message
+!lia buy  TICKER QTY      market buy  (live Robinhood)
+!lia sell TICKER QTY      market sell (live Robinhood)
 ```
-Universe is Robinhood-tradable symbols cached by `lia tickers-sync`.
+Examples: `!lia buy AAPL 1` · `!lia sell SPY 0.5`
+
+Qty may be fractional (up to 6 decimals). These place **real orders**.
 """
-
-
-def _fmt_market_cap(value: Any) -> str:
-    if value is None:
-        return "—"
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return "—"
-    abs_v = abs(v)
-    if abs_v >= 1e12:
-        return f"${v / 1e12:.2f}T"
-    if abs_v >= 1e9:
-        return f"${v / 1e9:.2f}B"
-    if abs_v >= 1e6:
-        return f"${v / 1e6:.2f}M"
-    return f"${v:,.0f}"
-
-
-def _fmt_num(value: Any, digits: int = 2) -> str:
-    if value is None or value == "":
-        return "—"
-    try:
-        return f"{float(value):,.{digits}f}"
-    except (TypeError, ValueError):
-        return "—"
 
 
 def _ensure_rh_login() -> bool:
@@ -89,298 +64,134 @@ def _ensure_rh_login() -> bool:
         return False
 
 
-def _cmd_price(symbol: str) -> str:
-    if not _ensure_rh_login():
-        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
-    import robin_stocks.robinhood as rh
-
-    vals = rh.stocks.get_latest_price(
-        symbol, priceType=None, includeExtendedHours=True
-    )
-    if not vals or vals[0] is None:
-        return f"No price for **{symbol}**."
-    return f"**{symbol}** ${float(vals[0]):,.4f}".rstrip("0").rstrip(".")
+def _trader_allowed(user_id: int) -> bool:
+    raw = (os.getenv("LIA_DISCORD_ALLOWLIST") or "").strip()
+    if not raw:
+        return True
+    allowed = {p.strip() for p in raw.split(",") if p.strip()}
+    return str(user_id) in allowed
 
 
-def _cmd_quote(symbol: str) -> str:
-    if not _ensure_rh_login():
-        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
-    import robin_stocks.robinhood as rh
+def _parse_qty(raw: str) -> float:
+    qty = float(raw)
+    if qty <= 0:
+        raise ValueError("quantity must be > 0")
+    # Robinhood fractional shares support up to 6 decimal places.
+    return round(qty, 6)
 
-    quotes = rh.stocks.get_quotes(symbol)
-    if not quotes or not quotes[0]:
-        return f"No quote for **{symbol}**."
-    q = quotes[0]
-    last = float(q.get("last_trade_price") or 0)
-    prev = float(q.get("previous_close") or q.get("adjusted_previous_close") or 0)
-    ext = q.get("last_extended_hours_trade_price")
-    chg = (last - prev) if prev else None
-    pct = (chg / prev * 100.0) if prev and chg is not None else None
+
+def _format_order(side: str, symbol: str, qty: float, result: Any) -> str:
+    if result is None:
+        return f"❌ {side} **{symbol}** x `{qty}` — no response from Robinhood."
+    if isinstance(result, list):
+        # Some robin_stocks paths return [None] / error strings on failure.
+        if not result or result[0] is None:
+            return f"❌ {side} **{symbol}** x `{qty}` — order rejected (empty response)."
+        result = result[0]
+    if isinstance(result, str):
+        return f"❌ {side} **{symbol}** x `{qty}` — `{result}`"
+    if not isinstance(result, dict):
+        return f"❌ {side} **{symbol}** x `{qty}` — unexpected response: `{result!r}`"
+
+    # robin_stocks sometimes returns {"detail": "..."} on API errors.
+    if result.get("detail") and not result.get("id"):
+        return f"❌ {side} **{symbol}** x `{qty}` — `{result['detail']}`"
+
+    oid = result.get("id") or result.get("order_id") or "—"
+    state = result.get("state") or result.get("status") or "—"
+    filled = result.get("cumulative_quantity") or result.get("quantity") or qty
+    price = result.get("average_price") or result.get("price")
+    if price is None:
+        tn = result.get("total_notional")
+        price = tn.get("amount") if isinstance(tn, dict) else tn
     lines = [
-        f"**{symbol}** quote",
-        f"Last: `${last:,.4f}`".rstrip("0").rstrip("."),
+        f"✅ **{side.upper()}** `{symbol}` x `{qty}` submitted",
+        f"Order id: `{oid}`",
+        f"State: `{state}` · filled qty: `{filled}`",
     ]
-    if prev:
-        sign = "+" if (chg or 0) >= 0 else ""
-        lines.append(
-            f"Prev close: `${prev:,.2f}`  ·  "
-            f"Change: `{sign}{_fmt_num(chg)}` (`{sign}{_fmt_num(pct)}%`)"
-        )
-    if ext:
-        lines.append(f"Extended: `${float(ext):,.4f}`")
-    if q.get("trading_halted") in (True, "true", "True"):
-        lines.append("⚠️ Trading halted")
+    if price not in (None, ""):
+        lines.append(f"Price / notional: `{price}`")
     return "\n".join(lines)
 
 
-def _lookup_cached(symbol: str) -> Optional[dict[str, Any]]:
-    try:
-        from julia import tickers_store
+def _cmd_buy(symbol: str, qty: float) -> str:
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
 
-        rows = tickers_store.list_tickers(search=symbol, limit=20)
-    except Exception:  # noqa: BLE001
-        return None
-    symbol = symbol.upper()
-    for row in rows:
-        if row.get("symbol") == symbol:
-            return row
-    return None
+    result = rh.orders.order_buy_fractional_by_quantity(symbol, qty)
+    return _format_order("buy", symbol, qty, result)
 
 
-def _cmd_info(symbol: str) -> str:
-    row = _lookup_cached(symbol)
-    fund: dict[str, Any] = {}
-    if _ensure_rh_login():
-        try:
-            import robin_stocks.robinhood as rh
+def _cmd_sell(symbol: str, qty: float) -> str:
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
 
-            data = rh.stocks.get_fundamentals(symbol)
-            if data and data[0]:
-                fund = data[0]
-        except Exception:  # noqa: BLE001
-            fund = {}
-
-    name = None
-    if row:
-        name = row.get("simple_name") or row.get("name")
-    sector = (fund.get("sector") or (row or {}).get("sector") or "—")
-    industry = (fund.get("industry") or (row or {}).get("industry") or "—")
-    mcap = fund.get("market_cap") or (row or {}).get("market_cap")
-    pe = fund.get("pe_ratio") or (row or {}).get("pe_ratio")
-    div = fund.get("dividend_yield") or (row or {}).get("dividend_yield")
-    desc = (fund.get("description") or (row or {}).get("description") or "")
-    itype = (row or {}).get("instrument_type") or ""
-
-    lines = [f"**{symbol}**" + (f" — {name}" if name else "")]
-    if itype:
-        lines.append(f"Type: `{itype.upper()}`")
-    lines.append(f"Sector: **{sector}**")
-    lines.append(f"Industry: **{industry}**")
-    lines.append(
-        f"Market cap: `{_fmt_market_cap(mcap)}`  ·  "
-        f"P/E: `{_fmt_num(pe)}`  ·  Div yield: `{_fmt_num(div)}%`"
-    )
-    if desc:
-        snippet = desc.strip().replace("\n", " ")
-        if len(snippet) > 280:
-            snippet = snippet[:277] + "…"
-        lines.append(snippet)
-    if not row and not fund:
-        lines.append(
-            "_No cache / fundamentals — run `lia tickers-sync` or check RH login._"
-        )
-    return "\n".join(lines)
+    result = rh.orders.order_sell_fractional_by_quantity(symbol, qty)
+    return _format_order("sell", symbol, qty, result)
 
 
-def _cmd_sectors() -> str:
-    from julia import tickers_store
+def _parse_lia(content: str) -> tuple[str, list[str]]:
+    """Return (subcommand, args) for a ``!lia ...`` message.
 
-    n = tickers_store.ticker_count()
-    if n == 0:
-        return "Ticker cache empty — run `lia tickers-sync` (or Sync on the Tickers tab)."
-    rows = tickers_store.list_sectors()
-    lines = [f"**Sectors** ({n:,} tradable symbols)"]
-    for r in rows[:25]:
-        lines.append(f"• {r['sector']} — `{r['count']:,}`")
-    if len(rows) > 25:
-        lines.append(f"_…and {len(rows) - 25} more_")
-    return "\n".join(lines)
-
-
-def _cmd_industries(sector: str) -> str:
-    from julia import tickers_store
-
-    rows = tickers_store.list_industries(sector)
-    if not rows:
-        # Case-insensitive sector match
-        for s in tickers_store.list_sectors():
-            if s["sector"].lower() == sector.lower():
-                sector = s["sector"]
-                rows = tickers_store.list_industries(sector)
-                break
-    if not rows:
-        return (
-            f"No industries for sector `{sector}`. "
-            "Try `!sectors` for names."
-        )
-    lines = [f"**{sector}** industries"]
-    for r in rows:
-        lines.append(f"• {r['industry']} — `{r['count']:,}`")
-    return "\n".join(lines)
-
-
-def _cmd_tickers(sector: str, industry: Optional[str] = None) -> str:
-    from julia import tickers_store
-
-    # Fuzzy sector match
-    sectors = {s["sector"].lower(): s["sector"] for s in tickers_store.list_sectors()}
-    sector_key = sector.lower()
-    if sector_key in sectors:
-        sector = sectors[sector_key]
-    else:
-        matches = [name for low, name in sectors.items() if sector_key in low]
-        if len(matches) == 1:
-            sector = matches[0]
-        elif not matches:
-            return f"Unknown sector `{sector}`. Try `!sectors`."
-
-    if industry:
-        inds = {
-            i["industry"].lower(): i["industry"]
-            for i in tickers_store.list_industries(sector)
-        }
-        ind_key = industry.lower()
-        if ind_key in inds:
-            industry = inds[ind_key]
-        else:
-            matches = [name for low, name in inds.items() if ind_key in low]
-            if len(matches) == 1:
-                industry = matches[0]
-            elif not matches:
-                return (
-                    f"Unknown industry `{industry}` in **{sector}**. "
-                    f"Try `!industries {sector}`."
-                )
-
-    rows = tickers_store.list_tickers(
-        sector=sector, industry=industry, limit=15
-    )
-    if not rows:
-        return "No tickers matched."
-    title = f"**{industry}** in {sector}" if industry else f"**{sector}**"
-    lines = [f"{title} — top by market cap"]
-    for r in rows:
-        name = r.get("simple_name") or r.get("name") or ""
-        lines.append(
-            f"`{r['symbol']:<6}` {_fmt_market_cap(r.get('market_cap'))}"
-            + (f"  {name}" if name else "")
-        )
-    return "\n".join(lines)
-
-
-def _cmd_search(query: str) -> str:
-    from julia import tickers_store
-
-    rows = tickers_store.list_tickers(search=query, limit=15)
-    if not rows:
-        return f"No matches for `{query}`."
-    lines = [f"**Search** `{query}`"]
-    for r in rows:
-        name = r.get("simple_name") or r.get("name") or ""
-        sector = r.get("sector") or "—"
-        lines.append(
-            f"`{r['symbol']:<6}` {name}  ·  {sector}  ·  "
-            f"{_fmt_market_cap(r.get('market_cap'))}"
-        )
-    return "\n".join(lines)
-
-
-def _parse_args(content: str, command: str) -> list[str]:
-    rest = content[len(command) :].strip()
-    if not rest:
-        return []
-    return rest.split()
+    ``!lia`` alone → ("help", []). Unknown prefix → ("", []).
+    """
+    parts = content.split()
+    if not parts:
+        return "", []
+    if parts[0].lower() != "!lia":
+        return "", []
+    if len(parts) == 1:
+        return "help", []
+    return parts[1].lower(), parts[2:]
 
 
 async def _handle_message(msg: discord.Message) -> None:
     content = (msg.content or "").strip()
-    if not content.startswith("!"):
+    if not content.lower().startswith("!lia"):
+        # Ignore every non-!lia message (including old !price / !help).
         return
 
-    lower = content.lower()
+    sub, args = _parse_lia(content)
+    if not sub:
+        return
+
     try:
-        if lower == "!ping":
-            await msg.reply("pong!")
-            return
-        if lower in ("!help", "!commands"):
+        if sub in ("help", "commands", "?"):
             await msg.reply(HELP_TEXT)
             return
-        if lower.startswith("!price"):
-            args = _parse_args(content, "!price")
-            if not args:
-                await msg.reply("Usage: `!price TICKER`")
-                return
-            await msg.reply(_cmd_price(args[0].upper()))
-            return
-        if lower.startswith("!quote"):
-            args = _parse_args(content, "!quote")
-            if not args:
-                await msg.reply("Usage: `!quote TICKER`")
-                return
-            await msg.reply(_cmd_quote(args[0].upper()))
-            return
-        if lower.startswith("!info"):
-            args = _parse_args(content, "!info")
-            if not args:
-                await msg.reply("Usage: `!info TICKER`")
-                return
-            await msg.reply(_cmd_info(args[0].upper()))
-            return
-        if lower in ("!sectors", "!sector"):
-            await msg.reply(_cmd_sectors())
-            return
-        if lower.startswith("!industries") or lower.startswith("!industry"):
-            cmd = "!industries" if lower.startswith("!industries") else "!industry"
-            args = _parse_args(content, cmd)
-            if not args:
-                await msg.reply("Usage: `!industries <sector>`")
-                return
-            await msg.reply(_cmd_industries(" ".join(args)))
-            return
-        if lower.startswith("!tickers"):
-            args = _parse_args(content, "!tickers")
-            if not args:
-                await msg.reply("Usage: `!tickers <sector> [industry]`")
-                return
-            from julia import tickers_store
 
-            sectors = [s["sector"] for s in tickers_store.list_sectors()]
-            joined = " ".join(args)
-            sector = None
-            industry = None
-            # Prefer longest sector name match against the full arg string.
-            for candidate in sorted(sectors, key=len, reverse=True):
-                if joined.lower() == candidate.lower():
-                    sector = candidate
-                    break
-                prefix = candidate.lower() + " "
-                if joined.lower().startswith(prefix):
-                    sector = candidate
-                    industry = joined[len(candidate) :].strip() or None
-                    break
-            if sector is None:
-                # Fall back: first token as sector, rest as industry.
-                sector = args[0]
-                industry = " ".join(args[1:]) or None
-            await msg.reply(_cmd_tickers(sector, industry))
-            return
-        if lower.startswith("!search"):
-            args = _parse_args(content, "!search")
-            if not args:
-                await msg.reply("Usage: `!search <query>`")
+        if sub in ("buy", "sell"):
+            if not _trader_allowed(msg.author.id):
+                await msg.reply(
+                    f"Not authorized to trade "
+                    f"(Discord user `{msg.author.id}` not in "
+                    f"`LIA_DISCORD_ALLOWLIST`)."
+                )
                 return
-            await msg.reply(_cmd_search(" ".join(args)))
+            if len(args) != 2:
+                await msg.reply(f"Usage: `!lia {sub} TICKER QTY`")
+                return
+            symbol = args[0].upper().strip()
+            try:
+                qty = _parse_qty(args[1])
+            except ValueError as e:
+                await msg.reply(f"Bad quantity: {e}")
+                return
+            if not symbol.isalnum():
+                await msg.reply(f"Bad ticker `{symbol}`.")
+                return
+            await msg.reply(f"Submitting **{sub}** `{symbol}` x `{qty}`…")
+            if sub == "buy":
+                await msg.reply(_cmd_buy(symbol, qty))
+            else:
+                await msg.reply(_cmd_sell(symbol, qty))
             return
+
+        await msg.reply(
+            f"Unknown `!lia` command `{sub}`. Try `!lia help`."
+        )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         await msg.reply(f"Error: `{type(e).__name__}: {e}`")
@@ -393,7 +204,10 @@ def build_client() -> discord.Client:
 
     @client.event
     async def on_ready() -> None:
-        print(f"[discord] logged in as {client.user} (id={client.user and client.user.id})")
+        print(
+            f"[discord] logged in as {client.user} "
+            f"(id={client.user and client.user.id})"
+        )
         channel_id = os.getenv("DISCORD_CHANNEL_ID")
         if not channel_id:
             return
@@ -403,7 +217,7 @@ def build_client() -> discord.Client:
                 channel = await client.fetch_channel(int(channel_id))
             if channel is not None:
                 await channel.send(
-                    "Julia stock bot online. Type `!help` for commands."
+                    "Julia online. Commands start with `!lia` — try `!lia help`."
                 )
         except Exception as e:  # noqa: BLE001
             print(f"[discord] ready greeting failed: {e!r}")
@@ -427,7 +241,16 @@ def run_bot(token: Optional[str] = None) -> None:
             "token in the julia host `.env`."
         )
     client = build_client()
-    client.run(token)
+    try:
+        client.run(token)
+    except discord.errors.PrivilegedIntentsRequired as e:
+        raise SystemExit(
+            "Discord rejected privileged intents.\n"
+            "In https://discord.com/developers/applications → your app → "
+            "Bot → Privileged Gateway Intents, enable **Message Content "
+            "Intent**, save, then re-run ./restart-discord-bot.sh.\n"
+            f"({e})"
+        ) from e
 
 
 if __name__ == "__main__":
