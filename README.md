@@ -137,15 +137,20 @@ RH_PASSWORD=your_password
 
 **Note**: The `.env` file is automatically ignored by git for security.
 
-### Discord stock bot (optional)
+### Discord `!lia` bot (optional)
 
 Create a **new** Discord application at https://discord.com/developers/applications
-(do not reuse another bot's token), enable **Message Content Intent**, invite the
-bot to your server, then add to `.env`:
+(do not reuse another bot's token), then:
+
+1. **Bot → Privileged Gateway Intents** → enable **Message Content Intent** (required)
+2. Invite the bot (OAuth2 → URL Generator: scope `bot`, Send Messages / Read History)
+3. Add to `.env`:
 
 ```bash
 DISCORD_BOT_TOKEN=...          # required to start the bot
 DISCORD_CHANNEL_ID=...         # optional — channel for the ready greeting
+# Optional: only these Discord user IDs may !lia buy / !lia sell
+# LIA_DISCORD_ALLOWLIST=123456789012345678,987654321098765432
 ```
 
 On the julia EC2 host, `./deploy.sh` starts the bot inside the dashboard
@@ -159,8 +164,13 @@ unset, deploy skips the bot and continues.
 ./restart-discord-bot.sh --stop
 ```
 
-In Discord: `!help`, `!price AAPL`, `!quote SPY`, `!info MSFT`, `!sectors`,
-`!industries Technology Services`, `!tickers Finance`, `!search nvidia`.
+The bot **only** responds to `!lia …` messages:
+
+```
+!lia help
+!lia buy  AAPL 1        # live Robinhood market buy
+!lia sell AAPL 0.5      # live Robinhood market sell (fractional ok)
+```
 
 ## Usage
 
