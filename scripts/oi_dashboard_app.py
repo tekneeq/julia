@@ -4895,16 +4895,30 @@ def _fmt_ratio(value) -> str:
 
 
 def _add_ticker_to_dashboard(symbol: str) -> None:
-    """Append ``symbol`` to the sidebar tickers input (session state)."""
+    """Queue ``symbol`` to be merged into the sidebar tickers on the next run.
+
+    Streamlit forbids mutating ``st.session_state[key]`` after a widget with
+    that ``key`` has already been instantiated in the same script run, so we
+    stash the symbol and apply it *before* the sidebar ``text_input`` on the
+    subsequent rerun.
+    """
     symbol = symbol.strip().upper()
+    if not symbol:
+        return
+    st.session_state["_pending_ticker_add"] = symbol
+    st.session_state["_tickers_flash"] = symbol
+
+
+def _apply_pending_ticker_add() -> None:
+    """Merge any queued ticker into ``tickers_str`` before the widget is built."""
+    symbol = st.session_state.pop("_pending_ticker_add", None)
     if not symbol:
         return
     current = st.session_state.get("tickers_str", "SPY") or ""
     existing = [t.strip().upper() for t in current.split(",") if t.strip()]
     if symbol not in existing:
         existing.append(symbol)
-    st.session_state["tickers_str"] = ", ".join(existing)
-    st.session_state["_tickers_flash"] = symbol
+    st.session_state["tickers_str"] = ", ".join(existing) or "SPY"
 
 
 def _render_tickers_page() -> None:
@@ -5095,13 +5109,27 @@ def _render_tickers_page() -> None:
             f"<span style='font-weight:400;color:#888'>in {selected_sector}</span>",
             unsafe_allow_html=True,
         )
+        industry_total = next(
+            (
+                i["count"]
+                for i in industries
+                if i["industry"] == selected_industry
+            ),
+            None,
+        )
         rows = tickers_store.list_tickers(
             sector=selected_sector,
             industry=selected_industry,
             instrument_types=type_filter,
             limit=5000,
         )
-        st.caption(f"{len(rows):,} tickers · sorted by market cap")
+        if industry_total and industry_total > len(rows):
+            st.caption(
+                f"Showing {len(rows):,} of {industry_total:,} tickers "
+                f"· sorted by market cap (top by market cap)"
+            )
+        else:
+            st.caption(f"{len(rows):,} tickers · sorted by market cap")
         _render_tickers_table(rows)
 
 
@@ -5155,6 +5183,8 @@ st.set_page_config(page_title="Options OI Dashboard", layout="wide")
 st.title("📊 Options OI — Live Dashboard")
 _git_sha, _git_when = _running_git_revision()
 st.caption(f"Running `{_git_sha}` · committed {_git_when}")
+
+_apply_pending_ticker_add()
 
 _page = st.radio(
     "Navigate",
