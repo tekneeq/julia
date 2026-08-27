@@ -1224,6 +1224,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "discord" },
     { name = "markupsafe" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -1242,7 +1243,6 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "chromadb" },
-    { name = "discord" },
     { name = "openai" },
     { name = "praw" },
     { name = "pydub" },
@@ -1256,7 +1256,6 @@ audio = [
     { name = "simpleaudio" },
 ]
 chat = [
-    { name = "discord" },
     { name = "praw" },
 ]
 llm = [
@@ -1274,8 +1273,7 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'all'", specifier = ">=1.3.4" },
     { name = "chromadb", marker = "extra == 'llm'", specifier = ">=1.3.4" },
     { name = "click", specifier = ">=8.1.8" },
-    { name = "discord", marker = "extra == 'all'", specifier = ">=2.3.2" },
-    { name = "discord", marker = "extra == 'chat'", specifier = ">=2.3.2" },
+    { name = "discord", specifier = ">=2.3.2" },
     { name = "markupsafe", specifier = "==3.0.2" },
     { name = "matplotlib", specifier = ">=3.11.0" },
     { name = "numpy", specifier = ">=2.0.2" },

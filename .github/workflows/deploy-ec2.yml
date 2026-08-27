@@ -48,5 +48,5 @@ jobs:
             # restart.sh already git-pulls, but pull first so deploy.sh
             # itself is up to date before we execute it.
             git pull --ff-only origin main
-            chmod +x deploy.sh restart.sh restart-oi-scheduler.sh restart-price-poller.sh
+            chmod +x deploy.sh restart.sh restart-oi-scheduler.sh restart-price-poller.sh restart-discord-bot.sh
             ./deploy.sh
