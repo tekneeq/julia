@@ -168,10 +168,13 @@ The bot **only** responds to `!lia …` messages:
 
 ```
 !lia help
-!lia buy  AAPL 1        # live Robinhood market buy
-!lia sell AAPL 0.5      # live Robinhood market sell (fractional ok)
-!lia today              # buys placed today (ET)
-!lia positions          # what you own / can sell  (!lia own works too)
+!lia buy  AAPL 1        # live Robinhood stock market buy
+!lia sell AAPL 0.5      # live Robinhood stock market sell (fractional ok)
+!lia today              # stock buys placed today (ET)
+!lia positions          # stock holdings  (!lia own works too)
+!lia opt                # open option positions with short ids
+!lia buy  opt SPY 2026-09-05 550 call 1 [LIMIT]
+!lia sell opt <id> [QTY] [LIMIT]   # close by id from !lia opt
 ```
 
 ## Usage
