@@ -5,11 +5,14 @@ Only messages that start with ``!lia`` are handled:
     !lia help
     !lia buy  AAPL 1
     !lia sell AAPL 0.5
-    !lia today              # buys submitted/filled today (ET)
-    !lia positions          # what you own (sellable qty)
+    !lia today              # stock buys submitted/filled today (ET)
+    !lia positions          # stock holdings
+    !lia opt                # open option positions (with short ids)
+    !lia buy  opt TICKER YYYY-MM-DD STRIKE call|put QTY [LIMIT]
+    !lia sell opt <id> [QTY] [LIMIT]
 
-Buy/sell submit **live Robinhood market orders** (fractional-capable) using
-the host ``RH_USERNAME`` / ``RH_PASSWORD``.
+Buy/sell submit **live Robinhood orders** using the host
+``RH_USERNAME`` / ``RH_PASSWORD``.
 
 Env (``.env`` on the julia EC2 host, loaded by docker ``--env-file``):
 
@@ -22,6 +25,7 @@ Env (``.env`` on the julia EC2 host, loaded by docker ``--env-file``):
 from __future__ import annotations
 
 import os
+import re
 import traceback
 from datetime import date, datetime
 from typing import Any, Optional
@@ -44,17 +48,27 @@ ET = ZoneInfo("America/New_York")
 
 HELP_TEXT = """**Julia · `!lia` commands**
 ```
-!lia help                 this message
-!lia buy  TICKER QTY      market buy  (live Robinhood)
-!lia sell TICKER QTY      market sell (live Robinhood)
-!lia today                buys you placed today (ET)
-!lia positions            what you own / can sell
-!lia own                  alias for positions
+!lia help                              this message
+!lia buy  TICKER QTY                   stock market buy
+!lia sell TICKER QTY                   stock market sell
+!lia today                             stock buys placed today (ET)
+!lia positions                         stock holdings
+!lia own                               alias for positions
+!lia opt                               open option positions (+ short ids)
+!lia buy  opt TICKER EXP STRIKE call|put QTY [LIMIT]
+!lia sell opt <id> [QTY] [LIMIT]       close option by id from !lia opt
 ```
-Examples: `!lia buy AAPL 1` · `!lia sell SPY 0.5` · `!lia today`
+Examples:
+`!lia buy AAPL 1`
+`!lia buy opt SPY 2026-09-05 550 call 1`
+`!lia sell opt a1b2c3`
 
-Qty may be fractional (up to 6 decimals). Buy/sell place **real orders**.
+Stock qty may be fractional. Option qty is whole contracts.
+Buy/sell place **real orders**. Option orders are **limit** (default: mark).
 """
+
+# Short-id → enriched option position, refreshed by ``!lia opt``.
+_OPT_POS_BY_ID: dict[str, dict[str, Any]] = {}
 
 # Discord hard limit is 2000; leave room for reply chrome.
 _DISCORD_SAFE_LEN = 1800
@@ -325,6 +339,361 @@ def _cmd_positions() -> str:
     return _clip("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+def _option_instrument_id(pos: dict[str, Any]) -> Optional[str]:
+    if pos.get("option_id"):
+        return str(pos["option_id"])
+    url = pos.get("option") or ""
+    if isinstance(url, str) and url:
+        # https://api.robinhood.com/options/instruments/<uuid>/
+        parts = url.rstrip("/").split("/")
+        if parts and parts[-1]:
+            return parts[-1]
+    return None
+
+
+def _short_opt_id(instrument_id: str) -> str:
+    """Stable short id from the option instrument UUID (first 6 hex chars)."""
+    hex_id = re.sub(r"[^0-9a-fA-F]", "", instrument_id).lower()
+    return (hex_id[:6] if hex_id else instrument_id[:6]).lower()
+
+
+def _enrich_option_position(pos: dict[str, Any]) -> dict[str, Any]:
+    """Attach symbol / strike / expiry / type / short id for display + sell."""
+    import robin_stocks.robinhood as rh
+
+    out = dict(pos)
+    instrument_id = _option_instrument_id(pos)
+    out["_instrument_id"] = instrument_id
+    out["_short_id"] = _short_opt_id(instrument_id) if instrument_id else "?"
+
+    if instrument_id:
+        try:
+            inst = rh.options.get_option_instrument_data_by_id(instrument_id) or {}
+            if isinstance(inst, list):
+                inst = inst[0] if inst else {}
+            if isinstance(inst, dict):
+                out["_symbol"] = (
+                    inst.get("chain_symbol")
+                    or out.get("chain_symbol")
+                    or "?"
+                ).upper()
+                out["_strike"] = float(inst.get("strike_price") or 0)
+                out["_expiration"] = inst.get("expiration_date") or "?"
+                out["_option_type"] = (inst.get("type") or "?").lower()
+        except Exception:  # noqa: BLE001
+            pass
+
+    out.setdefault("_symbol", (out.get("chain_symbol") or "?").upper())
+    out.setdefault("_strike", float(out.get("strike_price") or 0))
+    out.setdefault("_expiration", out.get("expiration_date") or "?")
+    # Don't use pos["type"] as call/put — on positions that field is often long/short.
+    if out.get("_option_type") in (None, "", "?", "long", "short"):
+        out["_option_type"] = "?"
+    try:
+        qty = float(out.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    out["_qty"] = qty
+    # Prefer explicit direction from RH when present.
+    ptype = (pos.get("type") or "").lower()
+    if ptype in ("long", "short"):
+        out["_side"] = ptype
+    else:
+        out["_side"] = "long" if qty >= 0 else "short"
+    return out
+
+
+def _load_open_option_positions() -> list[dict[str, Any]]:
+    """Fetch + enrich open option positions; refresh short-id map."""
+    global _OPT_POS_BY_ID
+    import robin_stocks.robinhood as rh
+
+    raw = rh.options.get_open_option_positions() or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    enriched: list[dict[str, Any]] = []
+    for pos in raw:
+        if not isinstance(pos, dict):
+            continue
+        try:
+            qty = float(pos.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty == 0:
+            continue
+        enriched.append(_enrich_option_position(pos))
+
+    # Stable sort for consistent listing.
+    enriched.sort(
+        key=lambda p: (
+            p.get("_symbol") or "",
+            p.get("_expiration") or "",
+            float(p.get("_strike") or 0),
+            p.get("_option_type") or "",
+        )
+    )
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for p in enriched:
+        sid = p.get("_short_id") or "?"
+        # Disambiguate rare collisions with a numeric suffix.
+        key = sid
+        n = 2
+        while key in by_id:
+            key = f"{sid}{n}"
+            n += 1
+        p["_short_id"] = key
+        by_id[key] = p
+    _OPT_POS_BY_ID = by_id
+    return enriched
+
+
+def _lookup_opt_position(short_id: str) -> Optional[dict[str, Any]]:
+    sid = short_id.lower().strip()
+    if sid in _OPT_POS_BY_ID:
+        return _OPT_POS_BY_ID[sid]
+    # Rebuild map (bot may have restarted since the user listed positions).
+    _load_open_option_positions()
+    if sid in _OPT_POS_BY_ID:
+        return _OPT_POS_BY_ID[sid]
+    # Prefix match against full instrument ids.
+    for key, pos in _OPT_POS_BY_ID.items():
+        inst = (pos.get("_instrument_id") or "").replace("-", "").lower()
+        if inst.startswith(sid) or key.startswith(sid):
+            return pos
+    return None
+
+
+def _option_quote_prices(
+    symbol: str, expiration: str, strike: float, option_type: str
+) -> dict[str, Optional[float]]:
+    """Return bid/ask/mark for a contract (best-effort)."""
+    import robin_stocks.robinhood as rh
+
+    try:
+        rows = rh.options.find_options_by_expiration_and_strike(
+            symbol,
+            expiration,
+            strike,
+            optionType=option_type.lower(),
+        ) or []
+    except Exception:  # noqa: BLE001
+        rows = []
+    if isinstance(rows, dict):
+        rows = [rows]
+    row = rows[0] if rows else {}
+    if not isinstance(row, dict):
+        row = {}
+
+    def _pf(key: str) -> Optional[float]:
+        v = row.get(key)
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    mark = _pf("mark_price") or _pf("adjusted_mark_price")
+    bid = _pf("bid_price")
+    ask = _pf("ask_price")
+    # Fallback via instrument market data if we have an id.
+    if mark is None and row.get("id"):
+        try:
+            md = rh.options.get_option_market_data_by_id(row["id"]) or {}
+            if isinstance(md, list):
+                md = md[0] if md else {}
+            if isinstance(md, dict):
+                for k in ("adjusted_mark_price", "mark_price"):
+                    if md.get(k) not in (None, ""):
+                        mark = float(md[k])
+                        break
+                if bid is None and md.get("bid_price") not in (None, ""):
+                    bid = float(md["bid_price"])
+                if ask is None and md.get("ask_price") not in (None, ""):
+                    ask = float(md["ask_price"])
+        except Exception:  # noqa: BLE001
+            pass
+    return {"bid": bid, "ask": ask, "mark": mark}
+
+
+def _cmd_opt_positions() -> str:
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    try:
+        positions = _load_open_option_positions()
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to load option positions: `{type(e).__name__}: {e}`"
+
+    if not positions:
+        return "No open option positions."
+
+    lines = [
+        f"**Option positions** · {len(positions)}",
+        "_Close with_ `!lia sell opt <id>` _(id column below)_",
+    ]
+    for p in positions[:40]:
+        sid = p.get("_short_id") or "?"
+        sym = p.get("_symbol") or "?"
+        exp = p.get("_expiration") or "?"
+        strike = p.get("_strike") or 0
+        otype = (p.get("_option_type") or "?").upper()
+        qty = abs(float(p.get("_qty") or 0))
+        side = p.get("_side") or "?"
+        avg = p.get("average_price")
+        lines.append(
+            f"`{sid}` **{sym}** {exp} `{_fnum(strike, 2)}` {otype} "
+            f"· {side} x `{_fnum(qty, 0)}` · avg `{_fnum(avg)}`"
+        )
+    if len(positions) > 40:
+        lines.append(f"_…and {len(positions) - 40} more_")
+    return _clip("\n".join(lines))
+
+
+def _cmd_buy_opt(
+    symbol: str,
+    expiration: str,
+    strike: float,
+    option_type: str,
+    qty: int,
+    limit: Optional[float],
+) -> str:
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
+
+    option_type = option_type.lower()
+    if option_type not in ("call", "put"):
+        return "option type must be `call` or `put`."
+    if qty <= 0:
+        return "quantity must be a positive whole number of contracts."
+
+    if limit is None:
+        q = _option_quote_prices(symbol, expiration, strike, option_type)
+        limit = q.get("ask") or q.get("mark") or q.get("bid")
+        if limit is None:
+            return (
+                f"No quote for {symbol} {expiration} {strike} {option_type} — "
+                "pass an explicit LIMIT price."
+            )
+        # Pad a tick so the debit limit is more likely to fill.
+        limit = round(float(limit) + 0.01, 2)
+    else:
+        limit = round(float(limit), 2)
+
+    result = rh.orders.order_buy_option_limit(
+        positionEffect="open",
+        creditOrDebit="debit",
+        price=limit,
+        symbol=symbol,
+        quantity=qty,
+        expirationDate=expiration,
+        strike=strike,
+        optionType=option_type,
+        timeInForce="gtc",
+    )
+    label = f"{symbol} {expiration} {strike:g} {option_type.upper()}"
+    return _format_order("buy-opt", label, float(qty), result) + f"\nLimit: `${limit}`"
+
+
+def _cmd_sell_opt(
+    short_id: str,
+    qty: Optional[int],
+    limit: Optional[float],
+) -> str:
+    """Close an option position referenced by the short id from ``!lia opt``."""
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
+
+    pos = _lookup_opt_position(short_id)
+    if not pos:
+        return (
+            f"Unknown option id `{short_id}`. "
+            "Run `!lia opt` to list positions and ids."
+        )
+
+    symbol = pos.get("_symbol") or "?"
+    expiration = pos.get("_expiration") or "?"
+    strike = float(pos.get("_strike") or 0)
+    option_type = (pos.get("_option_type") or "").lower()
+    held = abs(float(pos.get("_qty") or 0))
+    side = pos.get("_side") or "long"
+
+    if held <= 0:
+        return f"Position `{short_id}` has zero quantity."
+    if option_type not in ("call", "put"):
+        return f"Position `{short_id}` missing call/put type."
+
+    close_qty = int(held) if qty is None else int(qty)
+    if close_qty <= 0:
+        return "quantity must be a positive whole number of contracts."
+    if close_qty > int(held):
+        return f"Only `{_fnum(held, 0)}` contract(s) available (asked `{close_qty}`)."
+
+    if limit is None:
+        q = _option_quote_prices(symbol, expiration, strike, option_type)
+        if side == "long":
+            # Sell to close → credit; use bid/mark.
+            limit = q.get("bid") or q.get("mark") or q.get("ask")
+        else:
+            # Buy to close short → debit; use ask/mark.
+            limit = q.get("ask") or q.get("mark") or q.get("bid")
+        if limit is None:
+            return (
+                f"No quote for `{short_id}` — pass an explicit LIMIT price: "
+                f"`!lia sell opt {short_id} {close_qty} LIMIT`"
+            )
+        limit = round(float(limit), 2)
+        if side == "long":
+            limit = max(0.01, round(limit - 0.01, 2))
+        else:
+            limit = round(limit + 0.01, 2)
+    else:
+        limit = round(float(limit), 2)
+
+    label = (
+        f"{short_id} {symbol} {expiration} {strike:g} {option_type.upper()} "
+        f"({side})"
+    )
+
+    if side == "long":
+        result = rh.orders.order_sell_option_limit(
+            positionEffect="close",
+            creditOrDebit="credit",
+            price=limit,
+            symbol=symbol,
+            quantity=close_qty,
+            expirationDate=expiration,
+            strike=strike,
+            optionType=option_type,
+            timeInForce="gtc",
+        )
+        return (
+            _format_order("sell-opt", label, float(close_qty), result)
+            + f"\nLimit: `${limit}` (sell to close)"
+        )
+
+    # Short position → buy to close.
+    result = rh.orders.order_buy_option_limit(
+        positionEffect="close",
+        creditOrDebit="debit",
+        price=limit,
+        symbol=symbol,
+        quantity=close_qty,
+        expirationDate=expiration,
+        strike=strike,
+        optionType=option_type,
+        timeInForce="gtc",
+    )
+    return (
+        _format_order("buy-to-close", label, float(close_qty), result)
+        + f"\nLimit: `${limit}` (buy to close short)"
+    )
+
+
 def _parse_lia(content: str) -> tuple[str, list[str]]:
     """Return (subcommand, args) for a ``!lia ...`` message.
 
@@ -338,6 +707,47 @@ def _parse_lia(content: str) -> tuple[str, list[str]]:
     if len(parts) == 1:
         return "help", []
     return parts[1].lower(), parts[2:]
+
+
+def _parse_opt_buy_args(args: list[str]) -> tuple[str, str, float, str, int, Optional[float]]:
+    """Parse: TICKER EXP STRIKE call|put QTY [LIMIT]."""
+    if len(args) < 5:
+        raise ValueError(
+            "Usage: `!lia buy opt TICKER YYYY-MM-DD STRIKE call|put QTY [LIMIT]`"
+        )
+    symbol = args[0].upper().strip()
+    expiration = args[1].strip()
+    # Validate date shape early.
+    datetime.strptime(expiration, "%Y-%m-%d")
+    strike = float(args[2])
+    option_type = args[3].lower().strip()
+    qty = int(float(args[4]))
+    limit = float(args[5]) if len(args) >= 6 else None
+    if option_type not in ("call", "put", "c", "p"):
+        raise ValueError("option type must be `call` or `put`")
+    if option_type == "c":
+        option_type = "call"
+    if option_type == "p":
+        option_type = "put"
+    return symbol, expiration, strike, option_type, qty, limit
+
+
+def _parse_opt_sell_args(
+    args: list[str],
+) -> tuple[str, Optional[int], Optional[float]]:
+    """Parse: <id> [QTY] [LIMIT]."""
+    if not args:
+        raise ValueError(
+            "Usage: `!lia sell opt <id> [QTY] [LIMIT]` — ids from `!lia opt`"
+        )
+    short_id = args[0].strip()
+    qty: Optional[int] = None
+    limit: Optional[float] = None
+    if len(args) >= 2:
+        qty = int(float(args[1]))
+    if len(args) >= 3:
+        limit = float(args[2])
+    return short_id, qty, limit
 
 
 async def _handle_message(msg: discord.Message) -> None:
@@ -359,8 +769,18 @@ async def _handle_message(msg: discord.Message) -> None:
             await msg.reply(_cmd_today())
             return
 
+        if sub in ("opt", "opts", "options"):
+            # `!lia opt` / `!lia options` → list option positions.
+            # `!lia opt positions` also accepted.
+            await msg.reply(_cmd_opt_positions())
+            return
+
         if sub in ("positions", "position", "own", "holdings", "portfolio"):
-            await msg.reply(_cmd_positions())
+            # `!lia positions opt` → option positions; else stocks.
+            if args and args[0].lower() in ("opt", "opts", "options", "option"):
+                await msg.reply(_cmd_opt_positions())
+            else:
+                await msg.reply(_cmd_positions())
             return
 
         if sub in ("buy", "sell"):
@@ -371,8 +791,46 @@ async def _handle_message(msg: discord.Message) -> None:
                     f"`LIA_DISCORD_ALLOWLIST`)."
                 )
                 return
+
+            # Options branch: `!lia buy opt ...` / `!lia sell opt <id>`
+            if args and args[0].lower() in ("opt", "option", "opts", "options"):
+                opt_args = args[1:]
+                if sub == "buy":
+                    try:
+                        symbol, exp, strike, otype, qty, limit = _parse_opt_buy_args(
+                            opt_args
+                        )
+                    except ValueError as e:
+                        await msg.reply(str(e))
+                        return
+                    await msg.reply(
+                        f"Submitting **buy-opt** `{symbol} {exp} "
+                        f"{strike:g} {otype}` x `{qty}`…"
+                    )
+                    await msg.reply(
+                        _cmd_buy_opt(symbol, exp, strike, otype, qty, limit)
+                    )
+                    return
+
+                try:
+                    short_id, qty, limit = _parse_opt_sell_args(opt_args)
+                except ValueError as e:
+                    await msg.reply(str(e))
+                    return
+                await msg.reply(
+                    f"Submitting **sell-opt** `{short_id}`"
+                    + (f" x `{qty}`" if qty is not None else " (all)")
+                    + "…"
+                )
+                await msg.reply(_cmd_sell_opt(short_id, qty, limit))
+                return
+
+            # Stock branch.
             if len(args) != 2:
-                await msg.reply(f"Usage: `!lia {sub} TICKER QTY`")
+                await msg.reply(
+                    f"Usage: `!lia {sub} TICKER QTY` "
+                    f"or `!lia {sub} opt …` (see `!lia help`)"
+                )
                 return
             symbol = args[0].upper().strip()
             try:
