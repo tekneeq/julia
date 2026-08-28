@@ -61,8 +61,12 @@ HELP_TEXT = """**Julia · `!lia` commands**
 Examples:
 `!lia buy AAPL 1`
 `!lia buy opt SPY 2026-09-05 550 call 1`
+`!lia buy opt SPY 0dte 755 call 1`
+`!lia buy opt SPY 0dte atm call 1`
 `!lia sell opt a1b2c3`
 
+EXP can be `YYYY-MM-DD`, `0dte`, `1dte`, … (Nth upcoming listed expiration).
+STRIKE can be a number or `atm` (closest listed strike to spot).
 Stock qty may be fractional. Option qty is whole contracts.
 Buy/sell place **real orders**. Option orders are **limit** (default: mark).
 """
@@ -709,17 +713,24 @@ def _parse_lia(content: str) -> tuple[str, list[str]]:
     return parts[1].lower(), parts[2:]
 
 
-def _parse_opt_buy_args(args: list[str]) -> tuple[str, str, float, str, int, Optional[float]]:
-    """Parse: TICKER EXP STRIKE call|put QTY [LIMIT]."""
+def _parse_opt_buy_args(
+    args: list[str],
+) -> tuple[str, str, str, str, int, Optional[float]]:
+    """Parse: TICKER EXP STRIKE call|put QTY [LIMIT].
+
+    EXP may be ``YYYY-MM-DD`` or ``Ndte`` (e.g. ``0dte``).
+    STRIKE may be a number or ``atm``.
+    Resolution of aliases happens later in ``_resolve_opt_buy``.
+    """
     if len(args) < 5:
         raise ValueError(
-            "Usage: `!lia buy opt TICKER YYYY-MM-DD STRIKE call|put QTY [LIMIT]`"
+            "Usage: `!lia buy opt TICKER EXP STRIKE call|put QTY [LIMIT]`\n"
+            "EXP: `YYYY-MM-DD` or `0dte`/`1dte`/…  ·  "
+            "STRIKE: number or `atm`"
         )
     symbol = args[0].upper().strip()
-    expiration = args[1].strip()
-    # Validate date shape early.
-    datetime.strptime(expiration, "%Y-%m-%d")
-    strike = float(args[2])
+    expiration = args[1].strip().lower()
+    strike_token = args[2].strip().lower()
     option_type = args[3].lower().strip()
     qty = int(float(args[4]))
     limit = float(args[5]) if len(args) >= 6 else None
@@ -729,7 +740,131 @@ def _parse_opt_buy_args(args: list[str]) -> tuple[str, str, float, str, int, Opt
         option_type = "call"
     if option_type == "p":
         option_type = "put"
-    return symbol, expiration, strike, option_type, qty, limit
+
+    # Light validation — full resolve needs RH login.
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiration) and not re.fullmatch(
+        r"\d+dte", expiration
+    ):
+        raise ValueError(
+            f"Bad EXP `{expiration}` — use `YYYY-MM-DD` or `0dte`/`1dte`/…"
+        )
+    if strike_token != "atm":
+        try:
+            float(strike_token)
+        except ValueError as e:
+            raise ValueError(
+                f"Bad STRIKE `{strike_token}` — use a number or `atm`"
+            ) from e
+    if qty <= 0:
+        raise ValueError("quantity must be a positive whole number of contracts")
+    return symbol, expiration, strike_token, option_type, qty, limit
+
+
+def _listed_expirations(symbol: str) -> list[str]:
+    """Upcoming expiration dates for ``symbol`` from the RH option chain."""
+    import robin_stocks.robinhood as rh
+
+    chain = rh.options.get_chains(symbol) or {}
+    if isinstance(chain, list):
+        chain = chain[0] if chain else {}
+    dates = list(chain.get("expiration_dates") or [])
+    today = _today_et().isoformat()
+    upcoming = sorted(d for d in dates if isinstance(d, str) and d >= today)
+    if not upcoming:
+        raise ValueError(f"No upcoming option expirations listed for `{symbol}`")
+    return upcoming
+
+
+def _resolve_expiration(symbol: str, exp_token: str) -> tuple[str, str]:
+    """Return ``(YYYY-MM-DD, note)`` for a date or ``Ndte`` token."""
+    token = exp_token.strip().lower()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
+        datetime.strptime(token, "%Y-%m-%d")  # validate
+        return token, token
+
+    m = re.fullmatch(r"(\d+)dte", token)
+    if not m:
+        raise ValueError(f"Bad EXP `{exp_token}`")
+    n = int(m.group(1))
+    upcoming = _listed_expirations(symbol)
+    if n >= len(upcoming):
+        raise ValueError(
+            f"`{token}` needs upcoming[{n}] but `{symbol}` only has "
+            f"{len(upcoming)} listed date(s): {', '.join(upcoming[:5])}"
+            + ("…" if len(upcoming) > 5 else "")
+        )
+    resolved = upcoming[n]
+    note = f"{token} → {resolved}"
+    if n == 0 and resolved != _today_et().isoformat():
+        note += " _(no same-day expiry; nearest listed)_"
+    return resolved, note
+
+
+def _resolve_strike(
+    symbol: str,
+    expiration: str,
+    strike_token: str,
+    option_type: str,
+) -> tuple[float, str]:
+    """Return ``(strike, note)`` for a numeric strike or ``atm``."""
+    token = strike_token.strip().lower()
+    if token != "atm":
+        strike = float(token)
+        return strike, f"{strike:g}"
+
+    import robin_stocks.robinhood as rh
+
+    spot_list = rh.stocks.get_latest_price(
+        symbol, priceType=None, includeExtendedHours=True
+    )
+    if not spot_list or spot_list[0] is None:
+        raise ValueError(f"Could not fetch spot for `{symbol}` to resolve atm")
+    spot = float(spot_list[0])
+
+    rows = rh.options.find_options_by_expiration(
+        symbol, expirationDate=expiration, optionType=option_type
+    ) or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    strikes: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            strikes.append(float(row["strike_price"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    strikes = sorted(set(strikes))
+    if not strikes:
+        raise ValueError(
+            f"No {option_type} strikes listed for `{symbol}` {expiration}"
+        )
+    atm = min(strikes, key=lambda s: abs(s - spot))
+    return atm, f"atm → {atm:g} (spot `{spot:g}`)"
+
+
+def _resolve_opt_buy(
+    symbol: str,
+    exp_token: str,
+    strike_token: str,
+    option_type: str,
+    qty: int,
+    limit: Optional[float],
+) -> tuple[str, float, str]:
+    """Resolve aliases then place the buy. Returns ``(reply, strike, expiration)``."""
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`.", 0.0, ""
+    try:
+        expiration, exp_note = _resolve_expiration(symbol, exp_token)
+        strike, strike_note = _resolve_strike(
+            symbol, expiration, strike_token, option_type
+        )
+    except ValueError as e:
+        return f"❌ {e}", 0.0, ""
+
+    result = _cmd_buy_opt(symbol, expiration, strike, option_type, qty, limit)
+    header = f"Resolved `{exp_token}`/`{strike_token}` → **{exp_note}**, **{strike_note}**"
+    return f"{header}\n{result}", strike, expiration
 
 
 def _parse_opt_sell_args(
@@ -797,18 +932,25 @@ async def _handle_message(msg: discord.Message) -> None:
                 opt_args = args[1:]
                 if sub == "buy":
                     try:
-                        symbol, exp, strike, otype, qty, limit = _parse_opt_buy_args(
-                            opt_args
-                        )
+                        (
+                            symbol,
+                            exp_token,
+                            strike_token,
+                            otype,
+                            qty,
+                            limit,
+                        ) = _parse_opt_buy_args(opt_args)
                     except ValueError as e:
                         await msg.reply(str(e))
                         return
                     await msg.reply(
-                        f"Submitting **buy-opt** `{symbol} {exp} "
-                        f"{strike:g} {otype}` x `{qty}`…"
+                        f"Submitting **buy-opt** `{symbol} {exp_token} "
+                        f"{strike_token} {otype}` x `{qty}`…"
                     )
                     await msg.reply(
-                        _cmd_buy_opt(symbol, exp, strike, otype, qty, limit)
+                        _resolve_opt_buy(
+                            symbol, exp_token, strike_token, otype, qty, limit
+                        )[0]
                     )
                     return
 

@@ -174,8 +174,13 @@ The bot **only** responds to `!lia …` messages:
 !lia positions          # stock holdings  (!lia own works too)
 !lia opt                # open option positions with short ids
 !lia buy  opt SPY 2026-09-05 550 call 1 [LIMIT]
+!lia buy  opt SPY 0dte 755 call 1
+!lia buy  opt SPY 0dte atm call 1
 !lia sell opt <id> [QTY] [LIMIT]   # close by id from !lia opt
 ```
+
+`EXP` accepts `YYYY-MM-DD` or `0dte` / `1dte` / … (Nth upcoming listed expiration).
+`STRIKE` accepts a number or `atm` (closest listed strike to spot).
 
 ## Usage
 
