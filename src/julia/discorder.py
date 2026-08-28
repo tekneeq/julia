@@ -1,10 +1,12 @@
 """Julia Discord bot — ``!lia`` command surface.
 
-Only messages that start with ``!lia`` are handled. Start small:
+Only messages that start with ``!lia`` are handled:
 
     !lia help
     !lia buy  AAPL 1
     !lia sell AAPL 0.5
+    !lia today              # buys submitted/filled today (ET)
+    !lia positions          # what you own (sellable qty)
 
 Buy/sell submit **live Robinhood market orders** (fractional-capable) using
 the host ``RH_USERNAME`` / ``RH_PASSWORD``.
@@ -13,7 +15,7 @@ Env (``.env`` on the julia EC2 host, loaded by docker ``--env-file``):
 
     DISCORD_BOT_TOKEN         required
     DISCORD_CHANNEL_ID        optional ready greeting
-    RH_USERNAME / RH_PASSWORD required for buy/sell
+    RH_USERNAME / RH_PASSWORD required for trading / portfolio commands
     LIA_DISCORD_ALLOWLIST     optional comma-separated Discord user IDs
                               allowed to run buy/sell (everyone if unset)
 """
@@ -21,7 +23,9 @@ from __future__ import annotations
 
 import os
 import traceback
+from datetime import date, datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -36,16 +40,24 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+ET = ZoneInfo("America/New_York")
+
 HELP_TEXT = """**Julia · `!lia` commands**
 ```
 !lia help                 this message
 !lia buy  TICKER QTY      market buy  (live Robinhood)
 !lia sell TICKER QTY      market sell (live Robinhood)
+!lia today                buys you placed today (ET)
+!lia positions            what you own / can sell
+!lia own                  alias for positions
 ```
-Examples: `!lia buy AAPL 1` · `!lia sell SPY 0.5`
+Examples: `!lia buy AAPL 1` · `!lia sell SPY 0.5` · `!lia today`
 
-Qty may be fractional (up to 6 decimals). These place **real orders**.
+Qty may be fractional (up to 6 decimals). Buy/sell place **real orders**.
 """
+
+# Discord hard limit is 2000; leave room for reply chrome.
+_DISCORD_SAFE_LEN = 1800
 
 
 def _ensure_rh_login() -> bool:
@@ -78,6 +90,56 @@ def _parse_qty(raw: str) -> float:
         raise ValueError("quantity must be > 0")
     # Robinhood fractional shares support up to 6 decimal places.
     return round(qty, 6)
+
+
+def _fnum(value: Any, digits: int = 4) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    text = f"{v:,.{digits}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _clip(text: str) -> str:
+    if len(text) <= _DISCORD_SAFE_LEN:
+        return text
+    return text[: _DISCORD_SAFE_LEN - 20] + "\n… _(truncated)_"
+
+
+def _today_et() -> date:
+    return datetime.now(ET).date()
+
+
+def _order_created_date(order: dict[str, Any]) -> Optional[date]:
+    raw = order.get("created_at") or order.get("last_transaction_at") or ""
+    if not raw:
+        return None
+    try:
+        # RH timestamps look like 2026-08-27T14:32:01.123456Z
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(ET).date()
+    except ValueError:
+        return None
+
+
+def _symbol_for_order(order: dict[str, Any]) -> str:
+    sym = (order.get("symbol") or "").upper()
+    if sym:
+        return sym
+    # Fall back: resolve instrument URL → ticker.
+    url = order.get("instrument")
+    if not url:
+        return "?"
+    try:
+        import robin_stocks.robinhood as rh
+
+        resolved = rh.stocks.get_symbol_by_url(url)
+        return (resolved or "?").upper()
+    except Exception:  # noqa: BLE001
+        return "?"
 
 
 def _format_order(side: str, symbol: str, qty: float, result: Any) -> str:
@@ -132,6 +194,137 @@ def _cmd_sell(symbol: str, qty: float) -> str:
     return _format_order("sell", symbol, qty, result)
 
 
+def _cmd_today() -> str:
+    """Buys placed today (America/New_York calendar day)."""
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
+
+    today = _today_et()
+    start = today.isoformat()
+    try:
+        orders = rh.orders.get_all_stock_orders(start_date=start) or []
+    except TypeError:
+        # Older robin_stocks without start_date — pull all and filter.
+        orders = rh.orders.get_all_stock_orders() or []
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to load orders: `{type(e).__name__}: {e}`"
+
+    if isinstance(orders, dict):
+        orders = [orders]
+
+    buys: list[dict[str, Any]] = []
+    sells_today = 0
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        created = _order_created_date(order)
+        if created != today:
+            continue
+        side = (order.get("side") or "").lower()
+        if side == "sell":
+            sells_today += 1
+            continue
+        if side != "buy":
+            continue
+        buys.append(order)
+
+    if not buys:
+        extra = (
+            f" ({sells_today} sell(s) today)" if sells_today else ""
+        )
+        return f"No **buys** today ({today.isoformat()} ET){extra}."
+
+    # Newest first.
+    buys.sort(
+        key=lambda o: o.get("created_at") or "",
+        reverse=True,
+    )
+
+    lines = [f"**Buys today** ({today.isoformat()} ET) · {len(buys)}"]
+    for order in buys[:25]:
+        sym = _symbol_for_order(order)
+        qty = order.get("cumulative_quantity") or order.get("quantity") or "?"
+        state = order.get("state") or "?"
+        px = order.get("average_price") or order.get("price") or "—"
+        created = order.get("created_at") or ""
+        hhmm = ""
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(ET)
+            hhmm = dt.strftime("%H:%M")
+        except ValueError:
+            pass
+        lines.append(
+            f"`{hhmm or '??:??'}` **{sym}** x `{_fnum(qty)}` @ `{_fnum(px)}` · `{state}`"
+        )
+    if len(buys) > 25:
+        lines.append(f"_…and {len(buys) - 25} more_")
+    if sells_today:
+        lines.append(f"_Also {sells_today} sell order(s) today._")
+    return _clip("\n".join(lines))
+
+
+def _cmd_positions() -> str:
+    """Open stock holdings — what you can sell."""
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
+
+    try:
+        holdings = rh.account.build_holdings() or {}
+    except Exception as e:  # noqa: BLE001
+        return f"Failed to load holdings: `{type(e).__name__}: {e}`"
+
+    if not isinstance(holdings, dict) or not holdings:
+        return "No open stock positions."
+
+    rows: list[tuple[float, str, dict[str, Any]]] = []
+    for symbol, info in holdings.items():
+        if not isinstance(info, dict):
+            continue
+        try:
+            qty = float(info.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        try:
+            equity = float(info.get("equity") or 0)
+        except (TypeError, ValueError):
+            equity = 0.0
+        rows.append((equity, symbol.upper(), info))
+
+    if not rows:
+        return "No open stock positions."
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+    lines = [f"**Positions** · {len(rows)} holdings (sorted by equity)"]
+    for equity, symbol, info in rows[:40]:
+        qty = info.get("quantity")
+        avg = info.get("average_buy_price")
+        price = info.get("price")
+        pct = info.get("percent_change")
+        name = info.get("name") or ""
+        pct_s = ""
+        if pct not in (None, ""):
+            try:
+                p = float(pct)
+                sign = "+" if p >= 0 else ""
+                pct_s = f" · `{sign}{p:.2f}%`"
+            except (TypeError, ValueError):
+                pct_s = f" · `{pct}`"
+        label = f"  {name}" if name and name.upper() != symbol else ""
+        lines.append(
+            f"`{symbol:<6}` qty `{_fnum(qty)}` · "
+            f"avg `{_fnum(avg)}` · last `{_fnum(price)}` · "
+            f"eq `${_fnum(equity, 2)}`{pct_s}{label}"
+        )
+    if len(rows) > 40:
+        lines.append(f"_…and {len(rows) - 40} more_")
+    lines.append("_Sell with_ `!lia sell TICKER QTY`")
+    return _clip("\n".join(lines))
+
+
 def _parse_lia(content: str) -> tuple[str, list[str]]:
     """Return (subcommand, args) for a ``!lia ...`` message.
 
@@ -160,6 +353,14 @@ async def _handle_message(msg: discord.Message) -> None:
     try:
         if sub in ("help", "commands", "?"):
             await msg.reply(HELP_TEXT)
+            return
+
+        if sub in ("today", "buys"):
+            await msg.reply(_cmd_today())
+            return
+
+        if sub in ("positions", "position", "own", "holdings", "portfolio"):
+            await msg.reply(_cmd_positions())
             return
 
         if sub in ("buy", "sell"):

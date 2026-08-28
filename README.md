@@ -170,6 +170,8 @@ The bot **only** responds to `!lia …` messages:
 !lia help
 !lia buy  AAPL 1        # live Robinhood market buy
 !lia sell AAPL 0.5      # live Robinhood market sell (fractional ok)
+!lia today              # buys placed today (ET)
+!lia positions          # what you own / can sell  (!lia own works too)
 ```
 
 ## Usage
