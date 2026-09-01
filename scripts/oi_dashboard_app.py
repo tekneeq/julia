@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -3404,6 +3404,238 @@ def _ma_over_bars(
     return sma_full[n_prior:], ema_full[n_prior:]
 
 
+# ---------------------------------------------------------------------------
+# GEX day levels (for Today's price action)
+# ---------------------------------------------------------------------------
+
+_GEX_HIGH_COLOR = "#ff9800"  # amber ceiling
+_GEX_LOW_COLOR = "#26c6da"   # cyan floor
+
+
+def _fmt_gex_dollars(value: float) -> str:
+    abs_v = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_v >= 1e9:
+        return f"{sign}${abs_v / 1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"{sign}${abs_v / 1e6:.1f}M"
+    if abs_v >= 1e3:
+        return f"{sign}${abs_v / 1e3:.0f}K"
+    return f"{sign}${abs_v:,.0f}"
+
+
+def _pick_day_gex_snapshot(ticker: str, today: date):
+    """Prefer a snapshot for today's expiration (0DTE); else nearest upcoming."""
+    today_s = today.isoformat()
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=today_s, limit=1
+    )
+    if rows:
+        return rows[0]
+
+    recent = gex_store.recent_snapshots(ticker=ticker, limit=40)
+    if not recent:
+        return None
+    upcoming = [
+        r for r in recent
+        if (r["expiration_date"] or "") >= today_s
+    ]
+    if upcoming:
+        nearest_exp = min(r["expiration_date"] for r in upcoming)
+        candidates = [
+            r for r in upcoming if r["expiration_date"] == nearest_exp
+        ]
+        return max(candidates, key=lambda r: r["captured_at"] or "")
+    return recent[0]
+
+
+def _gex_levels_vs_ref(
+    *,
+    ticker: str,
+    today: date,
+    ref: float | None,
+) -> dict | None:
+    """Build day's GEX env + high/low walls relative to yesterday's close.
+
+    High = largest-|GEX| strike **above** ``ref`` (ceiling).
+    Low  = largest-|GEX| strike **below** ``ref`` (floor).
+    Env uses julia's put+/call− sign convention:
+      total > 0 → positive / long-gamma dealers (stabilizing)
+      total < 0 → negative / short-gamma dealers (destabilizing)
+    """
+    snap = _pick_day_gex_snapshot(ticker, today)
+    if snap is None:
+        return None
+    strikes = gex_store.get_strikes(snap["id"])
+    if not strikes:
+        return None
+
+    gex_by_strike: dict[float, float] = {}
+    gex_values: list[float] = []
+    for row in strikes:
+        try:
+            k = float(row["strike_price"])
+            g = float(row["gex_per_contract"] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        gex_by_strike[k] = gex_by_strike.get(k, 0.0) + g
+        gex_values.append(g)
+
+    if not gex_by_strike:
+        return None
+
+    total = snap["total_gex"]
+    if total is None:
+        total = sum(gex_values)
+    total = float(total)
+    call_gex = float(snap["call_gex"] or 0.0)
+    put_gex = float(snap["put_gex"] or 0.0)
+
+    if abs(total) < 1_000_000:
+        env = "NEUTRAL"
+        env_label = "Gamma neutral"
+        meaning = (
+            "Dealers are roughly flat gamma. Limited systematic hedging "
+            "flow — price is freer to wander without GEX pinning."
+        )
+    elif total > 0:
+        env = "POSITIVE"
+        env_label = "Positive GEX (long gamma)"
+        meaning = (
+            "Dealers are net **long gamma** (put-heavy in julia's sign "
+            "convention). Expect mean-reversion: they **buy dips / sell "
+            "rips**, which dampens moves and can pin price near large "
+            "positive-GEX walls."
+        )
+    else:
+        env = "NEGATIVE"
+        env_label = "Negative GEX (short gamma)"
+        meaning = (
+            "Dealers are net **short gamma** (call-heavy in julia's sign "
+            "convention). Expect trend amplification: they **sell dips / "
+            "buy rips**, so breaks through GEX walls can accelerate."
+        )
+
+    anchor = float(ref) if ref else float(snap["spot_price"] or 0)
+    above = {k: v for k, v in gex_by_strike.items() if k > anchor}
+    below = {k: v for k, v in gex_by_strike.items() if k < anchor}
+
+    high = max(above.items(), key=lambda kv: abs(kv[1])) if above else None
+    low = max(below.items(), key=lambda kv: abs(kv[1])) if below else None
+
+    return {
+        "snapshot_id": snap["id"],
+        "expiration": snap["expiration_date"],
+        "captured_at": snap["captured_at"],
+        "spot_at_snap": float(snap["spot_price"] or 0),
+        "anchor": anchor,
+        "anchor_is_ref": bool(ref),
+        "total_gex": total,
+        "call_gex": call_gex,
+        "put_gex": put_gex,
+        "env": env,
+        "env_label": env_label,
+        "meaning": meaning,
+        "high": high,
+        "low": low,
+    }
+
+
+def _add_gex_level_overlays(fig: go.Figure, gex: dict) -> None:
+    """Draw GEX high/low hlines on the price pane."""
+    if gex.get("high"):
+        strike, gex_v = gex["high"]
+        fig.add_hline(
+            y=float(strike),
+            line_color=_GEX_HIGH_COLOR,
+            line_width=1.4,
+            line_dash="dash",
+            annotation_text=(
+                f"GEX high {float(strike):,.0f} "
+                f"({_fmt_gex_dollars(float(gex_v))})"
+            ),
+            annotation_position="top right",
+            annotation_font=dict(size=11, color=_GEX_HIGH_COLOR),
+            row=1, col=1,
+        )
+    if gex.get("low"):
+        strike, gex_v = gex["low"]
+        fig.add_hline(
+            y=float(strike),
+            line_color=_GEX_LOW_COLOR,
+            line_width=1.4,
+            line_dash="dash",
+            annotation_text=(
+                f"GEX low {float(strike):,.0f} "
+                f"({_fmt_gex_dollars(float(gex_v))})"
+            ),
+            annotation_position="bottom right",
+            annotation_font=dict(size=11, color=_GEX_LOW_COLOR),
+            row=1, col=1,
+        )
+
+
+def _gex_snap_age_label(captured_at: str | None) -> str:
+    if not captured_at:
+        return "unknown age"
+    try:
+        ts = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = int((datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds())
+        return _format_age(max(0, age))
+    except ValueError:
+        return captured_at
+
+
+def _render_gex_day_summary(gex: dict) -> None:
+    """Env metrics + plain-English meaning under the live chart."""
+    st.markdown(
+        f"**GEX env** · {gex['env_label']} · "
+        f"net `{_fmt_gex_dollars(gex['total_gex'])}` · "
+        f"exp `{gex['expiration']}` · "
+        f"snap {_gex_snap_age_label(gex.get('captured_at'))}"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Net GEX", _fmt_gex_dollars(gex["total_gex"]), gex["env"])
+    with c2:
+        st.metric(
+            "Call GEX",
+            _fmt_gex_dollars(gex["call_gex"]),
+            help="Calls are signed negative in julia (dealer short-call / amplifying).",
+        )
+    with c3:
+        st.metric(
+            "Put GEX",
+            _fmt_gex_dollars(gex["put_gex"]),
+            help="Puts are signed positive in julia (dealer short-put / stabilizing).",
+        )
+    with c4:
+        hi = gex.get("high")
+        lo = gex.get("low")
+        anchor = gex["anchor"]
+        hi_s = f"${hi[0]:,.0f}" if hi else "—"
+        lo_s = f"${lo[0]:,.0f}" if lo else "—"
+        st.metric(
+            "GEX high / low",
+            f"{hi_s} / {lo_s}",
+            (
+                f"vs {'prev close' if gex['anchor_is_ref'] else 'snap spot'} "
+                f"${anchor:,.2f}"
+            ),
+            delta_color="off",
+            help=(
+                "Largest-|GEX| strike above and below yesterday's close "
+                "(or snapshot spot if prev close is unavailable). These are "
+                "the day's gamma walls / magnets on the live chart."
+            ),
+        )
+
+    st.caption(gex["meaning"])
+
+
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
@@ -3425,6 +3657,16 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             "or wait for the next scheduler fire / market-bar sync."
         )
         return
+
+    gex = None
+    try:
+        gex = _gex_levels_vs_ref(
+            ticker=ticker,
+            today=today,
+            ref=float(ref) if ref else None,
+        )
+    except Exception:
+        gex = None
 
     xs = [e["ts"] for e in series]
     ys = [e["price"] for e in series]
@@ -3490,7 +3732,9 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "returns to this session. The **histogram on the $ axis** "
         "is volume-at-price (longest bar = most volume / POC). "
         "The strip under the candles is volume-over-time: "
-        "**bright** = above the 20-bar average, **faded** = light."
+        "**bright** = above the 20-bar average, **faded** = light. "
+        "**Amber / cyan** dashed lines are the day's GEX high / low "
+        "walls vs yesterday's close."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
@@ -3520,6 +3764,8 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             annotation_font=dict(size=11, color=_TV_MUTED),
             row=1, col=1,
         )
+    if gex is not None:
+        _add_gex_level_overlays(fig, gex)
 
     if use_candles:
         fig.add_trace(go.Candlestick(
@@ -3683,6 +3929,11 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     y_all = ys + ([ref] if ref else []) + today_ma
     if use_candles:
         y_all.extend(v for b in today_bars for v in (b["h"], b["l"]))
+    if gex is not None:
+        if gex.get("high"):
+            y_all.append(float(gex["high"][0]))
+        if gex.get("low"):
+            y_all.append(float(gex["low"][0]))
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
@@ -3907,6 +4158,14 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 "Minutes with no tick fall back to Robinhood 5-minute "
                 "bars, then scheduler snapshots."
             ),
+        )
+
+    if gex is not None:
+        _render_gex_day_summary(gex)
+    else:
+        st.caption(
+            "GEX levels unavailable — no cached GEX snapshot for this "
+            "ticker yet (run an OI/GEX refresh)."
         )
 
 
