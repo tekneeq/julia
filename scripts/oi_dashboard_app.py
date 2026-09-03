@@ -3410,6 +3410,8 @@ def _ma_over_bars(
 
 _GEX_HIGH_COLOR = "#ff9800"  # amber ceiling
 _GEX_LOW_COLOR = "#26c6da"   # cyan floor
+_HOD_LOD_LOOKBACK = 30
+_HOD_LOD_BUCKET_MIN = 30  # half-hour windows across the regular session
 
 
 def _fmt_gex_dollars(value: float) -> str:
@@ -3424,21 +3426,83 @@ def _fmt_gex_dollars(value: float) -> str:
     return f"{sign}${abs_v:,.0f}"
 
 
-def _pick_day_gex_snapshot(ticker: str, today: date):
-    """Prefer a snapshot for today's expiration (0DTE); else nearest upcoming."""
-    today_s = today.isoformat()
+def _gex_env_short(env: str) -> str:
+    return {
+        "POSITIVE": "GEX+",
+        "NEGATIVE": "GEX−",
+        "NEUTRAL": "GEX≈",
+    }.get(env, "GEX")
+
+
+def _session_ref_from_path(path: list[dict] | None) -> float | None:
+    """Recover prior close from a densified session path."""
+    if not path:
+        return None
+    p0 = path[0]
+    try:
+        spot = float(p0["spot"])
+        pct = float(p0["pct"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    denom = 1.0 + pct / 100.0
+    if abs(denom) < 1e-12:
+        return None
+    ref = spot / denom
+    return ref if ref > 0 else None
+
+
+def _session_ref_spot(
+    ticker: str, session_day: date, path: list[dict] | None = None,
+) -> float | None:
+    day_s = session_day.isoformat()
+    for s in daily_moves_store.list_sessions(ticker):
+        if s["session_date"] == day_s:
+            try:
+                ref = float(s["ref_spot"])
+            except (TypeError, ValueError):
+                break
+            if ref > 0:
+                return ref
+            break
+    return _session_ref_from_path(path)
+
+
+def _pick_day_gex_snapshot(
+    ticker: str,
+    session_day: date,
+    *,
+    allow_upcoming_fallback: bool = False,
+):
+    """Prefer 0DTE for ``session_day``; else a snapshot captured that day.
+
+    Upcoming-expiration fallback is only for the live session (when
+    ``allow_upcoming_fallback``), so historical cards never inherit
+    unrelated modern GEX.
+    """
+    day_s = session_day.isoformat()
     rows = gex_store.recent_snapshots(
-        ticker=ticker, expiration_date=today_s, limit=1
+        ticker=ticker, expiration_date=day_s, limit=1
     )
     if rows:
         return rows[0]
 
-    recent = gex_store.recent_snapshots(ticker=ticker, limit=40)
+    recent = gex_store.recent_snapshots(ticker=ticker, limit=500)
     if not recent:
         return None
+
+    same_day = [
+        r for r in recent
+        if (r["captured_at"] or "")[:10] == day_s
+    ]
+    if same_day:
+        return max(same_day, key=lambda r: r["captured_at"] or "")
+
+    if not allow_upcoming_fallback:
+        return None
+
     upcoming = [
         r for r in recent
-        if (r["expiration_date"] or "") >= today_s
+        if (r["expiration_date"] or "") >= day_s
     ]
     if upcoming:
         nearest_exp = min(r["expiration_date"] for r in upcoming)
@@ -3454,6 +3518,7 @@ def _gex_levels_vs_ref(
     ticker: str,
     today: date,
     ref: float | None,
+    allow_upcoming_fallback: bool | None = None,
 ) -> dict | None:
     """Build day's GEX env + high/low walls relative to yesterday's close.
 
@@ -3463,7 +3528,11 @@ def _gex_levels_vs_ref(
       total > 0 → positive / long-gamma dealers (stabilizing)
       total < 0 → negative / short-gamma dealers (destabilizing)
     """
-    snap = _pick_day_gex_snapshot(ticker, today)
+    if allow_upcoming_fallback is None:
+        allow_upcoming_fallback = today == date.today()
+    snap = _pick_day_gex_snapshot(
+        ticker, today, allow_upcoming_fallback=allow_upcoming_fallback,
+    )
     if snap is None:
         return None
     strikes = gex_store.get_strikes(snap["id"])
@@ -3541,38 +3610,87 @@ def _gex_levels_vs_ref(
     }
 
 
-def _add_gex_level_overlays(fig: go.Figure, gex: dict) -> None:
-    """Draw GEX high/low hlines on the price pane."""
-    if gex.get("high"):
-        strike, gex_v = gex["high"]
+def _strike_as_pct(strike: float, ref: float) -> float | None:
+    if ref is None or float(ref) <= 0:
+        return None
+    return (float(strike) - float(ref)) / float(ref) * 100.0
+
+
+def _add_gex_level_overlays(
+    fig: go.Figure,
+    gex: dict,
+    *,
+    as_pct_ref: float | None = None,
+    row: int | None = 1,
+    col: int | None = 1,
+    compact: bool = False,
+) -> None:
+    """Draw GEX high/low hlines on a $ pane, or as % vs ``as_pct_ref``."""
+    subplot = {}
+    if row is not None and col is not None:
+        subplot = {"row": row, "col": col}
+
+    for side, color, pos in (
+        ("high", _GEX_HIGH_COLOR, "top right"),
+        ("low", _GEX_LOW_COLOR, "bottom right"),
+    ):
+        level = gex.get(side)
+        if not level:
+            continue
+        strike, gex_v = level
+        strike_f = float(strike)
+        gex_f = float(gex_v)
+        if as_pct_ref is not None:
+            y = _strike_as_pct(strike_f, as_pct_ref)
+            if y is None:
+                continue
+            if compact:
+                label = f"GEX {side[0].upper()} {y:+.2f}%"
+            else:
+                label = (
+                    f"GEX {side} {strike_f:,.0f} ({y:+.2f}%) "
+                    f"({_fmt_gex_dollars(gex_f)})"
+                )
+        else:
+            y = strike_f
+            if compact:
+                label = f"GEX {side[0].upper()} {strike_f:,.0f}"
+            else:
+                label = (
+                    f"GEX {side} {strike_f:,.0f} "
+                    f"({_fmt_gex_dollars(gex_f)})"
+                )
         fig.add_hline(
-            y=float(strike),
-            line_color=_GEX_HIGH_COLOR,
-            line_width=1.4,
+            y=y,
+            line_color=color,
+            line_width=1.1 if compact else 1.4,
             line_dash="dash",
-            annotation_text=(
-                f"GEX high {float(strike):,.0f} "
-                f"({_fmt_gex_dollars(float(gex_v))})"
+            annotation_text=label,
+            annotation_position=pos,
+            annotation_font=dict(
+                size=9 if compact else 11,
+                color=color,
             ),
-            annotation_position="top right",
-            annotation_font=dict(size=11, color=_GEX_HIGH_COLOR),
-            row=1, col=1,
+            **subplot,
         )
-    if gex.get("low"):
-        strike, gex_v = gex["low"]
-        fig.add_hline(
-            y=float(strike),
-            line_color=_GEX_LOW_COLOR,
-            line_width=1.4,
-            line_dash="dash",
-            annotation_text=(
-                f"GEX low {float(strike):,.0f} "
-                f"({_fmt_gex_dollars(float(gex_v))})"
-            ),
-            annotation_position="bottom right",
-            annotation_font=dict(size=11, color=_GEX_LOW_COLOR),
-            row=1, col=1,
+
+
+def _gex_info_caption(gex: dict, *, compact: bool = False) -> str:
+    hi = gex.get("high")
+    lo = gex.get("low")
+    hi_s = f"${hi[0]:,.0f}" if hi else "—"
+    lo_s = f"${lo[0]:,.0f}" if lo else "—"
+    if compact:
+        return (
+            f"{_gex_env_short(gex['env'])} · "
+            f"net `{_fmt_gex_dollars(gex['total_gex'])}` · "
+            f"H {hi_s} / L {lo_s}"
         )
+    return (
+        f"**GEX** {_gex_env_short(gex['env'])} · {gex['env_label']} · "
+        f"net `{_fmt_gex_dollars(gex['total_gex'])}` · "
+        f"high {hi_s} / low {lo_s} · exp `{gex['expiration']}`"
+    )
 
 
 def _gex_snap_age_label(captured_at: str | None) -> str:
@@ -3634,6 +3752,211 @@ def _render_gex_day_summary(gex: dict) -> None:
         )
 
     st.caption(gex["meaning"])
+
+
+def _fmt_session_clock(minutes_from_open: int) -> str:
+    """Minutes from 09:30 → ``H:MM`` ET clock (no leading zero on hour)."""
+    total = (
+        daily_moves_store.MARKET_OPEN.hour * 60
+        + daily_moves_store.MARKET_OPEN.minute
+        + int(minutes_from_open)
+    )
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _hod_lod_bucket_label(bucket_start: int, width: int = _HOD_LOD_BUCKET_MIN) -> str:
+    end = min(bucket_start + width, _SESSION_MINUTES)
+    return f"{_fmt_session_clock(bucket_start)}–{_fmt_session_clock(end)}"
+
+
+def _first_extreme_minutes(path: list[dict]) -> tuple[int | None, int | None]:
+    """First minute the session high / low % was printed."""
+    if not path:
+        return None, None
+    try:
+        hi = max(float(p["pct"]) for p in path)
+        lo = min(float(p["pct"]) for p in path)
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    eps = 1e-9
+    hi_m = lo_m = None
+    for p in path:
+        try:
+            m = int(p["minutes_from_open"])
+            pct = float(p["pct"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if hi_m is None and pct >= hi - eps:
+            hi_m = m
+        if lo_m is None and pct <= lo + eps:
+            lo_m = m
+        if hi_m is not None and lo_m is not None:
+            break
+    return hi_m, lo_m
+
+
+def _hod_lod_distribution(
+    ticker: str,
+    today: date,
+    *,
+    lookback: int = _HOD_LOD_LOOKBACK,
+    bucket_min: int = _HOD_LOD_BUCKET_MIN,
+) -> dict | None:
+    """Half-hour histogram of when HOD / LOD first printed over past sessions."""
+    end = _prev_business_day(today)
+    days = _past_business_days(end, lookback)
+    buckets = list(range(0, _SESSION_MINUTES, bucket_min))
+    high_counts = {b: 0 for b in buckets}
+    low_counts = {b: 0 for b in buckets}
+    n = 0
+    for d in days:
+        path = daily_moves_store.get_session_path(ticker, d)
+        if not path or len(path) < 2:
+            continue
+        # Require a reasonably complete session so open-only stubs
+        # don't skew the distribution toward 9:30.
+        if int(path[-1]["minutes_from_open"]) < _SESSION_MINUTES - 30:
+            continue
+        hi_m, lo_m = _first_extreme_minutes(path)
+        if hi_m is None or lo_m is None:
+            continue
+        hi_b = min((hi_m // bucket_min) * bucket_min, buckets[-1])
+        lo_b = min((lo_m // bucket_min) * bucket_min, buckets[-1])
+        high_counts[hi_b] += 1
+        low_counts[lo_b] += 1
+        n += 1
+
+    if n == 0:
+        return None
+
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    today_hi_m = today_lo_m = None
+    if today_path and len(today_path) >= 2:
+        today_hi_m, today_lo_m = _first_extreme_minutes(today_path)
+
+    def _rows(counts: dict[int, int]) -> list[dict]:
+        out = []
+        for b in buckets:
+            c = counts[b]
+            out.append({
+                "bucket": b,
+                "label": _hod_lod_bucket_label(b, bucket_min),
+                "count": c,
+                "pct": (c / n * 100.0) if n else 0.0,
+            })
+        return out
+
+    return {
+        "n": n,
+        "lookback": lookback,
+        "bucket_min": bucket_min,
+        "high": _rows(high_counts),
+        "low": _rows(low_counts),
+        "today_high_m": today_hi_m,
+        "today_low_m": today_lo_m,
+    }
+
+
+def _render_hod_lod_distribution(ticker: str, today: date) -> None:
+    """When the high/low of day tends to print — past N completed sessions."""
+    dist = _hod_lod_distribution(ticker, today)
+    st.markdown("##### High / low of day timing")
+    if dist is None:
+        st.caption(
+            "Need densified completed sessions before the HOD / LOD "
+            "timing distribution can be shown."
+        )
+        return
+
+    n = dist["n"]
+    st.caption(
+        f"Among the last **{n}** completed sessions with a full-enough "
+        f"path (up to {_HOD_LOD_LOOKBACK} lookback), when the **high of "
+        f"day** and **low of day** were first reached — counted in "
+        f"{dist['bucket_min']}-minute windows (e.g. 12:00–12:30). "
+        "Each bar is count and % of those sessions."
+    )
+
+    def _note(side: str, minutes: int | None, rows: list[dict]) -> str:
+        if minutes is None:
+            return f"Today's {side} so far: n/a"
+        b = min(
+            (minutes // dist["bucket_min"]) * dist["bucket_min"],
+            rows[-1]["bucket"],
+        )
+        row = next((r for r in rows if r["bucket"] == b), None)
+        label = _hod_lod_bucket_label(b, dist["bucket_min"])
+        clock = _fmt_session_clock(minutes)
+        if row is None:
+            return f"Today's {side} so far printed at **{clock}** ({label})"
+        return (
+            f"Today's {side} so far printed at **{clock}** "
+            f"({label} historically **{row['count']} / {n}** = "
+            f"**{row['pct']:.0f}%**)"
+        )
+
+    st.caption(
+        _note("high", dist["today_high_m"], dist["high"])
+        + "  ·  "
+        + _note("low", dist["today_low_m"], dist["low"])
+    )
+
+    left, right = st.columns(2)
+    for col, title, rows, color in (
+        (left, "High of day first printed", dist["high"], _TV_UP),
+        (right, "Low of day first printed", dist["low"], _TV_DOWN),
+    ):
+        with col:
+            labels = [r["label"] for r in rows]
+            counts = [r["count"] for r in rows]
+            pcts = [r["pct"] for r in rows]
+            fig = go.Figure(go.Bar(
+                x=labels,
+                y=counts,
+                marker_color=color,
+                customdata=pcts,
+                hovertemplate=(
+                    "%{x}<br><b>%{y}</b> / "
+                    f"{n} = %{{customdata:.0f}}%<extra></extra>"
+                ),
+                showlegend=False,
+            ))
+            fig.update_layout(**_tv_layout(
+                title=dict(
+                    text=title,
+                    font=dict(size=13, color=_TV_TEXT),
+                    x=0.02, xanchor="left",
+                ),
+                height=260,
+                margin=dict(t=40, l=36, r=12, b=56),
+                xaxis=dict(
+                    tickangle=-35,
+                    tickfont=dict(size=10, color=_TV_MUTED),
+                    gridcolor=_TV_GRID,
+                    color=_TV_MUTED,
+                    fixedrange=True,
+                ),
+                yaxis=dict(
+                    title=dict(text="sessions", font=dict(size=11)),
+                    tickfont=dict(size=10, color=_TV_MUTED),
+                    gridcolor=_TV_GRID,
+                    color=_TV_MUTED,
+                    fixedrange=True,
+                    rangemode="tozero",
+                ),
+            ))
+            _show_plotly(fig, config={"displayModeBar": False})
+
+            # Compact top windows so the example ("12:00–12:30 N times = X%")
+            # is readable without scanning the whole bar chart.
+            ranked = sorted(rows, key=lambda r: (-r["count"], r["bucket"]))
+            top = [r for r in ranked if r["count"] > 0][:3]
+            if top:
+                bits = [
+                    f"**{r['label']}** {r['count']}× ({r['pct']:.0f}%)"
+                    for r in top
+                ]
+                st.caption("Most common: " + " · ".join(bits))
 
 
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
@@ -4580,6 +4903,9 @@ def _render_htf_price_charts(ticker: str, today: date) -> None:
 def _twin_fig(
     ticker: str, today: date, today_path: list[dict],
     twin: dict, rank: int, color: str,
+    *,
+    gex: dict | None = None,
+    ref: float | None = None,
 ) -> go.Figure:
     """One historical twin on its own chart (% vs that day's prior close)."""
     now_m = today_path[-1]["minutes_from_open"] if today_path else None
@@ -4640,14 +4966,24 @@ def _twin_fig(
         )
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
 
+    gex_ref = float(ref) if ref and float(ref) > 0 else None
+    if gex is not None and gex_ref is not None:
+        _add_gex_level_overlays(
+            fig, gex,
+            as_pct_ref=gex_ref,
+            row=None, col=None,
+            compact=False,
+        )
+
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin["final_pct"] is not None else "close n/a"
     )
+    gex_txt = f"  ·  {_gex_env_short(gex['env'])}" if gex else ""
     fig.update_layout(**_tv_layout(
         **_twin_chart_chrome(
             f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
-            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
+            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}{gex_txt}"
         ),
         hovermode="x unified",
         xaxis=_session_axis_layout(),
@@ -4661,6 +4997,9 @@ def _yesterday_match_fig(
     yesterday_path: list[dict],
     twin: dict,
     color: str,
+    *,
+    gex: dict | None = None,
+    ref: float | None = None,
 ) -> go.Figure:
     """Left panel: yesterday vs its single closest historical match.
 
@@ -4695,14 +5034,25 @@ def _yesterday_match_fig(
             ),
         ))
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
+
+    gex_ref = float(ref) if ref and float(ref) > 0 else None
+    if gex is not None and gex_ref is not None:
+        _add_gex_level_overlays(
+            fig, gex,
+            as_pct_ref=gex_ref,
+            row=None, col=None,
+            compact=False,
+        )
+
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin.get("final_pct") is not None else "close n/a"
     )
+    gex_txt = f"  ·  {_gex_env_short(gex['env'])}" if gex else ""
     fig.update_layout(**_tv_layout(
         **_twin_chart_chrome(
             f"Yesterday vs {twin['day']:%a %b %d}  ·  "
-            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}"
+            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}{gex_txt}"
         ),
         hovermode="x unified",
         xaxis=_session_axis_layout(),
@@ -4711,7 +5061,12 @@ def _yesterday_match_fig(
     return fig
 
 
-def _nextday_only_fig(twin: dict) -> go.Figure:
+def _nextday_only_fig(
+    twin: dict,
+    *,
+    gex: dict | None = None,
+    ref: float | None = None,
+) -> go.Figure:
     """Right panel: only the session after the closest match.
 
     One path — what happened the next business day the last time a
@@ -4751,13 +5106,24 @@ def _nextday_only_fig(twin: dict) -> go.Figure:
         )
 
     fig.add_hline(y=0, line_color=_TV_ZERO, line_width=1)
+
+    gex_ref = float(ref) if ref and float(ref) > 0 else None
+    if gex is not None and gex_ref is not None:
+        _add_gex_level_overlays(
+            fig, gex,
+            as_pct_ref=gex_ref,
+            row=None, col=None,
+            compact=False,
+        )
+
+    gex_txt = f"  ·  {_gex_env_short(gex['env'])}" if gex else ""
     if next_day is not None and twin.get("next_final_pct") is not None:
         title = (
             f"Next day after twin — {next_day:%a %b %d}  ·  "
-            f"closed {twin['next_final_pct']:+.2f}%"
+            f"closed {twin['next_final_pct']:+.2f}%{gex_txt}"
         )
     elif next_day is not None:
-        title = f"Next day after twin — {next_day:%a %b %d}"
+        title = f"Next day after twin — {next_day:%a %b %d}{gex_txt}"
     else:
         title = (
             f"Next day after twin — n/a "
@@ -4811,11 +5177,14 @@ def _session_chicklet_fig(
     iva: dict | None,
     *,
     is_today: bool,
+    gex: dict | None = None,
+    ref: float | None = None,
 ) -> go.Figure:
     """One compact session card: % path, O/H/L annotations, ±σ bands.
 
     Y-axis is always centered on 0% (prior close) and scaled to the
     day's high/low. σ lines appear only when the path touched them.
+    Optional GEX high/low walls are drawn as % vs that day's prior close.
     """
     fig = go.Figure()
     implied = (iva or {}).get("implied") or None
@@ -4895,11 +5264,35 @@ def _session_chicklet_fig(
     # Prior-close baseline — always the vertical midpoint.
     fig.add_hline(y=0, line_color=_TV_MUTED, line_width=1.2)
 
+    gex_ref = float(ref) if ref and float(ref) > 0 else None
+    if gex is not None and gex_ref is not None:
+        _add_gex_level_overlays(
+            fig, gex,
+            as_pct_ref=gex_ref,
+            row=None, col=None,
+            compact=True,
+        )
+        for side in ("high", "low"):
+            level = gex.get(side)
+            if not level:
+                continue
+            yp = _strike_as_pct(float(level[0]), gex_ref)
+            if yp is None:
+                continue
+            lo_y = min(lo_y, yp)
+            hi_y = max(hi_y, yp)
+        pad = max((hi_y - lo_y) * 0.04, 0.05)
+        # Keep 0% as midpoint when possible.
+        extent = max(abs(lo_y), abs(hi_y)) + pad
+        lo_y, hi_y = -extent, extent
+
     day_label = (
         f"Today · {day:%b %d}" if is_today else f"{day:%a %b %d}"
     )
     if close_pct is not None:
         day_label = f"{day_label}  {close_pct:+.2f}%"
+    if gex is not None:
+        day_label = f"{day_label}  ·  {_gex_env_short(gex['env'])}"
 
     tick_mins = (0, 195, 390)
     tick_vals = [_minute_to_dt(day, m) for m in tick_mins]
@@ -4955,8 +5348,10 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
         "uniform. A ±σ line (blue / orange / red — same prior-session "
         "implied moves as **Implied vs actual daily moves**) is drawn "
         "only if the path actually reached it; untouched bands stay "
-        "off. Empty cards mean no densified path yet; they fill in as "
-        "history accumulates."
+        "off. **Amber / cyan** dashes are that day's GEX high / low "
+        "walls (when a snapshot exists), labeled **GEX+ / GEX− / GEX≈** "
+        "in the title. Empty cards mean no densified path yet; they "
+        "fill in as history accumulates."
     )
 
     # Yesterday (or Friday if today is Mon / weekend) → nineteen more back.
@@ -4971,13 +5366,29 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
         for col, day in zip(cols, row_days):
             with col:
                 path = daily_moves_store.get_session_path(ticker, day)
+                ref = _session_ref_spot(ticker, day, path)
+                gex = None
+                if ref is not None:
+                    try:
+                        gex = _gex_levels_vs_ref(
+                            ticker=ticker,
+                            today=day,
+                            ref=float(ref),
+                            allow_upcoming_fallback=False,
+                        )
+                    except Exception:
+                        gex = None
                 _show_plotly(
                     _session_chicklet_fig(
                         day, path, iva_by_day.get(day),
                         is_today=False,
+                        gex=gex,
+                        ref=ref,
                     ),
                     config={"displayModeBar": False},
                 )
+                if gex is not None:
+                    st.caption(_gex_info_caption(gex, compact=True))
 
 
 def _render_today_twin_row(ticker: str, today: date) -> None:
@@ -4989,7 +5400,9 @@ def _render_today_twin_row(ticker: str, today: date) -> None:
         "closely matches **today so far** — each on its own chart, in % "
         "vs that day's prior close. Thin grey = today; solid = the twin "
         "up to now; dashed = where that twin went after this time of day. "
-        "Match score = recency-weighted RMSE, recomputed on every refresh."
+        "Match score = recency-weighted RMSE, recomputed on every refresh. "
+        "**Amber / cyan** dashes are **today's** GEX high / low walls "
+        "(% vs today's prior close)."
     )
     result = _find_daily_twins(ticker, today, top_n=2)
     today_path = result["today_path"]
@@ -5007,6 +5420,19 @@ def _render_today_twin_row(ticker: str, today: date) -> None:
         )
         return
 
+    today_ref = _session_ref_spot(ticker, today, today_path)
+    today_gex = None
+    if today_ref is not None:
+        try:
+            today_gex = _gex_levels_vs_ref(
+                ticker=ticker,
+                today=today,
+                ref=float(today_ref),
+                allow_upcoming_fallback=True,
+            )
+        except Exception:
+            today_gex = None
+
     now_m = today_path[-1]["minutes_from_open"]
     last_pct = today_path[-1]["pct"]
     cols = st.columns(2)
@@ -5016,14 +5442,21 @@ def _render_today_twin_row(ticker: str, today: date) -> None:
                 _twin_fig(
                     ticker, today, today_path, twin,
                     i + 1, _TWIN_COLORS[i % len(_TWIN_COLORS)],
+                    gex=today_gex,
+                    ref=today_ref,
                 ),
             )
             twin_now = _interpolate_pct(twin["path"], now_m)
+            bits = []
             if twin_now is not None:
-                st.caption(
+                bits.append(
                     f"At this time that day: **{twin_now:+.2f}%**  ·  "
                     f"today − twin = **{last_pct - twin_now:+.2f}pp**"
                 )
+            if today_gex is not None:
+                bits.append(_gex_info_caption(today_gex, compact=True))
+            if bits:
+                st.caption("  ·  ".join(bits))
     if len(result["twins"]) == 1:
         with cols[1]:
             st.info(
@@ -5041,7 +5474,8 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
         "single closest historical match. **Right:** only the next "
         "business day after that match — what happened the last time a "
         "similar session printed (e.g. if yesterday matched 7/23, the "
-        "right chart is just 7/24)."
+        "right chart is just 7/24). GEX walls (when available) are for "
+        "yesterday on the left and the next-day session on the right."
     )
     result = _find_path_twins(ticker, yesterday, top_n=1)
     ypath = result["query_path"]
@@ -5059,36 +5493,76 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
         return
 
     twin = result["twins"][0]
+    y_ref = _session_ref_spot(ticker, yesterday, ypath)
+    y_gex = None
+    if y_ref is not None:
+        try:
+            y_gex = _gex_levels_vs_ref(
+                ticker=ticker,
+                today=yesterday,
+                ref=float(y_ref),
+                allow_upcoming_fallback=False,
+            )
+        except Exception:
+            y_gex = None
+
+    next_day = twin.get("next_day")
+    next_path = twin.get("next_path") or []
+    next_ref = (
+        _session_ref_spot(ticker, next_day, next_path)
+        if next_day is not None else None
+    )
+    next_gex = None
+    if next_day is not None and next_ref is not None:
+        try:
+            next_gex = _gex_levels_vs_ref(
+                ticker=ticker,
+                today=next_day,
+                ref=float(next_ref),
+                allow_upcoming_fallback=False,
+            )
+        except Exception:
+            next_gex = None
+
     left, right = st.columns(2)
     with left:
         _show_plotly(
             _yesterday_match_fig(
                 yesterday, ypath, twin, _TWIN_COLORS[0],
+                gex=y_gex,
+                ref=y_ref,
             ),
         )
-        st.caption(
+        bits = [
             f"Closest match **{twin['day']:%a %b %d}**  ·  "
             f"RMSE **{twin['rmse']:.2f}pp**"
             + (
                 f"  ·  twin closed **{twin['final_pct']:+.2f}%**"
                 if twin.get("final_pct") is not None else ""
             )
-        )
+        ]
+        if y_gex is not None:
+            bits.append(_gex_info_caption(y_gex, compact=True))
+        st.caption("  ·  ".join(bits))
     with right:
         _show_plotly(
-            _nextday_only_fig(twin),
+            _nextday_only_fig(twin, gex=next_gex, ref=next_ref),
         )
+        bits = []
         if twin.get("next_day") is not None and twin.get("next_final_pct") is not None:
-            st.caption(
+            bits.append(
                 f"After the twin on {twin['day']:%b %d}, "
                 f"**{twin['next_day']:%a %b %d}** closed "
                 f"**{twin['next_final_pct']:+.2f}%**"
             )
         else:
-            st.caption(
+            bits.append(
                 f"No next-day path after {twin['day']:%b %d} in the "
                 "library yet."
             )
+        if next_gex is not None:
+            bits.append(_gex_info_caption(next_gex, compact=True))
+        st.caption("  ·  ".join(bits))
 
 
 def _render_twin_panels(ticker: str, today: date) -> None:
@@ -5105,7 +5579,10 @@ def _render_today_and_twins(ticker: str) -> None:
 
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
+    _render_hod_lod_distribution(ticker, today)
     _render_htf_price_charts(ticker, today)
+    _render_recent_session_chiclets(ticker, today)
+    _render_twin_panels(ticker, today)
     _render_recent_session_chiclets(ticker, today)
     _render_twin_panels(ticker, today)
 
