@@ -137,6 +137,12 @@ RH_PASSWORD=your_password
 
 **Note**: The `.env` file is automatically ignored by git for security.
 
+If Robinhood device MFA fires (or you missed an approval), use the dashboard
+sidebar **Services → Restart selected + RH login** with **Clear RH session**
+checked, then approve the push in the Robinhood app within ~2 minutes. That
+restarts the price poller / OI scheduler / Discord bot inside the container
+without SSH. Host scripts still work too: `./restart-price-poller.sh`, etc.
+
 ### Discord `!lia` bot (optional)
 
 Create a **new** Discord application at https://discord.com/developers/applications
