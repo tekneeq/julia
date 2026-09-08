@@ -5927,8 +5927,6 @@ def _render_today_and_twins(ticker: str) -> None:
     _render_htf_price_charts(ticker, today)
     _render_recent_session_chiclets(ticker, today)
     _render_twin_panels(ticker, today)
-    _render_recent_session_chiclets(ticker, today)
-    _render_twin_panels(ticker, today)
 
     src = "+".join(status.get("today_sources") or ["none"])
     st.caption(
