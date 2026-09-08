@@ -72,6 +72,10 @@ def login_robinhood(username, password):
     """
     Login to Robinhood account.
 
+    Uses a persisted session pickle under ``~/.tokens/``. When Robinhood
+    requires device approval, ``robin_stocks`` polls for up to ~2 minutes
+    while you tap Approve in the app — no SMS code needed for prompt MFA.
+
     Parameters:
     - username: str, Robinhood username
     - password: str, Robinhood password
@@ -79,7 +83,13 @@ def login_robinhood(username, password):
     Returns:
     - None
     """
-    rh.login(username=username, password=password)
+    # expiresIn is seconds; a week cuts down how often MFA re-fires.
+    rh.login(
+        username=username,
+        password=password,
+        store_session=True,
+        expiresIn=86400 * 7,
+    )
 
 
 def implied_move(stock_price, iv, days_list, confidence_levels):

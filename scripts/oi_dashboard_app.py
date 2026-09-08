@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -1651,6 +1652,321 @@ def _poll_batch() -> str:
     st.session_state["_batch_finished_at"] = time.time()
     st.session_state["_batch_proc"] = None
     return "done" if rc == 0 else "failed"
+
+
+# ---------------------------------------------------------------------------
+# In-container service control (price poller / OI scheduler / Discord)
+# ---------------------------------------------------------------------------
+
+_SERVICE_SPECS: dict[str, dict] = {
+    "price_poller": {
+        "label": "Price poller",
+        "script": "scripts/price_poller.py",
+        "log": "logs/price-poller.out",
+        "pid": "logs/price-poller.pid",
+        "uses_tickers": True,
+        "needs_discord_token": False,
+    },
+    "oi_scheduler": {
+        "label": "OI scheduler",
+        "script": "scripts/oi_scheduler.py",
+        "log": "logs/oi-scheduler.out",
+        "pid": "logs/oi-scheduler.pid",
+        "uses_tickers": True,
+        "needs_discord_token": False,
+    },
+    "discord_bot": {
+        "label": "Discord bot",
+        "script": "scripts/discord_bot.py",
+        "log": "logs/discord-bot.out",
+        "pid": "logs/discord-bot.pid",
+        "uses_tickers": False,
+        "needs_discord_token": True,
+    },
+}
+
+
+def _service_pid_alive(pid_path: Path) -> int | None:
+    """Return the live PID from ``pid_path``, or None if not running."""
+    try:
+        raw = pid_path.read_text().strip()
+        pid = int(raw.splitlines()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    # Confirm it's not a recycled PID — cmdline should mention the script.
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+            "utf-8", errors="ignore"
+        )
+    except OSError:
+        return pid
+    return pid if "python" in cmdline or ".py" in cmdline else None
+
+
+def _service_status_line(key: str) -> str:
+    spec = _SERVICE_SPECS[key]
+    pid = _service_pid_alive(REPO_ROOT / spec["pid"])
+    if pid:
+        return f"● {spec['label']} running (pid {pid})"
+    return f"○ {spec['label']} not running"
+
+
+def _tail_text(path: Path, *, max_chars: int = 3500) -> str:
+    if not path.exists():
+        return "(log file not created yet)"
+    try:
+        data = path.read_text(errors="replace")
+    except OSError as e:
+        return f"(could not read log: {e})"
+    return data[-max_chars:] if len(data) > max_chars else data
+
+
+def _clear_rh_session_pickles() -> list[str]:
+    """Delete robin_stocks session pickles so the next login re-challenges MFA."""
+    cleared: list[str] = []
+    for directory in (Path.home() / ".tokens", REPO_ROOT / ".tokens"):
+        if not directory.is_dir():
+            continue
+        for pickle_path in directory.glob("*.pickle"):
+            try:
+                pickle_path.unlink()
+                cleared.append(str(pickle_path))
+            except OSError:
+                continue
+    try:
+        import robin_stocks.robinhood as rh
+
+        rh.logout()
+    except Exception:
+        pass
+    return cleared
+
+
+def _restart_bundle_script(
+    *,
+    service_keys: list[str],
+    tickers: list[str],
+    days_ahead: int,
+    force_mfa: bool,
+) -> Path:
+    """Write a one-shot shell script: optional MFA login, then restart services.
+
+    Login runs first so only one Robinhood challenge is in flight; services
+    then start and reuse the saved session pickle.
+    """
+    logs_dir = REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    bundle_log = logs_dir / "dashboard-restart.out"
+    bundle_sh = logs_dir / "dashboard-restart.sh"
+
+    ticker_csv = ",".join(tickers) if tickers else "SPY"
+    lines = [
+        "#!/bin/sh",
+        "set -u",
+        f"cd {shlex.quote(str(REPO_ROOT))}",
+        "export UV_NATIVE_TLS=\"${UV_NATIVE_TLS:-true}\"",
+        f"LOG={shlex.quote(str(bundle_log))}",
+        "echo \"── dashboard restart $(date '+%Y-%m-%d %H:%M:%S') ──\" | tee -a \"$LOG\"",
+    ]
+
+    if force_mfa:
+        lines += [
+            "echo 'Clearing RH session pickles…' | tee -a \"$LOG\"",
+            "uv run python - <<'PY' | tee -a \"$LOG\"",
+            "from pathlib import Path",
+            "cleared = []",
+            "for d in (Path.home() / '.tokens', Path('.') / '.tokens'):",
+            "    if not d.is_dir():",
+            "        continue",
+            "    for p in d.glob('*.pickle'):",
+            "        p.unlink(missing_ok=True)",
+            "        cleared.append(str(p))",
+            "try:",
+            "    import robin_stocks.robinhood as rh",
+            "    rh.logout()",
+            "except Exception:",
+            "    pass",
+            "print('cleared:', ', '.join(cleared) if cleared else '(none)')",
+            "PY",
+        ]
+
+    lines += [
+        "echo 'RH login (approve device push in the Robinhood app within ~2 min)…' | tee -a \"$LOG\"",
+        "uv run python - <<'PY' | tee -a \"$LOG\"",
+        "import os, sys, traceback",
+        "from datetime import datetime",
+        "from julia.main import is_logged_in, login_robinhood",
+        "print(f'[{datetime.now():%H:%M:%S}] logging in…', flush=True)",
+        "try:",
+        "    if is_logged_in():",
+        "        print('already logged in', flush=True)",
+        "        raise SystemExit(0)",
+        "    user, pw = os.environ.get('RH_USERNAME'), os.environ.get('RH_PASSWORD')",
+        "    if not user or not pw:",
+        "        print('RH_USERNAME / RH_PASSWORD missing', flush=True)",
+        "        raise SystemExit(2)",
+        "    login_robinhood(user, pw)",
+        "    ok = is_logged_in()",
+        "    print(('✅ login OK' if ok else '❌ login failed'), flush=True)",
+        "    raise SystemExit(0 if ok else 1)",
+        "except SystemExit:",
+        "    raise",
+        "except Exception:",
+        "    traceback.print_exc()",
+        "    raise SystemExit(1)",
+        "PY",
+        "login_rc=$?",
+        "if [ \"$login_rc\" -ne 0 ]; then",
+        "  echo \"RH login exited $login_rc — services will still restart and retry auth\" | tee -a \"$LOG\"",
+        "fi",
+        "echo 'Restarting services…' | tee -a \"$LOG\"",
+    ]
+
+    for key in service_keys:
+        spec = _SERVICE_SPECS[key]
+        if spec["needs_discord_token"]:
+            lines.append(
+                'if [ -z "${DISCORD_BOT_TOKEN:-}" ]; then '
+                f'echo "⏭ skip {spec["label"]} (no DISCORD_BOT_TOKEN)" | tee -a "$LOG"; '
+                "else"
+            )
+        script = REPO_ROOT / spec["script"]
+        log_path = REPO_ROOT / spec["log"]
+        pid_path = REPO_ROOT / spec["pid"]
+        args = ["--replace"]
+        if spec.get("uses_tickers"):
+            args += ["--tickers", ticker_csv]
+        if key == "oi_scheduler":
+            args += ["--days-ahead", str(int(days_ahead))]
+        argv = ["uv", "run", "python", str(script), *args]
+        quoted = " ".join(shlex.quote(a) for a in argv)
+        lines += [
+            f"rm -f {shlex.quote(str(pid_path))}",
+            f"echo '↺ starting {spec['label']}' | tee -a \"$LOG\"",
+            f"setsid {quoted} >>{shlex.quote(str(log_path))} 2>&1 </dev/null &",
+        ]
+        if spec["needs_discord_token"]:
+            lines.append("fi")
+
+    lines += [
+        "sleep 3",
+        "echo 'Done. Check service status in the sidebar.' | tee -a \"$LOG\"",
+    ]
+
+    bundle_sh.write_text("\n".join(lines) + "\n")
+    bundle_sh.chmod(0o755)
+    # Truncate prior run log so the expander shows this attempt.
+    bundle_log.write_text("")
+    env = os.environ.copy()
+    env.setdefault("UV_NATIVE_TLS", "true")
+    subprocess.Popen(
+        ["sh", str(bundle_sh)],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return bundle_log
+
+
+def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
+    """Sidebar controls to restart pollers and re-trigger Robinhood MFA."""
+    st.divider()
+    st.subheader("Services")
+    st.caption(
+        "Restart in-container workers from here (no SSH). "
+        "With **Clear RH session** on, login sends a **new device-approval "
+        "push** — approve it in the Robinhood app within ~2 minutes, then "
+        "the pollers start."
+    )
+
+    for key in _SERVICE_SPECS:
+        st.text(_service_status_line(key))
+
+    force_mfa = st.checkbox(
+        "Clear RH session (force MFA)",
+        value=True,
+        key="svc_force_mfa",
+        help=(
+            "Deletes ~/.tokens/*.pickle so login re-challenges. "
+            "Leave on when you missed an approval and need a fresh push."
+        ),
+    )
+    do_price = st.checkbox(
+        "Price poller", value=True, key="svc_restart_price",
+    )
+    do_sched = st.checkbox(
+        "OI scheduler", value=True, key="svc_restart_sched",
+    )
+    do_discord = st.checkbox(
+        "Discord bot",
+        value=bool(os.getenv("DISCORD_BOT_TOKEN")),
+        key="svc_restart_discord",
+        disabled=not bool(os.getenv("DISCORD_BOT_TOKEN")),
+    )
+
+    if st.button(
+        "↻ Restart selected + RH login",
+        type="primary",
+        use_container_width=True,
+        key="svc_restart_btn",
+        help="Login first (approve MFA), then restart checked services.",
+    ):
+        selected: list[str] = []
+        if do_price:
+            selected.append("price_poller")
+        if do_sched:
+            selected.append("oi_scheduler")
+        if do_discord:
+            selected.append("discord_bot")
+        if not selected:
+            st.warning("Pick at least one service to restart.")
+        else:
+            log_path = _restart_bundle_script(
+                service_keys=selected,
+                tickers=tickers or ["SPY"],
+                days_ahead=days_ahead,
+                force_mfa=force_mfa,
+            )
+            st.session_state["_svc_restart_notes"] = [
+                (
+                    "RH login started first — **approve the Robinhood app "
+                    "push now** (≈2 min window)."
+                    if force_mfa
+                    else "RH login / session check started, then services restart."
+                ),
+                f"Bundle log: `{log_path.relative_to(REPO_ROOT)}`",
+                "Services: " + ", ".join(
+                    _SERVICE_SPECS[k]["label"] for k in selected
+                ),
+            ]
+            st.session_state["_svc_restart_at"] = time.time()
+            st.rerun()
+
+    notes = st.session_state.get("_svc_restart_notes") or []
+    if notes:
+        started = st.session_state.get("_svc_restart_at")
+        age = (
+            f" ({int(time.time() - started)}s ago)"
+            if started else ""
+        )
+        st.info("Restart kicked off" + age + ":\n\n- " + "\n- ".join(notes))
+        with st.expander("Restart / MFA log", expanded=True):
+            st.code(
+                _tail_text(REPO_ROOT / "logs" / "dashboard-restart.out"),
+                language="text",
+            )
+        with st.expander("Price poller log"):
+            st.code(
+                _tail_text(REPO_ROOT / "logs" / "price-poller.out"),
+                language="text",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -5993,6 +6309,8 @@ with st.sidebar:
             start, end, _ = _compute_range(days_ahead)
             _kickoff_batch(tickers, start, end, refresh_cache)
             st.rerun()
+
+    _render_services_sidebar(tickers, days_ahead)
 
 if _page == "Tickers":
     _render_tickers_page()
