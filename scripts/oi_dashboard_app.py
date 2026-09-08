@@ -123,17 +123,33 @@ _PLOTLY_CONFIG: dict = {
 }
 
 
+_PLOTLY_SEQ = 0
+
+
 def _show_plotly(
     fig: go.Figure,
     *,
     config: dict | None = None,
+    key: str | None = None,
     **kwargs,
 ) -> None:
-    """Render a Plotly chart without accidental drag/touch zoom."""
+    """Render a Plotly chart without accidental drag/touch zoom.
+
+    Always passes a unique ``key`` so rows of similar charts (e.g. the
+    last-20 session cards) don't trip StreamlitDuplicateElementId.
+    """
+    global _PLOTLY_SEQ
+    if key is None:
+        key = kwargs.pop("key", None)
+    if key is None:
+        _PLOTLY_SEQ += 1
+        key = f"plotly_auto_{_PLOTLY_SEQ}"
     if fig.layout.dragmode is None:
         fig.update_layout(dragmode=False)
     merged = {**_PLOTLY_CONFIG, **(config or {})}
-    st.plotly_chart(fig, use_container_width=True, config=merged, **kwargs)
+    st.plotly_chart(
+        fig, use_container_width=True, config=merged, key=key, **kwargs,
+    )
 
 
 def _format_age(secs: int) -> str:
@@ -4261,7 +4277,12 @@ def _render_hod_lod_distribution(ticker: str, today: date) -> None:
                     rangemode="tozero",
                 ),
             ))
-            _show_plotly(fig, config={"displayModeBar": False})
+            side = "high" if "High" in title else "low"
+            _show_plotly(
+                fig,
+                config={"displayModeBar": False},
+                key=f"hod-lod-{ticker}-{side}",
+            )
 
             # Compact top windows so the example ("12:00–12:30 N times = X%")
             # is readable without scanning the whole bar chart.
@@ -5702,6 +5723,7 @@ def _render_recent_session_chiclets(ticker: str, today: date) -> None:
                         ref=ref,
                     ),
                     config={"displayModeBar": False},
+                    key=f"sess-chicklet-{ticker}-{day.isoformat()}",
                 )
                 if gex is not None:
                     st.caption(_gex_info_caption(gex, compact=True))
@@ -5761,6 +5783,7 @@ def _render_today_twin_row(ticker: str, today: date) -> None:
                     gex=today_gex,
                     ref=today_ref,
                 ),
+                key=f"twin-today-{ticker}-{twin['day'].isoformat()}-{i}",
             )
             twin_now = _interpolate_pct(twin["path"], now_m)
             bits = []
@@ -5848,6 +5871,7 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
                 gex=y_gex,
                 ref=y_ref,
             ),
+            key=f"twin-yday-{ticker}-{yesterday.isoformat()}-{twin['day'].isoformat()}",
         )
         bits = [
             f"Closest match **{twin['day']:%a %b %d}**  ·  "
@@ -5863,6 +5887,10 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
     with right:
         _show_plotly(
             _nextday_only_fig(twin, gex=next_gex, ref=next_ref),
+            key=(
+                f"twin-nextday-{ticker}-"
+                f"{(next_day or twin['day']).isoformat()}"
+            ),
         )
         bits = []
         if twin.get("next_day") is not None and twin.get("next_final_pct") is not None:
