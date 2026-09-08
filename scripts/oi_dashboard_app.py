@@ -3744,6 +3744,8 @@ _GEX_HIGH_COLOR = "#ff9800"  # amber ceiling
 _GEX_LOW_COLOR = "#26c6da"   # cyan floor
 _HOD_LOD_LOOKBACK = 30
 _HOD_LOD_BUCKET_MIN = 30  # half-hour windows across the regular session
+# How many GEX walls per side (above/below prev close) the levels table shows.
+_GEX_TABLE_LEVELS_PER_SIDE = 5
 
 
 def _fmt_gex_dollars(value: float) -> str:
@@ -3924,6 +3926,14 @@ def _gex_levels_vs_ref(
     high = max(above.items(), key=lambda kv: abs(kv[1])) if above else None
     low = max(below.items(), key=lambda kv: abs(kv[1])) if below else None
 
+    total_abs = sum(abs(v) for v in gex_by_strike.values()) or 1.0
+    levels_above = sorted(
+        above.items(), key=lambda kv: abs(kv[1]), reverse=True
+    )[:_GEX_TABLE_LEVELS_PER_SIDE]
+    levels_below = sorted(
+        below.items(), key=lambda kv: abs(kv[1]), reverse=True
+    )[:_GEX_TABLE_LEVELS_PER_SIDE]
+
     return {
         "snapshot_id": snap["id"],
         "expiration": snap["expiration_date"],
@@ -3934,11 +3944,14 @@ def _gex_levels_vs_ref(
         "total_gex": total,
         "call_gex": call_gex,
         "put_gex": put_gex,
+        "total_abs_gex": total_abs,
         "env": env,
         "env_label": env_label,
         "meaning": meaning,
         "high": high,
         "low": low,
+        "levels_above": levels_above,
+        "levels_below": levels_below,
     }
 
 
@@ -4084,6 +4097,75 @@ def _render_gex_day_summary(gex: dict) -> None:
         )
 
     st.caption(gex["meaning"])
+
+    _render_gex_levels_table(gex)
+
+
+def _render_gex_levels_table(gex: dict) -> None:
+    """Ranked GEX walls above/below prev close, with size and share."""
+    levels_above = gex.get("levels_above") or []
+    levels_below = gex.get("levels_below") or []
+    if not levels_above and not levels_below:
+        return
+
+    anchor = float(gex["anchor"])
+    total_abs = float(gex.get("total_abs_gex") or 0) or 1.0
+    hi = gex.get("high")
+    lo = gex.get("low")
+    hi_strike = float(hi[0]) if hi else None
+    lo_strike = float(lo[0]) if lo else None
+
+    rows: list[dict] = []
+    for side_label, levels in (
+        ("above", levels_above),
+        ("below", levels_below),
+    ):
+        for rank, (strike, g) in enumerate(levels, start=1):
+            strike_f = float(strike)
+            g_f = float(g)
+            pct = _strike_as_pct(strike_f, anchor)
+            tag = ""
+            if hi_strike is not None and strike_f == hi_strike:
+                tag = "GEX high"
+            elif lo_strike is not None and strike_f == lo_strike:
+                tag = "GEX low"
+            rows.append({
+                "Side": side_label,
+                "#": rank,
+                "Strike": f"${strike_f:,.0f}",
+                "vs prev close": (
+                    f"{pct:+.2f}%" if pct is not None else "—"
+                ),
+                "GEX": _fmt_gex_dollars(g_f),
+                "Sign": "+" if g_f >= 0 else "−",
+                "% of |GEX|": f"{abs(g_f) / total_abs * 100:.1f}%",
+                "Wall": tag,
+                "_strike": strike_f,
+            })
+
+    # Price-ladder order: highest strike at the top, prev close in between.
+    rows.sort(key=lambda r: -r["_strike"])
+    for r in rows:
+        r.pop("_strike", None)
+
+    with st.expander(
+        f"GEX levels table — top {_GEX_TABLE_LEVELS_PER_SIDE} walls "
+        "above / below prev close",
+        expanded=False,
+    ):
+        st.caption(
+            "Strikes ranked by |GEX| on each side of yesterday's close "
+            f"(${anchor:,.2f}), listed high→low like a price ladder. "
+            "**Sign** uses julia's convention (puts +, calls −): "
+            "**+** rows act as stabilizing magnets/support, **−** rows "
+            "as amplifying levels. **% of |GEX|** is that strike's share "
+            "of the whole expiration's absolute gamma."
+        )
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def _fmt_session_clock(minutes_from_open: int) -> str:
@@ -5316,11 +5398,16 @@ def _twin_fig(
         f"closed {twin['final_pct']:+.2f}%"
         if twin["final_pct"] is not None else "close n/a"
     )
+    rmse_v = twin.get("rmse")
+    rmse_txt = (
+        f"RMSE {rmse_v:.2f}pp"
+        if rmse_v is not None and math.isfinite(rmse_v) else "RMSE n/a"
+    )
     gex_txt = f"  ·  {_gex_env_short(gex['env'])}" if gex else ""
     fig.update_layout(**_tv_layout(
         **_twin_chart_chrome(
             f"Twin #{rank} — {twin['day']:%a %b %d}  ·  "
-            f"RMSE {twin['rmse']:.2f}pp  ·  {closed_txt}{gex_txt}"
+            f"{rmse_txt}  ·  {closed_txt}{gex_txt}"
         ),
         hovermode="x unified",
         xaxis=_session_axis_layout(),
@@ -5912,7 +5999,188 @@ def _render_yesterday_twin_row(ticker: str, today: date) -> None:
 def _render_twin_panels(ticker: str, today: date) -> None:
     """Today-so-far twins, then yesterday→next-day twins."""
     _render_today_twin_row(ticker, today)
+    _render_gex_twin_row(ticker, today)
     _render_yesterday_twin_row(ticker, today)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _gex_env_for_session(ticker: str, day_iso: str, ref: float | None) -> dict | None:
+    """Day-scoped GEX env for a completed session (cached; snapshots are static)."""
+    return _gex_levels_vs_ref(
+        ticker=ticker,
+        today=date.fromisoformat(day_iso),
+        ref=ref,
+        allow_upcoming_fallback=False,
+    )
+
+
+def _gex_env_distance(a: dict, b: dict) -> float:
+    """Relative distance between two GEX environments (lower = more similar).
+
+    Compares net first, call and put halves at half weight, and adds a
+    flat penalty when the env label (positive/negative/neutral) differs
+    so sign flips never rank above same-sign days.
+    """
+    def rel(x: float, y: float) -> float:
+        denom = max(abs(x), abs(y), 1e6)  # $1M floor avoids div-by-~0
+        return abs(x - y) / denom
+
+    d = (
+        rel(a["total_gex"], b["total_gex"])
+        + 0.5 * rel(a["call_gex"], b["call_gex"])
+        + 0.5 * rel(a["put_gex"], b["put_gex"])
+    )
+    if a["env"] != b["env"]:
+        d += 1.0
+    return d
+
+
+def _find_gex_twins(
+    ticker: str, today: date, *, top_n: int = 2,
+) -> dict | None:
+    """Completed sessions whose day GEX env best matches today's."""
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    today_ref = _session_ref_spot(ticker, today, today_path)
+    try:
+        today_gex = _gex_levels_vs_ref(
+            ticker=ticker,
+            today=today,
+            ref=float(today_ref) if today_ref else None,
+            allow_upcoming_fallback=True,
+        )
+    except Exception:
+        today_gex = None
+    if today_gex is None:
+        return None
+
+    candidates: list[dict] = []
+    n_with_gex = 0
+    for s in daily_moves_store.list_sessions(ticker):
+        d = date.fromisoformat(s["session_date"])
+        if d >= today:
+            continue
+        path = daily_moves_store.get_session_path(ticker, d)
+        if not path or len(path) < 2:
+            continue
+        try:
+            ref = float(s["ref_spot"])
+        except (TypeError, ValueError):
+            ref = None
+        try:
+            g = _gex_env_for_session(
+                ticker, d.isoformat(), ref if ref and ref > 0 else None,
+            )
+        except Exception:
+            g = None
+        if g is None:
+            continue
+        n_with_gex += 1
+        rmse = _path_rmse(today_path, path)
+        candidates.append({
+            "day": d,
+            "path": path,
+            "rmse": rmse if rmse is not None else float("inf"),
+            "final_pct": path[-1]["pct"] if path else None,
+            "gex": g,
+            "gex_dist": _gex_env_distance(today_gex, g),
+        })
+
+    # Most-similar gamma env first; path RMSE breaks ties.
+    candidates.sort(key=lambda c: (c["gex_dist"], c["rmse"]))
+    return {
+        "today_path": today_path,
+        "today_ref": today_ref,
+        "today_gex": today_gex,
+        "twins": candidates[:top_n],
+        "n_with_gex": n_with_gex,
+    }
+
+
+def _gex_twin_compare_caption(today_gex: dict, twin_gex: dict) -> str:
+    return (
+        f"That day: {_gex_env_short(twin_gex['env'])} "
+        f"net `{_fmt_gex_dollars(twin_gex['total_gex'])}` "
+        f"(C `{_fmt_gex_dollars(twin_gex['call_gex'])}` / "
+        f"P `{_fmt_gex_dollars(twin_gex['put_gex'])}`)  ·  "
+        f"today: {_gex_env_short(today_gex['env'])} "
+        f"net `{_fmt_gex_dollars(today_gex['total_gex'])}` "
+        f"(C `{_fmt_gex_dollars(today_gex['call_gex'])}` / "
+        f"P `{_fmt_gex_dollars(today_gex['put_gex'])}`)"
+    )
+
+
+def _render_gex_twin_row(ticker: str, today: date) -> None:
+    """Twins picked by similar GEX environment rather than path shape."""
+    st.markdown("##### 🧲 GEX twins — similar gamma environment")
+    st.caption(
+        "The completed sessions whose **day GEX env most resembles "
+        "today's** — matched on net GEX first, call and put GEX at half "
+        "weight, with a penalty when the positive/negative regime "
+        "differs; path RMSE breaks ties. Grey = today so far; solid = "
+        "that day up to now; dashed = how it finished. Use these to see "
+        "how price behaved the last time dealers were positioned like "
+        "today."
+    )
+
+    result = _find_gex_twins(ticker, today, top_n=2)
+    if result is None:
+        st.info(
+            "No GEX snapshot for today yet — GEX twins appear after the "
+            "first OI/GEX batch of the day."
+        )
+        return
+    if not result["twins"]:
+        st.info(
+            "No completed session in the library has a same-day GEX "
+            "snapshot yet — GEX twins fill in as snapshot history "
+            "accumulates."
+        )
+        return
+
+    today_gex = result["today_gex"]
+    today_path = result["today_path"]
+    today_ref = result["today_ref"]
+    now_m = (
+        today_path[-1]["minutes_from_open"] if today_path else None
+    )
+    last_pct = today_path[-1]["pct"] if today_path else None
+
+    cols = st.columns(2)
+    for i, twin in enumerate(result["twins"][:2]):
+        with cols[i]:
+            _show_plotly(
+                _twin_fig(
+                    ticker, today, today_path, twin,
+                    i + 1, _TWIN_COLORS[i % len(_TWIN_COLORS)],
+                    gex=today_gex,
+                    ref=today_ref,
+                ),
+                key=f"gex-twin-{ticker}-{twin['day'].isoformat()}-{i}",
+            )
+            bits = [
+                f"GEX match score **{twin['gex_dist']:.2f}** "
+                "(lower = closer)",
+                _gex_twin_compare_caption(today_gex, twin["gex"]),
+            ]
+            if now_m is not None and last_pct is not None:
+                twin_now = _interpolate_pct(twin["path"], now_m)
+                if twin_now is not None:
+                    bits.append(
+                        f"At this time that day: **{twin_now:+.2f}%**  ·  "
+                        f"today − twin = **{last_pct - twin_now:+.2f}pp**"
+                    )
+            st.caption("  ·  ".join(bits))
+    if len(result["twins"]) == 1:
+        with cols[1]:
+            st.info(
+                "Only one session with a comparable GEX snapshot so far — "
+                "a second GEX twin appears as history accumulates."
+            )
+    st.caption(
+        f"{result['n_with_gex']} completed session"
+        f"{'s' if result['n_with_gex'] != 1 else ''} in the library have "
+        "a same-day GEX snapshot to match against."
+    )
 
 
 def _render_today_and_twins(ticker: str) -> None:
