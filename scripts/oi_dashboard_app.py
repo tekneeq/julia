@@ -3329,7 +3329,13 @@ _VOL_PROFILE = "rgba(41, 98, 255, 0.38)"
 _VOL_PROFILE_POC = "rgba(41, 98, 255, 0.82)"
 # Fraction of the price pane (from the right / $ axis) the profile spans.
 _VOL_PROFILE_SPAN = 0.30
-_TODAY_CHART_HEIGHT = 580
+# Tall enough that the live session chart reads closer to square on a
+# wide layout — short heights squash vertical moves into a flat strip.
+_TODAY_CHART_HEIGHT = 820
+_TODAY_CHART_HEIGHT_NO_VOL = 720
+# Give most of the tall figure to price; volume stays a thin strip.
+_TODAY_PRICE_ROW_FRAC = 0.78
+_TODAY_VOL_ROW_FRAC = 0.22
 
 
 def _five_min_bars(series: list[dict], today: date) -> list[dict]:
@@ -4485,13 +4491,18 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     has_vol_data = any(
         b.get("v") is not None and float(b["v"]) > 0 for b in bars5
     )
-    chart_h = _TODAY_CHART_HEIGHT if has_vol_data else 480
+    chart_h = (
+        _TODAY_CHART_HEIGHT if has_vol_data else _TODAY_CHART_HEIGHT_NO_VOL
+    )
 
     fig = make_subplots(
         rows=2 if has_vol_data else 1, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.70, 0.30] if has_vol_data else [1.0],
+        vertical_spacing=0.03,
+        row_heights=(
+            [_TODAY_PRICE_ROW_FRAC, _TODAY_VOL_ROW_FRAC]
+            if has_vol_data else [1.0]
+        ),
         specs=(
             [[{"secondary_y": True}], [{"secondary_y": False}]]
             if has_vol_data else
