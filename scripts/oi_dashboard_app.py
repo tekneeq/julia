@@ -4389,7 +4389,8 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     close on the left, crosshair spikes, prev-close baseline with
     green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
     EMA 27 curves on 5-minute bars, and a dotted last-price line with
-    a right-axis box (price + time left on the 5-min bar). Toggles
+    a right-axis box (price, % vs prev close, time left on the 5-min
+    bar). Toggles
     between 5-min candles (TradingView-like) and the tick line.
     Default window is today's session; prior 5-minute bars are on the
     same traces so zooming/panning the time axis reveals them. No
@@ -4657,9 +4658,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         ), row=1, col=1)
 
     # Last price: dotted ray across the pane + right-axis box with
-    # the live print and MM:SS left on this 5-minute candle.
+    # the live print, % vs prev close, and MM:SS left on this 5-min bar.
     bar_close = _current_bar_close(now, today, "5min")
-    price_label = f"{last_price:,.2f}"
+    price_label = (
+        f"{last_price:,.2f}<br>{last_pct:+.2f}%"
+        if last_pct is not None else f"{last_price:,.2f}"
+    )
     timer_ann = _attach_last_price_line(
         fig,
         last_price=last_price,
@@ -6668,8 +6672,9 @@ st.header("📈 Today's price action")
 st.caption(
     "TradingView-style live session chart — **right axis = $ price**, "
     "**left axis = % vs prev close**. A **dotted last-price line** "
-    "tracks the live print; the right-axis box shows the price and "
-    "how much time is left on the current candle. "
+    "tracks the live print; the right-axis box shows the price, "
+    "today's % vs prev close, and how much time is left on the "
+    "current candle. "
     "**Drag the chart to pan.** Drag the **time axis** (bottom) to "
     "zoom — zoom out or pan left to see prior sessions, not just "
     "today. Drag the **price axis** (right) to zoom price. "
