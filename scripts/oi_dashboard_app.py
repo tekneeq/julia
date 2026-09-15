@@ -606,14 +606,9 @@ def _rh_market_data_ready() -> bool:
     failure retries instead of disabling market data until restart.
     """
     try:
-        from julia.main import is_logged_in, login_robinhood
-        if is_logged_in():
-            return True
-        username = os.getenv("RH_USERNAME")
-        password = os.getenv("RH_PASSWORD")
-        if username and password:
-            login_robinhood(username, password)
-            return is_logged_in()
+        from julia.rh_auth import ensure_robinhood_login
+
+        return ensure_robinhood_login()
     except Exception:
         pass
     return False
@@ -1794,6 +1789,7 @@ def _restart_bundle_script(
             "echo 'Clearing RH session pickles…' | tee -a \"$LOG\"",
             "uv run python - <<'PY' | tee -a \"$LOG\"",
             "from pathlib import Path",
+            "from julia.rh_auth import clear_login_cooldown",
             "cleared = []",
             "for d in (Path.home() / '.tokens', Path('.') / '.tokens'):",
             "    if not d.is_dir():",
@@ -1806,6 +1802,7 @@ def _restart_bundle_script(
             "    rh.logout()",
             "except Exception:",
             "    pass",
+            "clear_login_cooldown()",
             "print('cleared:', ', '.join(cleared) if cleared else '(none)')",
             "PY",
         ]
@@ -1815,19 +1812,14 @@ def _restart_bundle_script(
         "uv run python - <<'PY' | tee -a \"$LOG\"",
         "import os, sys, traceback",
         "from datetime import datetime",
-        "from julia.main import is_logged_in, login_robinhood",
+        "from julia.rh_auth import ensure_robinhood_login, is_logged_in",
         "print(f'[{datetime.now():%H:%M:%S}] logging in…', flush=True)",
         "try:",
         "    if is_logged_in():",
         "        print('already logged in', flush=True)",
         "        raise SystemExit(0)",
-        "    user, pw = os.environ.get('RH_USERNAME'), os.environ.get('RH_PASSWORD')",
-        "    if not user or not pw:",
-        "        print('RH_USERNAME / RH_PASSWORD missing', flush=True)",
-        "        raise SystemExit(2)",
-        "    login_robinhood(user, pw)",
-        "    ok = is_logged_in()",
-        "    print(('✅ login OK' if ok else '❌ login failed'), flush=True)",
+        "    ok = ensure_robinhood_login()",
+        "    print(('✅ login OK' if ok else '❌ login failed / cooling down'), flush=True)",
         "    raise SystemExit(0 if ok else 1)",
         "except SystemExit:",
         "    raise",
@@ -1837,9 +1829,9 @@ def _restart_bundle_script(
         "PY",
         "login_rc=$?",
         "if [ \"$login_rc\" -ne 0 ]; then",
-        "  echo \"RH login exited $login_rc — services will still restart and retry auth\" | tee -a \"$LOG\"",
+        "  echo \"RH login exited $login_rc — services still restart, but they share a login lock + 3min cooldown so they will not each fire a new MFA poll\" | tee -a \"$LOG\"",
         "fi",
-        "echo 'Restarting services…' | tee -a \"$LOG\"",
+        "echo 'Restarting services (staggered)…' | tee -a \"$LOG\"",
     ]
 
     for key in service_keys:
@@ -1864,6 +1856,7 @@ def _restart_bundle_script(
             f"rm -f {shlex.quote(str(pid_path))}",
             f"echo '↺ starting {spec['label']}' | tee -a \"$LOG\"",
             f"setsid {quoted} >>{shlex.quote(str(log_path))} 2>&1 </dev/null &",
+            "sleep 4",
         ]
         if spec["needs_discord_token"]:
             lines.append("fi")
@@ -1899,7 +1892,9 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
         "Restart in-container workers from here (no SSH). "
         "With **Clear RH session** on, login sends a **new device-approval "
         "push** — approve it in the Robinhood app within ~2 minutes, then "
-        "the pollers start."
+        "the pollers start. Only **one** process may MFA at a time; after "
+        "a 429 the rest wait ~3 minutes instead of stacking more pushes. "
+        "Don't mash restart if a challenge is already pending."
     )
 
     for key in _SERVICE_SPECS:

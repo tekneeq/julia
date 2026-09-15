@@ -12,6 +12,12 @@ from julia.options import OptionPricer
 from julia.options_cache import get_cache_instance
 from julia import predictions_store
 from julia import gex_store
+from julia.rh_auth import (  # noqa: F401 — re-export for existing callers
+    clear_login_cooldown,
+    ensure_robinhood_login,
+    is_logged_in,
+    login_robinhood,
+)
 import functools
 
 # looks for a .env file in the current directory
@@ -19,25 +25,12 @@ import functools
 load_dotenv()
 
 
-def is_logged_in():
-    """
-    Check if user is already logged in to Robinhood.
-
-    Returns:
-    - bool: True if logged in, False otherwise
-    """
-    try:
-        # Try to load account profile - this will fail if not logged in
-        rh.profiles.load_account_profile()
-        return True
-    except:
-        return False
-
-
 def ensure_logged_in(func):
     """
     Decorator to ensure user is logged in before executing command.
     If not logged in, will call login_robinhood with credentials from environment.
+    Login is process-serialized (file lock) so poller / dashboard / batch
+    don't each start a Robinhood device-approval challenge at once.
     """
 
     @functools.wraps(func)
@@ -57,39 +50,22 @@ def ensure_logged_in(func):
 
             click.echo("🔐 Logging in to Robinhood...")
             try:
-                login_robinhood(username, password)
-                click.echo("✅ Successfully logged in to Robinhood")
+                ok = login_robinhood(username, password)
             except Exception as e:
                 click.echo(f"❌ Login failed: {e}")
                 raise SystemExit(1) from e
+            if not ok:
+                click.echo(
+                    "❌ Login failed or cooling down after a 429 / MFA miss. "
+                    "Approve the app push if one is pending, wait a couple "
+                    "of minutes, and retry — don't restart every worker at once."
+                )
+                raise SystemExit(1)
+            click.echo("✅ Successfully logged in to Robinhood")
 
         return func(*args, **kwargs)
 
     return wrapper
-
-
-def login_robinhood(username, password):
-    """
-    Login to Robinhood account.
-
-    Uses a persisted session pickle under ``~/.tokens/``. When Robinhood
-    requires device approval, ``robin_stocks`` polls for up to ~2 minutes
-    while you tap Approve in the app — no SMS code needed for prompt MFA.
-
-    Parameters:
-    - username: str, Robinhood username
-    - password: str, Robinhood password
-
-    Returns:
-    - None
-    """
-    # expiresIn is seconds; a week cuts down how often MFA re-fires.
-    rh.login(
-        username=username,
-        password=password,
-        store_session=True,
-        expiresIn=86400 * 7,
-    )
 
 
 def implied_move(stock_price, iv, days_list, confidence_levels):

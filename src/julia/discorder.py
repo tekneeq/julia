@@ -80,16 +80,9 @@ _DISCORD_SAFE_LEN = 1800
 
 def _ensure_rh_login() -> bool:
     try:
-        from julia.main import is_logged_in, login_robinhood
+        from julia.rh_auth import ensure_robinhood_login
 
-        if is_logged_in():
-            return True
-        username = os.getenv("RH_USERNAME")
-        password = os.getenv("RH_PASSWORD")
-        if not username or not password:
-            return False
-        login_robinhood(username, password)
-        return is_logged_in()
+        return ensure_robinhood_login()
     except Exception:  # noqa: BLE001
         return False
 
