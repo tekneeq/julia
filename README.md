@@ -143,6 +143,12 @@ checked, then approve the push in the Robinhood app within ~2 minutes. That
 restarts the price poller / OI scheduler / Discord bot inside the container
 without SSH. Host scripts still work too: `./restart-price-poller.sh`, etc.
 
+Login is serialized across those processes (file lock on `~/.tokens/rh-login.lock`).
+If you see `429 Too Many Requests` on `/push/.../get_prompts_status/`, **do not
+restart everything again** — one challenge is already in flight. Approve the
+app push and wait ~3 minutes; extra workers reuse the saved session instead of
+starting more MFA polls.
+
 ### Discord `!lia` bot (optional)
 
 Create a **new** Discord application at https://discord.com/developers/applications

@@ -171,16 +171,10 @@ def _ensure_login() -> bool:
     if _login_ok:
         return True
     try:
-        from julia.main import is_logged_in, login_robinhood
-        if is_logged_in():
-            _login_ok = True
-            return True
-        username = os.getenv("RH_USERNAME")
-        password = os.getenv("RH_PASSWORD")
-        if username and password:
-            login_robinhood(username, password)
-            _login_ok = is_logged_in()
-            return _login_ok
+        from julia.rh_auth import ensure_robinhood_login
+
+        _login_ok = ensure_robinhood_login()
+        return _login_ok
     except Exception as e:  # noqa: BLE001
         print(f"[{datetime.now():%H:%M:%S}] login failed: {e!r}")
     return False
@@ -197,8 +191,13 @@ def _fetch_last_price(ticker: str) -> float | None:
         if vals and vals[0]:
             return float(vals[0])
     except Exception as e:  # noqa: BLE001
-        # Force a re-login attempt on the next cycle — an expired token
-        # surfaces here as a generic request error.
+        msg = f"{e!r}"
+        if "429" in msg or "Too Many Requests" in msg:
+            # Rate-limited on quotes — do not invalidate the session or
+            # we immediately start another MFA challenge.
+            print(f"[{datetime.now():%H:%M:%S}] {ticker}: 429, backing off")
+            return None
+        # Expired token usually surfaces as a generic request error.
         _login_ok = False
         print(f"[{datetime.now():%H:%M:%S}] {ticker}: fetch failed: {e!r}")
     return None
