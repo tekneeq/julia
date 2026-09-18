@@ -176,7 +176,7 @@ unset, deploy skips the bot and continues.
 ./restart-discord-bot.sh --stop
 ```
 
-The bot **only** responds to `!lia …` messages:
+The bot responds to `!lia …` messages (and `!spy watch` for price alerts):
 
 ```
 !lia help
@@ -196,6 +196,14 @@ The bot **only** responds to `!lia …` messages:
 !lia close spread <id1> <id2> now
 !lia close status                  # pending / recent spread closes
 !lia close cancel <job>
+!lia watch SPY 1m                  # print last + day change every minute
+!lia watch SPY 1%                  # print when today's % hits +1%
+!lia watch SPY -1%                 # print when today's % hits -1%
+!lia watch SPY 759                 # print when last hits 759
+!lia watch                         # list price watches (+ ids)
+!lia watch close <id>
+!spy watch                         # same list
+!spy watch close <id>
 ```
 
 `EXP` accepts `YYYY-MM-DD` or `0dte` / `1dte` / … (Nth upcoming listed expiration).
@@ -209,6 +217,14 @@ buys back the short leg and sells the long leg. Triggers: clock time
 delay (`in 1h` / `in 30m`), SPY last (`if spy >= 650` / `if spy <= 640`
 / `when spy hits 650`), or `now`. Pending watches survive a bot restart;
 `!lia close status` (also `!lia spreads`) lists them.
+
+`!lia watch` prints the last price plus today's dollar and percent change.
+Interval watches (`1m` / `5m` / `1h`, minimum 15s) also show the change
+since the previous print and keep going until you close them. Percent
+(`1%`, `-1%`) and price (`759`) watches fire once when the level is hit
+(`when last hits` resolves to `>=` or `<=` from the current print).
+`!spy watch` lists active watches; `!spy watch 1m` is shorthand for
+`!lia watch SPY 1m`. Pending watches survive a bot restart.
 
 ## Usage
 
