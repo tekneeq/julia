@@ -3273,7 +3273,11 @@ def _plotly_interactive_price_chart(
     home_y: tuple[float, float] | None = None,
     home_vol_hi: float | None = None,
 ) -> None:
-    """Pan the pane; drag the X/Y axes to zoom. Timer optional."""
+    """Pan the pane on desktop; drag the X/Y axes to zoom. Timer optional.
+
+    On phones (coarse / no-hover) pan and axis-zoom stay off so a
+    vertical swipe scrolls the dashboard instead of the chart.
+    """
     fig.update_layout(
         updatemenus=[],
         dragmode="pan",
