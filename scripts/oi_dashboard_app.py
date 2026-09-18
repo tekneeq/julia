@@ -120,7 +120,42 @@ def _png_for(ticker: str, exp: date) -> Path:
 _PLOTLY_CONFIG: dict = {
     "scrollZoom": False,
     "displaylogo": False,
+    "doubleClick": False,
 }
+
+# Phones: vertical swipes must scroll the page, not pan/zoom the plot.
+# Plotly's drag layer sets touch-action:none and preventDefault, which
+# traps the gesture. Coarse-pointer CSS lets the browser own pan-y.
+_MOBILE_CHART_SCROLL_CSS = """
+<style>
+@media (hover: none), (pointer: coarse) {
+  [data-testid="stPlotlyChart"],
+  [data-testid="stPlotlyChart"] iframe,
+  .stPlotlyChart,
+  .stPlotlyChart iframe,
+  iframe[title="st.plotly_chart"],
+  iframe[title="streamlit_plotly"] {
+    touch-action: pan-y !important;
+  }
+  /* Kill Plotly's invisible drag overlay so a finger swipe scrolls. */
+  [data-testid="stPlotlyChart"] .js-plotly-plot,
+  [data-testid="stPlotlyChart"] .nsewdrag,
+  [data-testid="stPlotlyChart"] .draglayer,
+  [data-testid="stPlotlyChart"] .zoombox,
+  .stPlotlyChart .js-plotly-plot,
+  .stPlotlyChart .nsewdrag,
+  .stPlotlyChart .draglayer {
+    touch-action: pan-y !important;
+    pointer-events: none !important;
+  }
+}
+</style>
+"""
+
+
+def _inject_mobile_chart_scroll_css() -> None:
+    """Make Streamlit Plotly charts page-scroll on phones (every rerun)."""
+    st.markdown(_MOBILE_CHART_SCROLL_CSS, unsafe_allow_html=True)
 
 
 _PLOTLY_SEQ = 0
@@ -144,8 +179,7 @@ def _show_plotly(
     if key is None:
         _PLOTLY_SEQ += 1
         key = f"plotly_auto_{_PLOTLY_SEQ}"
-    if fig.layout.dragmode is None:
-        fig.update_layout(dragmode=False)
+    fig.update_layout(dragmode=False)
     merged = {**_PLOTLY_CONFIG, **(config or {})}
     st.plotly_chart(
         fig, use_container_width=True, config=merged, key=key, **kwargs,
@@ -2848,7 +2882,7 @@ _PRICE_CHART_HTML = """
          border:1px solid #363a45;border-radius:4px;cursor:pointer;">
   __RESET_LABEL__
 </button>
-<div id="__UID__" style="width:100%;height:__HEIGHT__px;touch-action:none;"></div>
+<div id="__UID__" style="width:100%;height:__HEIGHT__px;touch-action:pan-y;"></div>
 </div>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script>
@@ -2860,8 +2894,11 @@ const annIdx = __ANN_IDX__;
 const persistKey = __PERSIST_KEY__;
 const refPrice = __REF_PRICE__;
 const anchorPrice = __ANCHOR_PRICE__;
+const phoneScroll = window.matchMedia("(hover: none)").matches
+  || window.matchMedia("(pointer: coarse)").matches;
 fig.layout = fig.layout || {};
-fig.layout.dragmode = "pan";
+// Desktop: pan the pane. Phone: leave drag off so a swipe scrolls the page.
+fig.layout.dragmode = phoneScroll ? false : "pan";
 fig.layout.uirevision = persistKey;
 const homeX = __HOME_X__ || (fig.layout.xaxis && fig.layout.xaxis.range
   ? fig.layout.xaxis.range.slice() : null);
@@ -3122,11 +3159,14 @@ function attachAxisZoom(gd) {
   function onUp() { mode = null; }
   gd.addEventListener("mousemove", onMoveCursor);
   gd.addEventListener("mousedown", onDown, true);
-  gd.addEventListener("touchstart", onDown, {capture: true, passive: false});
   window.addEventListener("mousemove", onMove);
-  window.addEventListener("touchmove", onMove, {passive: false});
   window.addEventListener("mouseup", onUp);
-  window.addEventListener("touchend", onUp);
+  // Touch axis-zoom steals the page scroll on phones — mouse only.
+  if (!phoneScroll) {
+    gd.addEventListener("touchstart", onDown, {capture: true, passive: false});
+    window.addEventListener("touchmove", onMove, {passive: false});
+    window.addEventListener("touchend", onUp);
+  }
   let fittingY = false;
   gd.on("plotly_relayout", (ev) => {
     if (!alive) return;
@@ -3187,7 +3227,17 @@ Plotly.newPlot(el, fig.data, fig.layout, {
     } : {}
   ));
   return apply.then(() => {
-    attachAxisZoom(gd);
+    if (!phoneScroll) {
+      attachAxisZoom(gd);
+    } else {
+      gd.style.touchAction = "pan-y";
+      gd.querySelectorAll(
+        ".nsewdrag,.draglayer,.zoombox,.cursor-ew-resize,.cursor-ns-resize"
+      ).forEach((n) => {
+        n.style.touchAction = "pan-y";
+        n.style.pointerEvents = "none";
+      });
+    }
     const xa0 = gd._fullLayout.xaxis;
     if (xa0 && xa0.range && gd._fullLayout.yaxis3) {
       const a0 = lin(xa0, xa0.range[0]), b0 = lin(xa0, xa0.range[1]);
@@ -6536,6 +6586,7 @@ def _render_tickers_table(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="Options OI Dashboard", layout="wide")
+_inject_mobile_chart_scroll_css()
 st.title("📊 Options OI — Live Dashboard")
 _git_sha, _git_when = _running_git_revision()
 st.caption(f"Running `{_git_sha}` · committed {_git_when}")
