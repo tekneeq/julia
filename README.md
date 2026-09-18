@@ -161,7 +161,7 @@ Create a **new** Discord application at https://discord.com/developers/applicati
 ```bash
 DISCORD_BOT_TOKEN=...          # required to start the bot
 DISCORD_CHANNEL_ID=...         # optional — channel for the ready greeting
-# Optional: only these Discord user IDs may !lia buy / !lia sell
+# Optional: only these Discord user IDs may !lia buy / sell / close
 # LIA_DISCORD_ALLOWLIST=123456789012345678,987654321098765432
 ```
 
@@ -189,10 +189,26 @@ The bot **only** responds to `!lia …` messages:
 !lia buy  opt SPY 0dte 755 call 1
 !lia buy  opt SPY 0dte atm call 1
 !lia sell opt <id> [QTY] [LIMIT]   # close by id from !lia opt
+!lia close spread <id1> <id2> [QTY] at 2pm
+!lia close spread <id1> <id2> [QTY] in 1h
+!lia close spread <id1> <id2> [QTY] if spy >= 650
+!lia close spread <id1> <id2> [QTY] when spy hits 650
+!lia close spread <id1> <id2> now
+!lia close status                  # pending / recent spread closes
+!lia close cancel <job>
 ```
 
 `EXP` accepts `YYYY-MM-DD` or `0dte` / `1dte` / … (Nth upcoming listed expiration).
 `STRIKE` accepts a number or `atm` (closest listed strike to spot).
+
+`!lia close spread` is **SPY options only**. Pass the two short ids from
+`!lia opt` (long lower-strike put + short higher-strike put for a put
+credit spread; order does not matter). When the trigger fires the bot
+buys back the short leg and sells the long leg. Triggers: clock time
+(`at 2pm` / `at 14:00` ET; rolls to tomorrow if already past), relative
+delay (`in 1h` / `in 30m`), SPY last (`if spy >= 650` / `if spy <= 640`
+/ `when spy hits 650`), or `now`. Pending watches survive a bot restart;
+`!lia close status` (also `!lia spreads`) lists them.
 
 ## Usage
 

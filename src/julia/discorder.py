@@ -10,6 +10,9 @@ Only messages that start with ``!lia`` are handled:
     !lia opt                # open option positions (with short ids)
     !lia buy  opt TICKER YYYY-MM-DD STRIKE call|put QTY [LIMIT]
     !lia sell opt <id> [QTY] [LIMIT]
+    !lia close spread <id1> <id2> [QTY] at 2pm|in 1h|if spy >= 650|now
+    !lia close status
+    !lia close cancel <job>
 
 Buy/sell submit **live Robinhood orders** using the host
 ``RH_USERNAME`` / ``RH_PASSWORD``.
@@ -20,16 +23,19 @@ Env (``.env`` on the julia EC2 host, loaded by docker ``--env-file``):
     DISCORD_CHANNEL_ID        optional ready greeting
     RH_USERNAME / RH_PASSWORD required for trading / portfolio commands
     LIA_DISCORD_ALLOWLIST     optional comma-separated Discord user IDs
-                              allowed to run buy/sell (everyone if unset)
+                              allowed to run buy/sell/close (everyone if unset)
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import traceback
 from datetime import date, datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
+
+from julia import spread_close
 
 from dotenv import load_dotenv
 
@@ -57,6 +63,9 @@ HELP_TEXT = """**Julia · `!lia` commands**
 !lia opt                               open option positions (+ short ids)
 !lia buy  opt TICKER EXP STRIKE call|put QTY [LIMIT]
 !lia sell opt <id> [QTY] [LIMIT]       close option by id from !lia opt
+!lia close spread <id1> <id2> [QTY] …  close both SPY spread legs
+!lia close status                      pending / recent spread closes
+!lia close cancel <job>                stop a pending spread close
 ```
 Examples:
 `!lia buy AAPL 1`
@@ -64,11 +73,21 @@ Examples:
 `!lia buy opt SPY 0dte 755 call 1`
 `!lia buy opt SPY 0dte atm call 1`
 `!lia sell opt a1b2c3`
+`!lia close spread a1b2c3 d4e5f6 at 2pm`
+`!lia close spread a1b2c3 d4e5f6 in 1h`
+`!lia close spread a1b2c3 d4e5f6 if spy >= 650`
+`!lia close spread a1b2c3 d4e5f6 when spy hits 650`
+`!lia close spread a1b2c3 d4e5f6 now`
+`!lia close status`
 
 EXP can be `YYYY-MM-DD`, `0dte`, `1dte`, … (Nth upcoming listed expiration).
 STRIKE can be a number or `atm` (closest listed strike to spot).
 Stock qty may be fractional. Option qty is whole contracts.
 Buy/sell place **real orders**. Option orders are **limit** (default: mark).
+`close spread` is **SPY options only**. Ids come from `!lia opt` (order of
+the two legs does not matter). Trigger: clock (`at 2pm` / `at 14:00`),
+delay (`in 1h` / `in 30m`), SPY print (`if spy >= 650` / `when spy hits
+650`), or `now`.
 """
 
 # Short-id → enriched option position, refreshed by ``!lia opt``.
@@ -529,7 +548,8 @@ def _cmd_opt_positions() -> str:
 
     lines = [
         f"**Option positions** · {len(positions)}",
-        "_Close with_ `!lia sell opt <id>` _(id column below)_",
+        "_Close one leg with_ `!lia sell opt <id>` · "
+        "_both spread legs with_ `!lia close spread <id1> <id2> at 2pm`",
     ]
     for p in positions[:40]:
         sid = p.get("_short_id") or "?"
@@ -689,6 +709,222 @@ def _cmd_sell_opt(
         _format_order("buy-to-close", label, float(close_qty), result)
         + f"\nLimit: `${limit}` (buy to close short)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Conditional SPY spread close
+# ---------------------------------------------------------------------------
+
+_SPREAD_WATCH_SECONDS = 15
+
+
+def _spy_spot() -> Optional[float]:
+    """Best-effort SPY last: poller ticks first, then Robinhood."""
+    try:
+        from julia.daily_moves_store import latest_tick
+
+        tick = latest_tick("SPY")
+        if tick and tick.get("price"):
+            return float(tick["price"])
+    except Exception:  # noqa: BLE001
+        pass
+    if not _ensure_rh_login():
+        return None
+    try:
+        import robin_stocks.robinhood as rh
+
+        spot_list = rh.stocks.get_latest_price(
+            "SPY", priceType=None, includeExtendedHours=True
+        )
+        if spot_list and spot_list[0] is not None:
+            return float(spot_list[0])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _fire_spread_job(job: dict[str, Any]) -> str:
+    """Buy-to-close the short leg, then sell-to-close the long leg."""
+    qty = int(job.get("qty") or 0)
+    short_id = str(job.get("short_id") or "")
+    long_id = str(job.get("long_id") or "")
+    header = (
+        f"**Spread close `#{job.get('id')}` fired** · "
+        f"{job.get('trigger_text') or '?'}"
+    )
+    if qty <= 0 or not short_id or not long_id:
+        err = "Job missing qty or leg ids."
+        spread_close.mark_job(
+            int(job["id"]),
+            status=spread_close.STATUS_ERROR,
+            last_error=err,
+            result_text=err,
+        )
+        return f"{header}\n❌ {err}"
+
+    short_result = _cmd_sell_opt(short_id, qty, None)
+    long_result = _cmd_sell_opt(long_id, qty, None)
+    short_ok = short_result.startswith("✅")
+    long_ok = long_result.startswith("✅")
+    body = (
+        f"**Short `{short_id}` (buy to close)**\n{short_result}\n"
+        f"**Long `{long_id}` (sell to close)**\n{long_result}"
+    )
+    if short_ok and long_ok:
+        status = spread_close.STATUS_FIRED
+        last_error = None
+    elif short_ok or long_ok:
+        status = spread_close.STATUS_PARTIAL
+        last_error = "one leg failed"
+    else:
+        status = spread_close.STATUS_ERROR
+        last_error = "both legs failed"
+    spread_close.mark_job(
+        int(job["id"]),
+        status=status,
+        result_text=body,
+        last_error=last_error,
+    )
+    return f"{header}\n{body}"
+
+
+def _cmd_close_status() -> str:
+    jobs = spread_close.list_jobs(
+        statuses=(
+            spread_close.STATUS_PENDING,
+            spread_close.STATUS_FIRING,
+        ),
+        limit=25,
+    )
+    if not jobs:
+        recent = spread_close.list_jobs(limit=8)
+        if not recent:
+            return spread_close.format_status([])
+        lines = [
+            "No **pending** spread closes. Recent:",
+            *(spread_close.format_job_line(j) for j in recent),
+            "_New watch:_ `!lia close spread <id1> <id2> at 2pm`",
+        ]
+        return _clip("\n".join(lines))
+    return _clip(spread_close.format_status(jobs))
+
+
+def _cmd_close_cancel(raw_id: str) -> str:
+    token = raw_id.strip().lstrip("#")
+    if not token.isdigit():
+        return "Usage: `!lia close cancel <job>` — job ids from `!lia close status`."
+    job_id = int(token)
+    job = spread_close.cancel_job(job_id)
+    if job is None:
+        return f"No spread-close job `#{job_id}`."
+    if job["status"] == spread_close.STATUS_CANCELLED:
+        return f"Cancelled `{spread_close.format_job_line(job)}`."
+    return (
+        f"Job `#{job_id}` is `{job['status']}` — only **pending** watches can be cancelled."
+    )
+
+
+def _schedule_spread_close(
+    args: list[str],
+    *,
+    created_by: str,
+    channel_id: Optional[str],
+) -> str:
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    try:
+        req = spread_close.parse_close_spread_args(args)
+    except ValueError as e:
+        return str(e)
+
+    pos1 = _lookup_opt_position(req.id1)
+    pos2 = _lookup_opt_position(req.id2)
+    if not pos1:
+        return f"Unknown option id `{req.id1}`. Run `!lia opt` to list positions and ids."
+    if not pos2:
+        return f"Unknown option id `{req.id2}`. Run `!lia opt` to list positions and ids."
+    if req.id1 == req.id2 or pos1 is pos2:
+        return "Need two different legs."
+
+    try:
+        legs = spread_close.validate_spread_legs(pos1, pos2, req.qty)
+    except ValueError as e:
+        return str(e)
+
+    trigger = req.trigger
+    if trigger.hits_unresolved:
+        spot = _spy_spot()
+        if spot is None:
+            return (
+                "Could not read SPY to resolve `hits`. "
+                "Use `if spy >= LEVEL` or `if spy <= LEVEL` instead."
+            )
+        trigger = spread_close.resolve_hits_trigger(trigger, spot)
+        if spread_close.price_condition_met(
+            trigger.price_op, trigger.price_level, spot
+        ):
+            # Already at the level — fire now rather than sitting pending.
+            trigger = spread_close.Trigger("now", trigger.text + " · already there", None)
+
+    if trigger.kind == "now":
+        job = spread_close.insert_job(
+            legs=legs,
+            trigger=trigger,
+            created_by=created_by,
+            channel_id=channel_id,
+            status=spread_close.STATUS_FIRING,
+        )
+        return (
+            f"Closing spread `#{job['id']}` now — "
+            f"buy-to-close `{legs.short_label}`, "
+            f"sell-to-close `{legs.long_label}` x `{legs.qty}`.\n"
+            + _fire_spread_job(job)
+        )
+
+    job = spread_close.insert_job(
+        legs=legs,
+        trigger=trigger,
+        created_by=created_by,
+        channel_id=channel_id,
+    )
+    return spread_close.format_scheduled(job, legs)
+
+
+async def _notify_channel(client: discord.Client, channel_id: Optional[str], text: str) -> None:
+    if not channel_id:
+        print(f"[discord] spread close (no channel): {text[:200]}")
+        return
+    try:
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+        if channel is not None:
+            await channel.send(_clip(text))
+    except Exception as e:  # noqa: BLE001
+        print(f"[discord] spread-close notify failed: {e!r}")
+
+
+async def _tick_spread_closes(client: discord.Client) -> None:
+    pending = spread_close.list_pending()
+    if not pending:
+        return
+    need_price = any(j.get("trigger_kind") == "price" for j in pending)
+    spy = await asyncio.to_thread(_spy_spot) if need_price else None
+    due = await asyncio.to_thread(spread_close.claim_due_jobs, None, spy)
+    for job in due:
+        result = await asyncio.to_thread(_fire_spread_job, job)
+        await _notify_channel(client, job.get("channel_id"), result)
+
+
+async def _watch_spread_closes(client: discord.Client) -> None:
+    await client.wait_until_ready()
+    print("[discord] spread-close watcher started")
+    while not client.is_closed():
+        try:
+            await _tick_spread_closes(client)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        await asyncio.sleep(_SPREAD_WATCH_SECONDS)
 
 
 def _parse_lia(content: str) -> tuple[str, list[str]]:
@@ -903,6 +1139,56 @@ async def _handle_message(msg: discord.Message) -> None:
             await msg.reply(_cmd_opt_positions())
             return
 
+        if sub in ("spreads", "spread"):
+            await msg.reply(_cmd_close_status())
+            return
+
+        if sub == "close":
+            if not args or args[0].lower() in (
+                "status",
+                "jobs",
+                "list",
+                "pending",
+            ):
+                await msg.reply(_cmd_close_status())
+                return
+            if args[0].lower() in ("help", "?"):
+                await msg.reply(
+                    "Close both SPY spread legs (buy the short, sell the long).\n"
+                    "`!lia close spread <id1> <id2> [QTY] at 2pm`\n"
+                    "`!lia close spread <id1> <id2> [QTY] in 1h`\n"
+                    "`!lia close spread <id1> <id2> [QTY] if spy >= 650`\n"
+                    "`!lia close spread <id1> <id2> [QTY] when spy hits 650`\n"
+                    "`!lia close spread <id1> <id2> [QTY] now`\n"
+                    "`!lia close status` · `!lia close cancel <job>`\n"
+                    "Ids from `!lia opt`. SPY options only."
+                )
+                return
+            if not _trader_allowed(msg.author.id):
+                await msg.reply(
+                    f"Not authorized to trade "
+                    f"(Discord user `{msg.author.id}` not in "
+                    f"`LIA_DISCORD_ALLOWLIST`)."
+                )
+                return
+            if args[0].lower() in ("cancel", "stop", "rm", "delete"):
+                if len(args) < 2:
+                    await msg.reply(
+                        "Usage: `!lia close cancel <job>` — ids from `!lia close status`."
+                    )
+                    return
+                await msg.reply(_cmd_close_cancel(args[1]))
+                return
+            spread_args = args[1:] if args[0].lower() in ("spread", "spr") else args
+            await msg.reply(
+                _schedule_spread_close(
+                    spread_args,
+                    created_by=str(msg.author.id),
+                    channel_id=str(msg.channel.id),
+                )
+            )
+            return
+
         if sub in ("positions", "position", "own", "holdings", "portfolio"):
             # `!lia positions opt` → option positions; else stocks.
             if args and args[0].lower() in ("opt", "opts", "options", "option"):
@@ -995,6 +1281,7 @@ def build_client() -> discord.Client:
     intents = Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
+    watcher_started = {"value": False}
 
     @client.event
     async def on_ready() -> None:
@@ -1002,6 +1289,9 @@ def build_client() -> discord.Client:
             f"[discord] logged in as {client.user} "
             f"(id={client.user and client.user.id})"
         )
+        if not watcher_started["value"]:
+            watcher_started["value"] = True
+            client.loop.create_task(_watch_spread_closes(client))
         channel_id = os.getenv("DISCORD_CHANNEL_ID")
         if not channel_id:
             return
