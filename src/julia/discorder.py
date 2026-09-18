@@ -1,6 +1,6 @@
 """Julia Discord bot — ``!lia`` command surface.
 
-Only messages that start with ``!lia`` are handled:
+Messages that start with ``!lia`` (and ``!spy watch``) are handled:
 
     !lia help
     !lia buy  AAPL 1
@@ -13,6 +13,9 @@ Only messages that start with ``!lia`` are handled:
     !lia close spread <id1> <id2> [QTY] at 2pm|in 1h|if spy >= 650|now
     !lia close status
     !lia close cancel <job>
+    !lia watch SPY 1m|1%|-1%|759
+    !lia watch / !spy watch
+    !lia watch close <id> / !spy watch close <id>
 
 Buy/sell submit **live Robinhood orders** using the host
 ``RH_USERNAME`` / ``RH_PASSWORD``.
@@ -35,7 +38,7 @@ from datetime import date, datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from julia import spread_close
+from julia import price_watch, spread_close
 
 from dotenv import load_dotenv
 
@@ -66,7 +69,12 @@ HELP_TEXT = """**Julia · `!lia` commands**
 !lia close spread <id1> <id2> [QTY] …  close both SPY spread legs
 !lia close status                      pending / recent spread closes
 !lia close cancel <job>                stop a pending spread close
+!lia watch TICKER 1m|1%|-1%|759        price prints / alerts
+!lia watch                             list price watches
+!lia watch close <id>                  stop a price watch
 ```
+Also: `!spy watch` lists watches · `!spy watch close <id>` stops one ·
+`!spy watch 1m` is shorthand for `!lia watch SPY 1m`.
 Examples:
 `!lia buy AAPL 1`
 `!lia buy opt SPY 2026-09-05 550 call 1`
@@ -79,6 +87,12 @@ Examples:
 `!lia close spread a1b2c3 d4e5f6 when spy hits 650`
 `!lia close spread a1b2c3 d4e5f6 now`
 `!lia close status`
+`!lia watch SPY 1m`
+`!lia watch SPY 1%`
+`!lia watch SPY -1%`
+`!lia watch SPY 759`
+`!spy watch`
+`!spy watch close 3`
 
 EXP can be `YYYY-MM-DD`, `0dte`, `1dte`, … (Nth upcoming listed expiration).
 STRIKE can be a number or `atm` (closest listed strike to spot).
@@ -88,6 +102,8 @@ Buy/sell place **real orders**. Option orders are **limit** (default: mark).
 the two legs does not matter). Trigger: clock (`at 2pm` / `at 14:00`),
 delay (`in 1h` / `in 30m`), SPY print (`if spy >= 650` / `when spy hits
 650`), or `now`.
+`watch` prints last + daily $/% change. Interval (`1m`) also shows change
+since the last print. `%` and price watches fire once when hit.
 """
 
 # Short-id → enriched option position, refreshed by ``!lia opt``.
@@ -743,6 +759,235 @@ def _spy_spot() -> Optional[float]:
     return None
 
 
+def _session_ref_spot(symbol: str) -> Optional[float]:
+    try:
+        from julia.daily_moves_store import list_sessions
+
+        today = _today_et().isoformat()
+        for row in list_sessions(symbol):
+            if str(row["session_date"]) == today:
+                return float(row["ref_spot"])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _rh_previous_close(symbol: str) -> Optional[float]:
+    try:
+        import robin_stocks.robinhood as rh
+
+        quotes = rh.stocks.get_quotes(symbol) or []
+        if isinstance(quotes, dict):
+            quotes = [quotes]
+        row = quotes[0] if quotes else {}
+        if not isinstance(row, dict):
+            return None
+        for key in ("previous_close", "adjusted_previous_close", "last_close"):
+            if row.get(key) not in (None, ""):
+                return float(row[key])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _stock_quote(symbol: str) -> Optional[dict[str, Any]]:
+    """Last price + daily change. Poller ticks first, then Robinhood."""
+    symbol = symbol.upper()
+    price: Optional[float] = None
+    ts = datetime.now(ET)
+    try:
+        from julia.daily_moves_store import latest_tick
+
+        tick = latest_tick(symbol)
+        if tick and tick.get("price"):
+            price = float(tick["price"])
+            ts = tick.get("ts") or ts
+    except Exception:  # noqa: BLE001
+        pass
+    if price is None:
+        if not _ensure_rh_login():
+            return None
+        try:
+            import robin_stocks.robinhood as rh
+
+            spot_list = rh.stocks.get_latest_price(
+                symbol, priceType=None, includeExtendedHours=True
+            )
+            if spot_list and spot_list[0] is not None:
+                price = float(spot_list[0])
+        except Exception:  # noqa: BLE001
+            return None
+    if price is None:
+        return None
+    ref = _session_ref_spot(symbol)
+    if ref is None and _ensure_rh_login():
+        ref = _rh_previous_close(symbol)
+    daily_chg = (price - ref) if ref else None
+    daily_pct = (daily_chg / ref * 100.0) if ref and ref != 0 else None
+    return {
+        "symbol": symbol,
+        "price": price,
+        "ref": ref,
+        "daily_chg": daily_chg,
+        "daily_pct": daily_pct,
+        "ts": ts,
+    }
+
+
+def _cmd_watch_status() -> str:
+    jobs = price_watch.list_watches(
+        statuses=(price_watch.STATUS_PENDING,),
+        limit=40,
+    )
+    if not jobs:
+        recent = price_watch.list_watches(limit=8)
+        if not recent:
+            return price_watch.format_watch_status([])
+        lines = [
+            "No **active** price watches. Recent:",
+            *(price_watch.format_watch_line(j) for j in recent),
+            "_New:_ `!lia watch SPY 1m`",
+        ]
+        return _clip("\n".join(lines))
+    return _clip(price_watch.format_watch_status(jobs))
+
+
+def _cmd_watch_close(raw_id: str) -> str:
+    token = raw_id.strip().lstrip("#")
+    if not token.isdigit():
+        return "Usage: `!lia watch close <id>` or `!spy watch close <id>`."
+    watch_id = int(token)
+    job = price_watch.cancel_watch(watch_id)
+    if job is None:
+        return f"No price watch `#{watch_id}`."
+    if job["status"] == price_watch.STATUS_CANCELLED:
+        return f"Closed `{price_watch.format_watch_line(job)}`."
+    return (
+        f"Watch `#{watch_id}` is `{job['status']}` — "
+        "only **pending** watches can be closed."
+    )
+
+
+def _schedule_price_watch(
+    args: list[str],
+    *,
+    created_by: str,
+    channel_id: Optional[str],
+) -> str:
+    try:
+        req = price_watch.parse_watch_args(args)
+    except ValueError as e:
+        return str(e)
+
+    quote = _stock_quote(req.symbol)
+    if quote is None:
+        return (
+            f"Could not read a last price for `{req.symbol}`. "
+            "Is the price poller running, or RH login available?"
+        )
+
+    spec = req.spec
+    fire_now = False
+    if spec.kind == price_watch.KIND_PRICE:
+        spec = price_watch.resolve_price_op(spec, float(quote["price"]))
+        fire_now = price_watch.price_condition_met(
+            spec.price_op, spec.price_level, float(quote["price"])
+        )
+    elif spec.kind == price_watch.KIND_PCT:
+        fire_now = price_watch.pct_condition_met(spec.pct_level, quote.get("daily_pct"))
+        if quote.get("daily_pct") is None and not fire_now:
+            # Still schedule — watcher will fire once daily % is known.
+            pass
+    elif spec.kind == price_watch.KIND_INTERVAL:
+        fire_now = True  # first print immediately, then every interval
+
+    now = datetime.now(ET)
+    if fire_now and spec.kind != price_watch.KIND_INTERVAL:
+        job = price_watch.insert_watch(
+            symbol=req.symbol,
+            spec=spec,
+            created_by=created_by,
+            channel_id=channel_id,
+            last_price=float(quote["price"]),
+            last_printed_at=now,
+            print_count=1,
+            status=price_watch.STATUS_FIRED,
+        )
+        return (
+            f"Watch `#{job['id']}` already there — printing now.\n"
+            + price_watch.format_quote_message(
+                job, {**quote, "prev_print_price": None}
+            )
+        )
+
+    job = price_watch.insert_watch(
+        symbol=req.symbol,
+        spec=spec,
+        created_by=created_by,
+        channel_id=channel_id,
+        last_price=float(quote["price"]) if spec.kind == price_watch.KIND_INTERVAL else None,
+        last_printed_at=now if spec.kind == price_watch.KIND_INTERVAL else None,
+        print_count=1 if spec.kind == price_watch.KIND_INTERVAL else 0,
+        status=price_watch.STATUS_PENDING,
+    )
+    if spec.kind == price_watch.KIND_INTERVAL:
+        return (
+            f"Watching `#{job['id']}` **{req.symbol}** {spec.text}. "
+            f"`!spy watch close {job['id']}` to stop.\n"
+            + price_watch.format_quote_message(
+                job, {**quote, "prev_print_price": None}
+            )
+        )
+    return (
+        f"Watching `#{job['id']}` **{req.symbol}** {spec.text}. "
+        f"`!spy watch close {job['id']}` to stop.\n"
+        f"Now `{req.symbol}` `${float(quote['price']):,.2f}` · "
+        f"day `{price_watch.signed_money(quote.get('daily_chg'))}` "
+        f"(`{price_watch.signed_pct(quote.get('daily_pct'))}`)"
+    )
+
+
+_WATCH_HELP = (
+    "Price watches:\n"
+    "`!lia watch SPY 1m` — print last + day change every minute "
+    "(also % since last print)\n"
+    "`!lia watch SPY 1%` / `!lia watch SPY -1%` — print when today's % hits\n"
+    "`!lia watch SPY 759` — print when last hits 759\n"
+    "`!lia watch` or `!spy watch` — list with ids\n"
+    "`!lia watch close <id>` or `!spy watch close <id>` — stop"
+)
+
+
+def _handle_watch_args(
+    args: list[str],
+    *,
+    created_by: str,
+    channel_id: Optional[str],
+    default_symbol: Optional[str] = None,
+) -> str:
+    if not args or args[0].lower() in ("status", "list", "jobs"):
+        return _cmd_watch_status()
+    if args[0].lower() in ("help", "?"):
+        return _WATCH_HELP
+    if args[0].lower() in ("close", "cancel", "stop", "rm", "delete"):
+        if len(args) < 2:
+            return "Usage: `!lia watch close <id>` or `!spy watch close <id>`."
+        return _cmd_watch_close(args[1])
+    watch_args = list(args)
+    if default_symbol:
+        try:
+            price_watch.parse_watch_spec(" ".join(watch_args))
+        except ValueError:
+            pass
+        else:
+            watch_args = [default_symbol, *watch_args]
+    return _schedule_price_watch(
+        watch_args,
+        created_by=created_by,
+        channel_id=channel_id,
+    )
+
+
 def _fire_spread_job(job: dict[str, Any]) -> str:
     """Buy-to-close the short leg, then sell-to-close the long leg."""
     qty = int(job.get("qty") or 0)
@@ -916,12 +1161,41 @@ async def _tick_spread_closes(client: discord.Client) -> None:
         await _notify_channel(client, job.get("channel_id"), result)
 
 
-async def _watch_spread_closes(client: discord.Client) -> None:
+async def _tick_price_watches(client: discord.Client) -> None:
+    pending = price_watch.list_pending()
+    if not pending:
+        return
+    symbols = sorted(
+        {
+            str(j.get("symbol") or "").upper()
+            for j in pending
+            if j.get("symbol")
+        }
+    )
+    quotes: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        quote = await asyncio.to_thread(_stock_quote, symbol)
+        if quote:
+            quotes[symbol] = quote
+    due = await asyncio.to_thread(price_watch.claim_due_watches, quotes, None)
+    for job, quote in due:
+        await _notify_channel(
+            client,
+            job.get("channel_id"),
+            price_watch.format_quote_message(job, quote),
+        )
+
+
+async def _watch_background(client: discord.Client) -> None:
     await client.wait_until_ready()
-    print("[discord] spread-close watcher started")
+    print("[discord] spread-close + price-watch loop started")
     while not client.is_closed():
         try:
             await _tick_spread_closes(client)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        try:
+            await _tick_price_watches(client)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
         await asyncio.sleep(_SPREAD_WATCH_SECONDS)
@@ -1114,10 +1388,40 @@ def _parse_opt_sell_args(
     return short_id, qty, limit
 
 
+async def _handle_spy_message(msg: discord.Message, content: str) -> None:
+    """``!spy watch`` list / ``!spy watch 1m`` / ``!spy watch close <id>``."""
+    parts = content.split()
+    rest = parts[1:]
+    if rest and rest[0].lower() in ("watch", "watches"):
+        rest = rest[1:]
+    elif rest:
+        await msg.reply(
+            "SPY watches: `!spy watch` · `!spy watch 1m` · "
+            "`!spy watch close <id>`"
+        )
+        return
+    await msg.reply(
+        _handle_watch_args(
+            rest,
+            created_by=str(msg.author.id),
+            channel_id=str(msg.channel.id),
+            default_symbol="SPY",
+        )
+    )
+
+
 async def _handle_message(msg: discord.Message) -> None:
     content = (msg.content or "").strip()
-    if not content.lower().startswith("!lia"):
-        # Ignore every non-!lia message (including old !price / !help).
+    lower = content.lower()
+    if lower.startswith("!spy"):
+        try:
+            await _handle_spy_message(msg, content)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            await msg.reply(f"Error: `{type(e).__name__}: {e}`")
+        return
+    if not lower.startswith("!lia"):
+        # Ignore every other message (including old !price / !help).
         return
 
     sub, args = _parse_lia(content)
@@ -1127,6 +1431,16 @@ async def _handle_message(msg: discord.Message) -> None:
     try:
         if sub in ("help", "commands", "?"):
             await msg.reply(HELP_TEXT)
+            return
+
+        if sub in ("watch", "watches"):
+            await msg.reply(
+                _handle_watch_args(
+                    args,
+                    created_by=str(msg.author.id),
+                    channel_id=str(msg.channel.id),
+                )
+            )
             return
 
         if sub in ("today", "buys"):
@@ -1291,7 +1605,7 @@ def build_client() -> discord.Client:
         )
         if not watcher_started["value"]:
             watcher_started["value"] = True
-            client.loop.create_task(_watch_spread_closes(client))
+            client.loop.create_task(_watch_background(client))
         channel_id = os.getenv("DISCORD_CHANNEL_ID")
         if not channel_id:
             return
