@@ -2779,17 +2779,109 @@ def _session_axis_layout(*, step_min: int = 90) -> dict:
     )
 
 
+def _fmt_pct_tick(v: float) -> str:
+    """Two-decimal signed percent, collapsing float dust to 0.00%."""
+    if abs(v) < 5e-12:
+        v = 0.0
+    return f"{v:+.2f}%"
+
+
+def _nice_pct_ticks(lo: float, hi: float, *, target: int = 5) -> list[float]:
+    """Even percent ticks that don't carry binary float residue."""
+    lo_f, hi_f = float(lo), float(hi)
+    if hi_f < lo_f:
+        lo_f, hi_f = hi_f, lo_f
+    if abs(hi_f - lo_f) < 1e-12:
+        lo_f, hi_f = lo_f - 0.5, hi_f + 0.5
+    span = hi_f - lo_f
+    raw = span / max(int(target) - 1, 1)
+    nice_steps = (
+        0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5,
+        1.0, 2.0, 2.5, 5.0, 10.0, 20.0, 25.0, 50.0,
+    )
+    step = next((s for s in nice_steps if s >= raw * 0.85), nice_steps[-1])
+    start_n = math.floor(lo_f / step - 1e-12)
+    end_n = math.ceil(hi_f / step + 1e-12)
+    ticks: list[float] = []
+    for n in range(start_n, end_n + 1):
+        v = round(n * step, 10)
+        ticks.append(0.0 if abs(v) < 5e-12 else v)
+    if lo_f <= 0.0 <= hi_f and 0.0 not in ticks:
+        ticks.append(0.0)
+        ticks.sort()
+    return ticks or [0.0]
+
+
+def _pct_window(
+    values: list[float | None], *, pad_frac: float = 0.08,
+) -> tuple[float, float]:
+    """Inclusive [lo, hi] around 0% with a little pad for path/GEX extremes."""
+    ys = [
+        float(v) for v in values
+        if v is not None and math.isfinite(float(v))
+    ]
+    if not ys:
+        return -1.0, 1.0
+    lo, hi = min(ys), max(ys)
+    lo = min(lo, 0.0)
+    hi = max(hi, 0.0)
+    pad = max((hi - lo) * pad_frac, 0.05)
+    return lo - pad, hi + pad
+
+
+def _path_pcts(path: list[dict] | None) -> list[float]:
+    if not path:
+        return []
+    return [float(p["pct"]) for p in path if p.get("pct") is not None]
+
+
+def _gex_pct_values(gex: dict | None, ref: float | None) -> list[float]:
+    if not gex or ref is None or float(ref) <= 0:
+        return []
+    out: list[float] = []
+    for side in ("high", "low"):
+        level = gex.get(side)
+        if not level:
+            continue
+        yp = _strike_as_pct(float(level[0]), float(ref))
+        if yp is not None:
+            out.append(yp)
+    return out
+
+
 def _pct_axis_layout(**extra) -> dict:
-    """% y-axis with two-decimal ticks and hover."""
+    """% y-axis with two-decimal ticks (no 0.3999999999999999% labels).
+
+    Plotly's auto ticks + ``tickformat="+.2f"`` / ``ticksuffix="%"``
+    often ignore the format and print raw binary floats. When a range
+    is given we pin ``tickvals`` / ``ticktext`` ourselves.
+    """
+    y_range = extra.pop("range", None)
+    nticks = extra.pop("nticks", 5)
+    try:
+        nticks = int(nticks) if nticks is not None else 5
+    except (TypeError, ValueError):
+        nticks = 5
     base = dict(
-        tickformat="+.2f",
-        ticksuffix="%",
-        hoverformat="+.2f",
         side="right",
         gridcolor=_TV_GRID,
         zeroline=False,
         color=_TV_MUTED,
+        hoverformat=".2f",
     )
+    if y_range is not None:
+        lo, hi = float(y_range[0]), float(y_range[1])
+        ticks = _nice_pct_ticks(lo, hi, target=max(nticks, 3))
+        lo = min(lo, ticks[0])
+        hi = max(hi, ticks[-1])
+        base.update(
+            range=[lo, hi],
+            tickmode="array",
+            tickvals=ticks,
+            ticktext=[_fmt_pct_tick(t) for t in ticks],
+        )
+    else:
+        base.update(tickformat=".2f", ticksuffix="%")
     base.update(extra)
     return base
 
@@ -4824,7 +4916,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         ),
     )
     if ref:
-        layout_kw["yaxis2"] = dict(
+        layout_kw["yaxis2"] = _pct_axis_layout(
             overlaying="y",
             side="left",
             range=[
@@ -4832,12 +4924,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
                 (y_hi - ref) / ref * 100.0,
             ],
             fixedrange=True,
-            tickformat="+.2f",
-            ticksuffix="%",
-            hoverformat="+.2f",
             showgrid=False,
-            zeroline=False,
-            color=_TV_MUTED,
             title=dict(
                 text="% vs prev close",
                 font=dict(size=11, color=_TV_MUTED),
@@ -5458,6 +5545,12 @@ def _twin_fig(
             compact=False,
         )
 
+    y_lo, y_hi = _pct_window(
+        _path_pcts(today_path)
+        + _path_pcts(twin.get("path"))
+        + _gex_pct_values(gex, gex_ref)
+    )
+
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin["final_pct"] is not None else "close n/a"
@@ -5475,7 +5568,7 @@ def _twin_fig(
         ),
         hovermode="x unified",
         xaxis=_session_axis_layout(),
-        yaxis=_pct_axis_layout(),
+        yaxis=_pct_axis_layout(range=[y_lo, y_hi]),
     ))
     return fig
 
@@ -5532,6 +5625,12 @@ def _yesterday_match_fig(
             compact=False,
         )
 
+    y_lo, y_hi = _pct_window(
+        _path_pcts(yesterday_path)
+        + _path_pcts(twin.get("path"))
+        + _gex_pct_values(gex, gex_ref)
+    )
+
     closed_txt = (
         f"closed {twin['final_pct']:+.2f}%"
         if twin.get("final_pct") is not None else "close n/a"
@@ -5544,7 +5643,7 @@ def _yesterday_match_fig(
         ),
         hovermode="x unified",
         xaxis=_session_axis_layout(),
-        yaxis=_pct_axis_layout(),
+        yaxis=_pct_axis_layout(range=[y_lo, y_hi]),
     ))
     return fig
 
@@ -5604,6 +5703,10 @@ def _nextday_only_fig(
             compact=False,
         )
 
+    y_lo, y_hi = _pct_window(
+        _path_pcts(next_path) + _gex_pct_values(gex, gex_ref)
+    )
+
     gex_txt = f"  ·  {_gex_env_short(gex['env'])}" if gex else ""
     if next_day is not None and twin.get("next_final_pct") is not None:
         title = (
@@ -5621,7 +5724,7 @@ def _nextday_only_fig(
         **_twin_chart_chrome(title, show_legend=False),
         hovermode="x",
         xaxis=_session_axis_layout(),
-        yaxis=_pct_axis_layout(),
+        yaxis=_pct_axis_layout(range=[y_lo, y_hi]),
     ))
     return fig
 
