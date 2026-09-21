@@ -666,7 +666,7 @@ def _market_daily_ohlc(ticker: str, today_iso: str) -> dict[str, dict[str, float
     out: dict[str, dict[str, float]] = {}
     try:
         bars = rh.stocks.get_stock_historicals(
-            ticker, interval="day", span="month", bounds="regular"
+            ticker, interval="day", span="3month", bounds="regular"
         ) or []
         for bar in bars:
             if not isinstance(bar, dict):
@@ -7016,8 +7016,8 @@ st.header("📏 Implied vs actual daily moves")
 
 iva_days = st.selectbox(
     "History window",
-    options=[5, 10, 15, 20],
-    index=0,
+    options=[5, 10, 15, 20, 40],
+    index=4,
     format_func=lambda n: f"Last {n} working days",
     key="iva_days",
 )
