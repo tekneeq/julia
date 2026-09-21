@@ -15,7 +15,7 @@ price poller so the live session chart can be rendered at full
 resolution instead of collapsed to one point per minute.
 
 Retention keeps today + the most recent ``KEEP_SESSIONS`` completed
-sessions (default 30). Older sessions are pruned on sync; raw ticks
+sessions (default 90). Older sessions are pruned on sync; raw ticks
 are pruned separately (``prune_ticks``) since only recent days need
 sub-minute detail.
 """
@@ -29,7 +29,7 @@ from typing import Optional
 
 from julia.predictions_store import DEFAULT_DB_PATH
 
-KEEP_SESSIONS = 30
+KEEP_SESSIONS = 90
 KEEP_TICK_SESSIONS = 10
 # NYSE regular session in local (container) time — Dockerfile pins ET.
 MARKET_OPEN = dtime(9, 30)
