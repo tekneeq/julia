@@ -4624,11 +4624,22 @@ def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
         f"sessions with a same-day GEX snapshot are in this regime."
     )
 
+    if matched["n_same_env"] == 0:
+        st.caption(
+            f"No completed session in the last "
+            f"{daily_moves_store.KEEP_SESSIONS}-day library was {env} "
+            f"like today — so there is nothing to histogram yet. "
+            "We already store each day's path and GEX snapshot; this "
+            "chart fills in once a matching regime closes."
+        )
+        return
+
     dist = _hod_lod_distribution(ticker, today, days=matched["days"])
     if dist is None:
         st.caption(
-            f"None of those {env} sessions have a full-enough path "
-            "yet to time the high / low."
+            f"{matched['n_same_env']} library session"
+            f"{'s' if matched['n_same_env'] != 1 else ''} were {env}, "
+            "but none have a full-enough path yet to time the high / low."
         )
         return
     _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
