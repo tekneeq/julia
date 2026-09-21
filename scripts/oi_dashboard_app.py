@@ -46,6 +46,11 @@ BATCH_SCRIPT = REPO_ROOT / "scripts" / "oi_batch.py"
 # matches exactly what the PNG dashboard shows.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from julia import daily_moves_store, gex_store  # noqa: E402
+from julia.gex_flip import (  # noqa: E402
+    contracts_from_strike_rows,
+    find_gex_flips,
+    years_to_expiry,
+)
 from julia.main import (  # noqa: E402
     _find_curve_crossing,
     _load_oi_snapshot_df,
@@ -4117,6 +4122,7 @@ def _ma_over_bars(
 
 _GEX_HIGH_COLOR = "#ff9800"  # amber ceiling
 _GEX_LOW_COLOR = "#26c6da"   # cyan floor
+_GEX_FLIP_COLOR = "#ab47bc"  # purple zero-gamma / env-flip print
 _HOD_LOD_LOOKBACK = daily_moves_store.KEEP_SESSIONS
 _HOD_LOD_BUCKET_MIN = 30  # half-hour windows across the regular session
 # How many GEX walls per side (above/below prev close) the levels table shows.
@@ -4331,11 +4337,19 @@ def _gex_levels_vs_ref(
         below.items(), key=lambda kv: abs(kv[1]), reverse=True
     )[:_GEX_TABLE_LEVELS_PER_SIDE]
 
+    spot_snap = float(snap["spot_price"] or 0)
+    flip = find_gex_flips(
+        contracts_from_strike_rows(strikes),
+        spot=spot_snap if spot_snap > 0 else anchor,
+        T=years_to_expiry(str(snap["expiration_date"]), today),
+        r=float(snap["risk_free_rate"] or 0.02),
+    )
+
     return {
         "snapshot_id": snap["id"],
         "expiration": snap["expiration_date"],
         "captured_at": snap["captured_at"],
-        "spot_at_snap": float(snap["spot_price"] or 0),
+        "spot_at_snap": spot_snap,
         "anchor": anchor,
         "anchor_is_ref": bool(ref),
         "total_gex": total,
@@ -4349,6 +4363,7 @@ def _gex_levels_vs_ref(
         "low": low,
         "levels_above": levels_above,
         "levels_below": levels_below,
+        "flip": flip,
     }
 
 
@@ -4416,22 +4431,54 @@ def _add_gex_level_overlays(
             **subplot,
         )
 
+    flip_px = (gex.get("flip") or {}).get("zero")
+    if flip_px:
+        flip_f = float(flip_px)
+        if as_pct_ref is not None:
+            y = _strike_as_pct(flip_f, as_pct_ref)
+            if y is None:
+                return
+            label = (
+                f"GEX flip {y:+.2f}%"
+                if compact
+                else f"GEX flip {flip_f:,.2f} ({y:+.2f}%)"
+            )
+        else:
+            y = flip_f
+            label = f"GEX flip {flip_f:,.2f}"
+        fig.add_hline(
+            y=y,
+            line_color=_GEX_FLIP_COLOR,
+            line_width=1.1 if compact else 1.4,
+            line_dash="dot",
+            annotation_text=label,
+            annotation_position="bottom left",
+            annotation_font=dict(
+                size=9 if compact else 11,
+                color=_GEX_FLIP_COLOR,
+            ),
+            **subplot,
+        )
+
 
 def _gex_info_caption(gex: dict, *, compact: bool = False) -> str:
     hi = gex.get("high")
     lo = gex.get("low")
     hi_s = f"${hi[0]:,.0f}" if hi else "—"
     lo_s = f"${lo[0]:,.0f}" if lo else "—"
+    flip_px = (gex.get("flip") or {}).get("zero")
+    flip_s = f"${float(flip_px):,.2f}" if flip_px else "—"
     if compact:
         return (
             f"{_gex_env_short(gex['env'])} · "
             f"net `{_fmt_gex_dollars(gex['total_gex'])}` · "
-            f"H {hi_s} / L {lo_s}"
+            f"H {hi_s} / L {lo_s} · flip {flip_s}"
         )
     return (
         f"**GEX** {_gex_env_short(gex['env'])} · {gex['env_label']} · "
         f"net `{_fmt_gex_dollars(gex['total_gex'])}` · "
-        f"high {hi_s} / low {lo_s} · exp `{gex['expiration']}`"
+        f"high {hi_s} / low {lo_s} · flip {flip_s} · "
+        f"exp `{gex['expiration']}`"
     )
 
 
@@ -4494,8 +4541,108 @@ def _render_gex_day_summary(gex: dict) -> None:
         )
 
     st.caption(gex["meaning"])
-
+    _render_gex_flip_row(gex)
     _render_gex_levels_table(gex)
+
+
+def _flip_vs_spot_label(price: float | None, spot: float) -> str | None:
+    if price is None or not spot:
+        return None
+    d = float(price) - float(spot)
+    pct = d / float(spot) * 100.0
+    return f"{d:+.2f} ({pct:+.2f}%) vs snap ${spot:,.2f}"
+
+
+def _render_gex_flip_row(gex: dict) -> None:
+    """Price prints where this expiry's net GEX would change env."""
+    flip = gex.get("flip") or {}
+    spot = float(gex.get("spot_at_snap") or 0)
+    env = gex.get("env")
+    zero = flip.get("zero")
+    to_neutral = flip.get("to_neutral")
+    to_opposite = flip.get("to_opposite")
+    scan_lo = flip.get("scan_lo")
+    scan_hi = flip.get("scan_hi")
+
+    if env == "NEGATIVE":
+        opposite = "POSITIVE"
+        flip_arrow = "GEX− → GEX+"
+    elif env == "POSITIVE":
+        opposite = "NEGATIVE"
+        flip_arrow = "GEX+ → GEX−"
+    else:
+        opposite = None
+        flip_arrow = "net GEX crosses $0"
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        st.metric(
+            "GEX flip print",
+            f"${zero:,.2f}" if zero else "none in scan",
+            (
+                f"{flip_arrow} · {_flip_vs_spot_label(zero, spot)}"
+                if zero and spot
+                else flip_arrow
+            ),
+            delta_color="off",
+            help=(
+                "Spot where this expiration's net GEX crosses $0 if we "
+                "restate Black-Scholes gamma at trial prints, holding the "
+                "snapshot's OI and IV fixed. Puts stay +, calls stay −, so "
+                "a lower print usually adds GEX+ (puts go ATM) and a higher "
+                "print adds GEX− (calls go ATM). Not a live last-print — "
+                "it's the model flip for this chain."
+            ),
+        )
+    with f2:
+        st.metric(
+            "Enters GEX≈",
+            f"${to_neutral:,.2f}" if to_neutral else (
+                "already GEX≈" if env == "NEUTRAL" else "none in scan"
+            ),
+            _flip_vs_spot_label(to_neutral, spot),
+            delta_color="off",
+            help=(
+                "Print where |net GEX| falls through $1M — the dashboard's "
+                "GEX≈ band — on the way toward the opposite regime."
+            ),
+        )
+    with f3:
+        if env == "NEUTRAL":
+            plus = flip.get("to_gex_plus")
+            minus = flip.get("to_gex_minus")
+            bits = []
+            if plus:
+                bits.append(f"GEX+ ${plus:,.2f}")
+            if minus:
+                bits.append(f"GEX− ${minus:,.2f}")
+            st.metric(
+                "Leaves GEX≈",
+                " / ".join(bits) if bits else "none in scan",
+                help=(
+                    "Prints where |net GEX| exits the $1M band into GEX+ "
+                    "or GEX−. Typically GEX+ below spot and GEX− above."
+                ),
+            )
+        else:
+            st.metric(
+                f"Prints {_gex_env_short(opposite)}" if opposite else "Opposite env",
+                f"${to_opposite:,.2f}" if to_opposite else "none in scan",
+                _flip_vs_spot_label(to_opposite, spot),
+                delta_color="off",
+                help=(
+                    "Print where |net GEX| crosses $1M on the far side — "
+                    "fully into the opposite env, past the GEX≈ band."
+                ),
+            )
+
+    if scan_lo and scan_hi:
+        st.caption(
+            "Flip is a **model print** for this expiry only: OI + IV frozen "
+            "from the snapshot, gamma restated at each trial spot. Scan "
+            f"${scan_lo:,.2f}–${scan_hi:,.2f} (±12% of snap). "
+            "A real tape print also changes IV and, over days, OI."
+        )
 
 
 def _render_gex_levels_table(gex: dict) -> None:
