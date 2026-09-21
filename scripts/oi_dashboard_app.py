@@ -1650,6 +1650,234 @@ def _render_crossing_chart(ticker: str, expiration: date, history: list[dict]) -
         )
 
 
+def _gex_env_history(ticker: str, expiration: date) -> list[dict]:
+    """Net GEX + env per snapshot for one expiration, oldest → newest.
+
+    X-axis is when we started tracking that expiry (first stored
+    snapshot) and every later capture. Skips rows with no GEX totals.
+    """
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration.isoformat(), limit=500
+    )
+    if not rows:
+        return []
+
+    history: list[dict] = []
+    for r in rows:
+        total = r["total_gex"]
+        call_g = r["call_gex"]
+        put_g = r["put_gex"]
+        if total is None:
+            if call_g is None and put_g is None:
+                continue
+            total = float(call_g or 0.0) + float(put_g or 0.0)
+        else:
+            total = float(total)
+        env = _classify_gex_env(total)
+        captured = _parse_utc(r["captured_at"])
+        history.append({
+            "captured_at_utc": captured,
+            "captured_at_local": captured.astimezone(),
+            "total_gex": total,
+            "call_gex": float(call_g or 0.0),
+            "put_gex": float(put_g or 0.0),
+            "env": env,
+            "env_label": _GEX_ENV_LABELS[env],
+            "spot_price": float(r["spot_price"]),
+        })
+
+    history.sort(key=lambda h: h["captured_at_utc"])
+    return history
+
+
+def _gex_last_per_local_day(history: list[dict]) -> list[dict]:
+    """Latest snapshot on each local trading day, oldest day first."""
+    by_date: dict[date, dict] = {}
+    for h in history:
+        d = h["captured_at_local"].date()
+        if d not in by_date or h["captured_at_local"] > by_date[d]["captured_at_local"]:
+            by_date[d] = h
+    return sorted(by_date.values(), key=lambda h: h["captured_at_local"].date())
+
+
+def _render_gex_env_chart(ticker: str, expiration: date, history: list[dict]) -> None:
+    if not history:
+        st.info(
+            f"No GEX snapshots yet for {ticker} {expiration.isoformat()}. "
+            "Run **oi-dashboard** at least once to seed the history."
+        )
+        return
+
+    ts = [h["captured_at_local"] for h in history]
+    net = [h["total_gex"] for h in history]
+    call_g = [h["call_gex"] for h in history]
+    put_g = [h["put_gex"] for h in history]
+    env_colors = [_GEX_ENV_COLORS[h["env"]] for h in history]
+    hover_net = [_fmt_gex_dollars(v) for v in net]
+    hover_call = [_fmt_gex_dollars(v) for v in call_g]
+    hover_put = [_fmt_gex_dollars(v) for v in put_g]
+    hover_env = [_gex_env_short(h["env"]) for h in history]
+    single = len(history) == 1
+
+    first, last = history[0], history[-1]
+    delta_net = last["total_gex"] - first["total_gex"]
+    span_min = (last["captured_at_utc"] - first["captured_at_utc"]).total_seconds() / 60
+    if single:
+        span_str = "single snapshot"
+    else:
+        span_str = (
+            f"{span_min / 60 / 24:.1f} days" if span_min >= 60 * 24
+            else f"{span_min / 60:.1f} hours" if span_min >= 60
+            else f"{span_min:.0f} min"
+        )
+
+    daily = _gex_last_per_local_day(history)
+    prior_day = daily[-2] if len(daily) >= 2 else None
+
+    fig = go.Figure()
+    fig.add_hrect(
+        y0=-_GEX_NEUTRAL_ABS,
+        y1=_GEX_NEUTRAL_ABS,
+        fillcolor="#9e9e9e",
+        opacity=0.12,
+        line_width=0,
+        annotation_text="GEX≈",
+        annotation_position="top left",
+        annotation_font=dict(size=11, color="#7f7f7f"),
+    )
+    fig.add_hline(y=0, line=dict(color="#444", width=1, dash="dot"))
+    fig.add_trace(go.Scatter(
+        x=ts, y=call_g,
+        mode="markers" if single else "lines",
+        name="Call GEX",
+        line=dict(color="#2ca02c", width=1.5, dash="dash"),
+        marker=dict(size=8 if single else 5, color="#2ca02c"),
+        customdata=list(zip(hover_call)),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "Call GEX: <b>%{customdata[0]}</b><extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=ts, y=put_g,
+        mode="markers" if single else "lines",
+        name="Put GEX",
+        line=dict(color="#d62728", width=1.5, dash="dash"),
+        marker=dict(size=8 if single else 5, color="#d62728"),
+        customdata=list(zip(hover_put)),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "Put GEX: <b>%{customdata[0]}</b><extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=ts, y=net,
+        mode="markers" if single else "lines+markers",
+        name="Net GEX",
+        line=dict(color="#1f77b4", width=2.5),
+        marker=dict(size=12 if single else 8, color=env_colors),
+        customdata=list(zip(hover_net, hover_env)),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "Net GEX: <b>%{customdata[0]}</b><br>"
+            "Env: <b>%{customdata[1]}</b><extra></extra>"
+        ),
+    ))
+
+    layout_kwargs: dict = dict(
+        title=(
+            f"{ticker} {expiration.isoformat()} — net GEX over time  "
+            f"·  {len(history)} snapshot{'s' if len(history) != 1 else ''} "
+            f"over {span_str}"
+        ),
+        xaxis_title="Snapshot time (local) — tracking started here",
+        yaxis_title="GEX ($)",
+        height=380,
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, x=0),
+        margin=dict(t=60, l=60, r=20, b=40),
+    )
+    if single:
+        t0 = ts[0]
+        layout_kwargs["xaxis"] = dict(
+            range=[t0 - timedelta(hours=6), t0 + timedelta(hours=6)],
+        )
+        pad = max(abs(net[0]) * 0.4, _GEX_NEUTRAL_ABS * 1.5, 1.0)
+        layout_kwargs["yaxis"] = dict(range=[-pad, pad] if abs(net[0]) < pad else [
+            net[0] - pad, net[0] + pad,
+        ])
+
+    fig.update_layout(**layout_kwargs)
+    fig.update_yaxes(tickformat="$,.2s")
+    _show_plotly(fig, key=f"gex_env_{ticker}_{expiration.isoformat()}")
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        st.metric(
+            "Latest env",
+            _gex_env_short(last["env"]),
+            last["env_label"],
+            help=_GEX_ENV_MEANING[last["env"]],
+        )
+    with col_b:
+        st.metric(
+            "Latest net GEX",
+            _fmt_gex_dollars(last["total_gex"]),
+            None if single else f"{_fmt_gex_delta(delta_net)} vs first",
+        )
+    with col_c:
+        if prior_day is None:
+            st.metric(
+                "Daily change",
+                "n/a",
+                help=(
+                    "Need a snapshot from a prior trading day for this "
+                    "expiration to show the day-over-day net GEX move."
+                ),
+            )
+        else:
+            d_day = last["total_gex"] - prior_day["total_gex"]
+            prior_label = prior_day["captured_at_local"].strftime("%b %d")
+            st.metric(
+                "Daily change",
+                _fmt_gex_delta(d_day),
+                (
+                    f"{_gex_env_short(prior_day['env'])} → "
+                    f"{_gex_env_short(last['env'])} vs {prior_label}"
+                ),
+                help=(
+                    "Net GEX today minus the last snapshot on the "
+                    "previous local trading day we have for this expiry."
+                ),
+            )
+    with col_d:
+        st.metric(
+            "Snapshot age",
+            _age_from_dt(last["captured_at_utc"]),
+            last["captured_at_local"].strftime("%H:%M:%S"),
+            help=(
+                "How long ago the batch persisted this snapshot. "
+                "X-axis left edge is the first time we started "
+                "tracking this expiration."
+            ),
+        )
+
+    if len(daily) >= 2:
+        bits = []
+        for h in daily:
+            bits.append(
+                f"{h['captured_at_local'].strftime('%a %b %d')}: "
+                f"{_gex_env_short(h['env'])} {_fmt_gex_dollars(h['total_gex'])}"
+            )
+        st.caption("Daily last-print  ·  " + "  →  ".join(bits))
+    elif single:
+        st.caption(
+            "Only one snapshot so far — run `oi-dashboard` again "
+            "(or the batch) to start seeing net GEX drift and daily "
+            "env changes."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Background batch runner
 # ---------------------------------------------------------------------------
@@ -3893,6 +4121,35 @@ _HOD_LOD_LOOKBACK = daily_moves_store.KEEP_SESSIONS
 _HOD_LOD_BUCKET_MIN = 30  # half-hour windows across the regular session
 # How many GEX walls per side (above/below prev close) the levels table shows.
 _GEX_TABLE_LEVELS_PER_SIDE = 5
+# |net GEX| below this is treated as flat / GEX≈ everywhere on the dashboard.
+_GEX_NEUTRAL_ABS = 1_000_000.0
+_GEX_ENV_COLORS = {
+    "POSITIVE": "#2ca02c",
+    "NEGATIVE": "#d62728",
+    "NEUTRAL": "#7f7f7f",
+}
+_GEX_ENV_LABELS = {
+    "POSITIVE": "Positive GEX (long gamma)",
+    "NEGATIVE": "Negative GEX (short gamma)",
+    "NEUTRAL": "Gamma neutral",
+}
+_GEX_ENV_MEANING = {
+    "NEUTRAL": (
+        "Dealers are roughly flat gamma. Limited systematic hedging "
+        "flow — price is freer to wander without GEX pinning."
+    ),
+    "POSITIVE": (
+        "Dealers are net **long gamma** (put-heavy in julia's sign "
+        "convention). Expect mean-reversion: they **buy dips / sell "
+        "rips**, which dampens moves and can pin price near large "
+        "positive-GEX walls."
+    ),
+    "NEGATIVE": (
+        "Dealers are net **short gamma** (call-heavy in julia's sign "
+        "convention). Expect trend amplification: they **sell dips / "
+        "buy rips**, so breaks through GEX walls can accelerate."
+    ),
+}
 
 
 def _fmt_gex_dollars(value: float) -> str:
@@ -3905,6 +4162,20 @@ def _fmt_gex_dollars(value: float) -> str:
     if abs_v >= 1e3:
         return f"{sign}${abs_v / 1e3:.0f}K"
     return f"{sign}${abs_v:,.0f}"
+
+
+def _fmt_gex_delta(value: float) -> str:
+    """Signed compact dollars for metric deltas (`+$1.2M`, `-$400K`)."""
+    if value > 0:
+        return f"+{_fmt_gex_dollars(value)}"
+    return _fmt_gex_dollars(value)
+
+
+def _classify_gex_env(total: float) -> str:
+    """POSITIVE / NEGATIVE / NEUTRAL from net GEX (same $1M |net| cut)."""
+    if abs(float(total)) < _GEX_NEUTRAL_ABS:
+        return "NEUTRAL"
+    return "POSITIVE" if float(total) > 0 else "NEGATIVE"
 
 
 def _gex_env_short(env: str) -> str:
@@ -4041,30 +4312,9 @@ def _gex_levels_vs_ref(
     call_gex = float(snap["call_gex"] or 0.0)
     put_gex = float(snap["put_gex"] or 0.0)
 
-    if abs(total) < 1_000_000:
-        env = "NEUTRAL"
-        env_label = "Gamma neutral"
-        meaning = (
-            "Dealers are roughly flat gamma. Limited systematic hedging "
-            "flow — price is freer to wander without GEX pinning."
-        )
-    elif total > 0:
-        env = "POSITIVE"
-        env_label = "Positive GEX (long gamma)"
-        meaning = (
-            "Dealers are net **long gamma** (put-heavy in julia's sign "
-            "convention). Expect mean-reversion: they **buy dips / sell "
-            "rips**, which dampens moves and can pin price near large "
-            "positive-GEX walls."
-        )
-    else:
-        env = "NEGATIVE"
-        env_label = "Negative GEX (short gamma)"
-        meaning = (
-            "Dealers are net **short gamma** (call-heavy in julia's sign "
-            "convention). Expect trend amplification: they **sell dips / "
-            "buy rips**, so breaks through GEX walls can accelerate."
-        )
+    env = _classify_gex_env(total)
+    env_label = _GEX_ENV_LABELS[env]
+    meaning = _GEX_ENV_MEANING[env]
 
     anchor = float(ref) if ref else float(snap["spot_price"] or 0)
     above = {k: v for k, v in gex_by_strike.items() if k > anchor}
@@ -7108,6 +7358,30 @@ for ticker in tickers:
             )
             history = _crossing_history(ticker, exp, range_pct=range_pct)
             _render_crossing_chart(ticker, exp, history)
+
+# ---------------------------------------------------------------------------
+# GEX env / net GEX time series (next N working-day expirations)
+# ---------------------------------------------------------------------------
+st.divider()
+st.header("⚡ GEX env over time")
+st.caption(
+    "Net dealer gamma for each of the next working-day expirations. "
+    "The x-axis starts at the first snapshot we stored for that expiry "
+    "(when tracking began) and adds a point on every later capture. "
+    "Markers are colored by env: **GEX+** long-gamma / pinning, "
+    "**GEX−** short-gamma / trend, **GEX≈** when |net| is under $1M. "
+    "Daily change is latest vs the prior session's last print."
+)
+
+for ticker in tickers:
+    if not exps:
+        continue
+    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
+    for tab, exp in zip(tabs, exps):
+        with tab:
+            st.markdown(f"**{ticker} · {exp.isoformat()}**  _(net GEX + env)_")
+            gex_hist = _gex_env_history(ticker, exp)
+            _render_gex_env_chart(ticker, exp, gex_hist)
 
 # ---------------------------------------------------------------------------
 # Positioning totals (calls vs puts) — toggle OI (daily) or Volume (intraday)
