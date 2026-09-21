@@ -4362,14 +4362,21 @@ def _hod_lod_distribution(
     *,
     lookback: int = _HOD_LOD_LOOKBACK,
     bucket_min: int = _HOD_LOD_BUCKET_MIN,
+    days: list[date] | None = None,
 ) -> dict | None:
-    """Half-hour histogram of when HOD / LOD first printed over past sessions."""
-    end = _prev_business_day(today)
-    days = _past_business_days(end, lookback)
+    """Half-hour histogram of when HOD / LOD first printed over past sessions.
+
+    ``days`` overrides the default lookback window (used for the
+    GEX-env-matched companion chart).
+    """
+    if days is None:
+        end = _prev_business_day(today)
+        days = _past_business_days(end, lookback)
     buckets = list(range(0, _SESSION_MINUTES, bucket_min))
     high_counts = {b: 0 for b in buckets}
     low_counts = {b: 0 for b in buckets}
     n = 0
+    used: list[date] = []
     for d in days:
         path = daily_moves_store.get_session_path(ticker, d)
         if not path or len(path) < 2:
@@ -4386,6 +4393,7 @@ def _hod_lod_distribution(
         high_counts[hi_b] += 1
         low_counts[lo_b] += 1
         n += 1
+        used.append(d)
 
     if n == 0:
         return None
@@ -4415,28 +4423,77 @@ def _hod_lod_distribution(
         "low": _rows(low_counts),
         "today_high_m": today_hi_m,
         "today_low_m": today_lo_m,
+        "days": used,
     }
 
 
-def _render_hod_lod_distribution(ticker: str, today: date) -> None:
-    """When the high/low of day tends to print — past N completed sessions."""
-    dist = _hod_lod_distribution(ticker, today)
-    st.markdown("##### High / low of day timing")
-    if dist is None:
-        st.caption(
-            "Need densified completed sessions before the HOD / LOD "
-            "timing distribution can be shown."
-        )
-        return
+def _gex_matched_hod_lod_days(
+    ticker: str, today: date,
+) -> dict:
+    """Completed sessions whose GEX regime matches today's.
 
+    Same env label (GEX+ / GEX− / GEX≈) as ``_find_gex_twins``, scanned
+    across the retained library so the histogram still has a sample
+    after filtering.
+    """
+    today_path = daily_moves_store.get_session_path(ticker, today)
+    today_ref = _session_ref_spot(ticker, today, today_path)
+    try:
+        today_gex = _gex_levels_vs_ref(
+            ticker=ticker,
+            today=today,
+            ref=float(today_ref) if today_ref else None,
+            allow_upcoming_fallback=True,
+        )
+    except Exception:
+        today_gex = None
+    if today_gex is None:
+        return {
+            "today_gex": None,
+            "days": [],
+            "n_with_gex": 0,
+            "n_same_env": 0,
+        }
+
+    days: list[date] = []
+    n_with_gex = 0
+    for s in daily_moves_store.list_sessions(ticker):
+        d = date.fromisoformat(s["session_date"])
+        if d >= today:
+            continue
+        try:
+            ref = float(s["ref_spot"])
+        except (TypeError, ValueError):
+            ref = None
+        try:
+            g = _gex_env_for_session(
+                ticker, d.isoformat(), ref if ref and ref > 0 else None,
+            )
+        except Exception:
+            g = None
+        if g is None:
+            continue
+        n_with_gex += 1
+        if g.get("env") != today_gex.get("env"):
+            continue
+        days.append(d)
+    days.sort()
+    return {
+        "today_gex": today_gex,
+        "days": days,
+        "n_with_gex": n_with_gex,
+        "n_same_env": len(days),
+    }
+
+
+def _render_hod_lod_bars(
+    ticker: str,
+    dist: dict,
+    *,
+    key_prefix: str,
+) -> None:
+    """Shared HOD / LOD bar pair used by the all-session and GEX charts."""
     n = dist["n"]
-    st.caption(
-        f"Among the last **{n}** completed sessions with a full-enough "
-        f"path (up to {_HOD_LOD_LOOKBACK} lookback), when the **high of "
-        f"day** and **low of day** were first reached — counted in "
-        f"{dist['bucket_min']}-minute windows (e.g. 12:00–12:30). "
-        "Each bar is count and % of those sessions."
-    )
 
     def _note(side: str, minutes: int | None, rows: list[dict]) -> str:
         if minutes is None:
@@ -4510,11 +4567,9 @@ def _render_hod_lod_distribution(ticker: str, today: date) -> None:
             _show_plotly(
                 fig,
                 config={"displayModeBar": False},
-                key=f"hod-lod-{ticker}-{side}",
+                key=f"{key_prefix}-{ticker}-{side}",
             )
 
-            # Compact top windows so the example ("12:00–12:30 N times = X%")
-            # is readable without scanning the whole bar chart.
             ranked = sorted(rows, key=lambda r: (-r["count"], r["bucket"]))
             top = [r for r in ranked if r["count"] > 0][:3]
             if top:
@@ -4523,6 +4578,60 @@ def _render_hod_lod_distribution(ticker: str, today: date) -> None:
                     for r in top
                 ]
                 st.caption("Most common: " + " · ".join(bits))
+
+
+def _render_hod_lod_distribution(ticker: str, today: date) -> None:
+    """When the high/low of day tends to print — past N completed sessions."""
+    dist = _hod_lod_distribution(ticker, today)
+    st.markdown("##### High / low of day timing")
+    if dist is None:
+        st.caption(
+            "Need densified completed sessions before the HOD / LOD "
+            "timing distribution can be shown."
+        )
+        return
+
+    n = dist["n"]
+    st.caption(
+        f"Among the last **{n}** completed sessions with a full-enough "
+        f"path (up to {_HOD_LOD_LOOKBACK} lookback), when the **high of "
+        f"day** and **low of day** were first reached — counted in "
+        f"{dist['bucket_min']}-minute windows (e.g. 12:00–12:30). "
+        "Each bar is count and % of those sessions."
+    )
+    _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod")
+
+
+def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
+    """HOD / LOD timing among completed days with today's GEX regime."""
+    st.markdown("##### High / low of day timing — today's GEX env")
+    matched = _gex_matched_hod_lod_days(ticker, today)
+    today_gex = matched["today_gex"]
+    if today_gex is None:
+        st.caption(
+            "No GEX snapshot for today yet — this chart appears after "
+            "the first OI/GEX batch of the day."
+        )
+        return
+
+    env = _gex_env_short(today_gex["env"])
+    st.caption(
+        f"Same HOD / LOD windows as above, but only **completed** "
+        f"sessions whose GEX regime matches today "
+        f"({env} · {today_gex['env_label']} · net "
+        f"`{_fmt_gex_dollars(today_gex['total_gex'])}`). "
+        f"{matched['n_same_env']} of {matched['n_with_gex']} library "
+        f"sessions with a same-day GEX snapshot are in this regime."
+    )
+
+    dist = _hod_lod_distribution(ticker, today, days=matched["days"])
+    if dist is None:
+        st.caption(
+            f"None of those {env} sessions have a full-enough path "
+            "yet to time the high / low."
+        )
+        return
+    _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
 
 
 def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
@@ -6359,6 +6468,7 @@ def _render_today_and_twins(ticker: str) -> None:
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
     _render_hod_lod_distribution(ticker, today)
+    _render_hod_lod_gex_distribution(ticker, today)
     _render_htf_price_charts(ticker, today)
     _render_recent_session_chiclets(ticker, today)
     _render_twin_panels(ticker, today)
