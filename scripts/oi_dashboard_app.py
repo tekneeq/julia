@@ -4430,59 +4430,44 @@ def _hod_lod_distribution(
 def _gex_matched_hod_lod_days(
     ticker: str, today: date,
 ) -> dict:
-    """Completed sessions whose GEX regime matches today's.
+    """Completed sessions similar to today on the GEX-twins score.
 
-    Same env label (GEX+ / GEX− / GEX≈) as ``_find_gex_twins``, scanned
-    across the retained library so the histogram still has a sample
-    after filtering.
+    Uses the same ``_gex_env_distance`` ranking as the GEX twin charts
+    (net / call / put, plus a penalty when the GEX+/GEX−/GEX≈ label
+    differs). Includes every same-label day, plus any day at least as
+    close as the twins we show — so a GEX− today can count near-neutral
+    short-gamma days (GEX≈, |net| < $1M) instead of coming up empty.
     """
-    today_path = daily_moves_store.get_session_path(ticker, today)
-    today_ref = _session_ref_spot(ticker, today, today_path)
-    try:
-        today_gex = _gex_levels_vs_ref(
-            ticker=ticker,
-            today=today,
-            ref=float(today_ref) if today_ref else None,
-            allow_upcoming_fallback=True,
-        )
-    except Exception:
-        today_gex = None
-    if today_gex is None:
+    scored = _score_gex_sessions(ticker, today)
+    if scored is None:
         return {
             "today_gex": None,
             "days": [],
             "n_with_gex": 0,
             "n_same_env": 0,
+            "n_similar": 0,
+            "cutoff": None,
         }
-
-    days: list[date] = []
-    n_with_gex = 0
-    for s in daily_moves_store.list_sessions(ticker):
-        d = date.fromisoformat(s["session_date"])
-        if d >= today:
-            continue
-        try:
-            ref = float(s["ref_spot"])
-        except (TypeError, ValueError):
-            ref = None
-        try:
-            g = _gex_env_for_session(
-                ticker, d.isoformat(), ref if ref and ref > 0 else None,
-            )
-        except Exception:
-            g = None
-        if g is None:
-            continue
-        n_with_gex += 1
-        if g.get("env") != today_gex.get("env"):
-            continue
-        days.append(d)
-    days.sort()
+    today_gex = scored["today_gex"]
+    candidates = scored["candidates"]
+    same_env = [
+        c for c in candidates if c["gex"].get("env") == today_gex.get("env")
+    ]
+    top = candidates[:2]
+    cutoff = max((float(c["gex_dist"]) for c in top), default=1.0)
+    days = sorted({
+        c["day"]
+        for c in candidates
+        if c["gex"].get("env") == today_gex.get("env")
+        or float(c["gex_dist"]) <= cutoff + 1e-9
+    })
     return {
         "today_gex": today_gex,
         "days": days,
-        "n_with_gex": n_with_gex,
-        "n_same_env": len(days),
+        "n_with_gex": scored["n_with_gex"],
+        "n_same_env": len(same_env),
+        "n_similar": len(days),
+        "cutoff": cutoff,
     }
 
 
@@ -4615,31 +4600,36 @@ def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
         return
 
     env = _gex_env_short(today_gex["env"])
+    n_sim = matched["n_similar"]
+    n_env = matched["n_same_env"]
     st.caption(
-        f"Same HOD / LOD windows as above, but only **completed** "
-        f"sessions whose GEX regime matches today "
-        f"({env} · {today_gex['env_label']} · net "
-        f"`{_fmt_gex_dollars(today_gex['total_gex'])}`). "
-        f"{matched['n_same_env']} of {matched['n_with_gex']} library "
-        f"sessions with a same-day GEX snapshot are in this regime."
+        f"Same HOD / LOD windows as above, scored with the **same GEX "
+        f"distance as GEX twins** (net / call / put — not only the "
+        f"{env} label). Today is {env} · {today_gex['env_label']} · net "
+        f"`{_fmt_gex_dollars(today_gex['total_gex'])}`. "
+        f"|net| under $1M is labeled GEX≈, so near-neutral short-gamma "
+        f"days still count. **{n_sim}** similar of "
+        f"{matched['n_with_gex']} snapshot days"
+        + (
+            f" ({n_env} exact {env})"
+            if n_env != n_sim else ""
+        )
+        + "."
     )
 
-    if matched["n_same_env"] == 0:
+    if n_sim == 0:
         st.caption(
-            f"No completed session in the last "
-            f"{daily_moves_store.KEEP_SESSIONS}-day library was {env} "
-            f"like today — so there is nothing to histogram yet. "
-            "We already store each day's path and GEX snapshot; this "
-            "chart fills in once a matching regime closes."
+            "No completed session in the library is close enough on "
+            "that GEX score to histogram yet."
         )
         return
 
     dist = _hod_lod_distribution(ticker, today, days=matched["days"])
     if dist is None:
         st.caption(
-            f"{matched['n_same_env']} library session"
-            f"{'s' if matched['n_same_env'] != 1 else ''} were {env}, "
-            "but none have a full-enough path yet to time the high / low."
+            f"{n_sim} similar GEX session"
+            f"{'s' if n_sim != 1 else ''}, but none have a "
+            "full-enough path yet to time the high / low."
         )
         return
     _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
@@ -6322,10 +6312,8 @@ def _gex_env_distance(a: dict, b: dict) -> float:
     return d
 
 
-def _find_gex_twins(
-    ticker: str, today: date, *, top_n: int = 2,
-) -> dict | None:
-    """Completed sessions whose day GEX env best matches today's."""
+def _score_gex_sessions(ticker: str, today: date) -> dict | None:
+    """Score completed sessions with the same GEX distance twins use."""
     today_path = daily_moves_store.get_session_path(ticker, today)
     today_ref = _session_ref_spot(ticker, today, today_path)
     try:
@@ -6372,14 +6360,29 @@ def _find_gex_twins(
             "gex_dist": _gex_env_distance(today_gex, g),
         })
 
-    # Most-similar gamma env first; path RMSE breaks ties.
     candidates.sort(key=lambda c: (c["gex_dist"], c["rmse"]))
     return {
         "today_path": today_path,
         "today_ref": today_ref,
         "today_gex": today_gex,
-        "twins": candidates[:top_n],
+        "candidates": candidates,
         "n_with_gex": n_with_gex,
+    }
+
+
+def _find_gex_twins(
+    ticker: str, today: date, *, top_n: int = 2,
+) -> dict | None:
+    """Completed sessions whose day GEX env best matches today's."""
+    scored = _score_gex_sessions(ticker, today)
+    if scored is None:
+        return None
+    return {
+        "today_path": scored["today_path"],
+        "today_ref": scored["today_ref"],
+        "today_gex": scored["today_gex"],
+        "twins": scored["candidates"][:top_n],
+        "n_with_gex": scored["n_with_gex"],
     }
 
 
