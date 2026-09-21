@@ -2039,7 +2039,7 @@ def _prior_close_spot(ticker: str, session: date) -> float | None:
     return best[1] if best else None
 
 
-def _ingest_snapshot_paths(ticker: str, lookback_calendar_days: int = 60) -> None:
+def _ingest_snapshot_paths(ticker: str, lookback_calendar_days: int = 140) -> None:
     """Upsert daily paths from gex_snapshots spot stamps."""
     cutoff = date.today() - timedelta(days=lookback_calendar_days)
     rows = gex_store.recent_snapshots(ticker=ticker, limit=10000)
@@ -2137,7 +2137,7 @@ def _fetch_rh_daily_closes(ticker: str) -> dict[str, float]:
     import robin_stocks.robinhood as rh
     try:
         bars = rh.stocks.get_stock_historicals(
-            ticker, interval="day", span="month", bounds="regular",
+            ticker, interval="day", span="3month", bounds="regular",
         ) or []
     except Exception:
         return {}
@@ -2189,15 +2189,15 @@ def _resolve_ref_spot(ticker: str, session: date) -> tuple[float | None, str]:
 def _ingest_market_paths(ticker: str) -> int:
     """Densify today + recent days with Robinhood 5-minute OHLC bars.
 
-    Fetches ``span='day'`` (freshest today) and ``span='week'`` (recent
-    history). Each bar is expanded to an open→wick→close polyline so a
-    high open that dumps inside the first hour actually shows up as a
-    sharp drop, not a single close print. Returns the number of market
-    points upserted (0 when auth/network fails).
+    Fetches ``span='month'`` and ``span='week'`` for recent history plus
+    ``span='day'`` (freshest today). Each bar is expanded to an
+    open→wick→close polyline so a high open that dumps inside the first
+    hour actually shows up as a sharp drop, not a single close print.
+    Returns the number of market points upserted (0 when auth/network fails).
     """
-    # Day last so today's bars win over the week payload on conflicts.
+    # Day last so today's bars win over the week/month payload on conflicts.
     candles_by_key: dict[str, dict] = {}
-    for span in ("week", "day"):
+    for span in ("month", "week", "day"):
         for c in _fetch_rh_5min(ticker, span):
             if not isinstance(c, dict):
                 continue
@@ -2328,7 +2328,7 @@ def _rebase_all_sessions_to_official_close(ticker: str) -> int:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _sync_daily_move_library(ticker: str, today_iso: str) -> dict:
-    """Refresh the 30-session library and return a small status dict."""
+    """Refresh the retained session library and return a small status dict."""
     today = date.fromisoformat(today_iso)
     _ingest_snapshot_paths(ticker)
     market_pts = _ingest_market_paths(ticker)
@@ -3889,7 +3889,7 @@ def _ma_over_bars(
 
 _GEX_HIGH_COLOR = "#ff9800"  # amber ceiling
 _GEX_LOW_COLOR = "#26c6da"   # cyan floor
-_HOD_LOD_LOOKBACK = 30
+_HOD_LOD_LOOKBACK = daily_moves_store.KEEP_SESSIONS
 _HOD_LOD_BUCKET_MIN = 30  # half-hour windows across the regular session
 # How many GEX walls per side (above/below prev close) the levels table shows.
 _GEX_TABLE_LEVELS_PER_SIDE = 5
@@ -4624,11 +4624,22 @@ def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
         f"sessions with a same-day GEX snapshot are in this regime."
     )
 
+    if matched["n_same_env"] == 0:
+        st.caption(
+            f"No completed session in the last "
+            f"{daily_moves_store.KEEP_SESSIONS}-day library was {env} "
+            f"like today — so there is nothing to histogram yet. "
+            "We already store each day's path and GEX snapshot; this "
+            "chart fills in once a matching regime closes."
+        )
+        return
+
     dist = _hod_lod_distribution(ticker, today, days=matched["days"])
     if dist is None:
         st.caption(
-            f"None of those {env} sessions have a full-enough path "
-            "yet to time the high / low."
+            f"{matched['n_same_env']} library session"
+            f"{'s' if matched['n_same_env'] != 1 else ''} were {env}, "
+            "but none have a full-enough path yet to time the high / low."
         )
         return
     _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
