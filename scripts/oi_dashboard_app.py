@@ -1883,6 +1883,28 @@ def _render_gex_env_chart(ticker: str, expiration: date, history: list[dict]) ->
         )
 
 
+def _render_gex_env_over_time(ticker: str, exps: list[date]) -> None:
+    """Next working-day net GEX / env tabs — sits above HOD / LOD timing."""
+    st.markdown("##### ⚡ GEX env over time")
+    st.caption(
+        "Net dealer gamma for each of the next working-day expirations. "
+        "The x-axis starts at the first snapshot we stored for that expiry "
+        "(when tracking began) and adds a point on every later capture. "
+        "Markers are colored by env: **GEX+** long-gamma / pinning, "
+        "**GEX−** short-gamma / trend, **GEX≈** when |net| is under $1M. "
+        "Daily change is latest vs the prior session's last print."
+    )
+    if not exps:
+        st.caption("No business days in the selected range.")
+        return
+    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
+    for tab, exp in zip(tabs, exps):
+        with tab:
+            st.markdown(f"**{ticker} · {exp.isoformat()}**  _(net GEX + env)_")
+            gex_hist = _gex_env_history(ticker, exp)
+            _render_gex_env_chart(ticker, exp, gex_hist)
+
+
 # ---------------------------------------------------------------------------
 # Background batch runner
 # ---------------------------------------------------------------------------
@@ -6870,14 +6892,16 @@ def _render_gex_twin_row(ticker: str, today: date) -> None:
     )
 
 
-def _render_today_and_twins(ticker: str) -> None:
+def _render_today_and_twins(ticker: str, exps: list[date]) -> None:
     today = date.today()
     if today.weekday() >= 5:
         st.info("Weekend — the live session chart resumes next trading day.")
+        _render_gex_env_over_time(ticker, exps)
         return
 
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
+    _render_gex_env_over_time(ticker, exps)
     _render_hod_lod_distribution(ticker, today)
     _render_hod_lod_gex_distribution(ticker, today)
     _render_htf_price_charts(ticker, today)
@@ -7368,7 +7392,7 @@ st.caption(
 )
 for ticker in tickers:
     st.markdown(f"**{ticker}**")
-    _render_today_and_twins(ticker)
+    _render_today_and_twins(ticker, exps)
 
 # ---------------------------------------------------------------------------
 # Implied-move time series (68% / 95% / 99.7%) per expiration
@@ -7505,30 +7529,6 @@ for ticker in tickers:
             )
             history = _crossing_history(ticker, exp, range_pct=range_pct)
             _render_crossing_chart(ticker, exp, history)
-
-# ---------------------------------------------------------------------------
-# GEX env / net GEX time series (next N working-day expirations)
-# ---------------------------------------------------------------------------
-st.divider()
-st.header("⚡ GEX env over time")
-st.caption(
-    "Net dealer gamma for each of the next working-day expirations. "
-    "The x-axis starts at the first snapshot we stored for that expiry "
-    "(when tracking began) and adds a point on every later capture. "
-    "Markers are colored by env: **GEX+** long-gamma / pinning, "
-    "**GEX−** short-gamma / trend, **GEX≈** when |net| is under $1M. "
-    "Daily change is latest vs the prior session's last print."
-)
-
-for ticker in tickers:
-    if not exps:
-        continue
-    tabs = st.tabs([f"{exp.isoformat()} ({exp.strftime('%a')})" for exp in exps])
-    for tab, exp in zip(tabs, exps):
-        with tab:
-            st.markdown(f"**{ticker} · {exp.isoformat()}**  _(net GEX + env)_")
-            gex_hist = _gex_env_history(ticker, exp)
-            _render_gex_env_chart(ticker, exp, gex_hist)
 
 # ---------------------------------------------------------------------------
 # Positioning totals (calls vs puts) — toggle OI (daily) or Volume (intraday)
