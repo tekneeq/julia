@@ -3724,14 +3724,18 @@ _VOL_DOWN_DIM = "rgba(242, 54, 69, 0.28)"
 _VOL_PROFILE = "rgba(41, 98, 255, 0.38)"
 _VOL_PROFILE_POC = "rgba(41, 98, 255, 0.82)"
 # Fraction of the price pane the profile spans, ending at
-# ``_VOL_PROFILE_X1`` (left of the GEX heatmap when that is drawn).
+# ``_VOL_PROFILE_X1`` (left of the GEX ladder when that is drawn).
 _VOL_PROFILE_SPAN = 0.22
 # Right-edge of the volume-at-price bars in x-domain units. The GEX
-# heatmap occupies ``_GEX_HM_LEFT``–1.0 so the two don't overlap.
-_VOL_PROFILE_X1 = 0.78
-_GEX_HM_LEFT = 0.80
-_GEX_HM_RIGHT = 1.0
-_GEX_HM_MAX_STRIKES = 40
+# ladder occupies ``1 - _GEX_LADDER_SPAN``–1.0 so the two don't overlap.
+_VOL_PROFILE_X1 = 0.76
+# Today-only GEX level ladder on the $ axis: bars grow from the right
+# edge inward, length ∝ |net GEX| at that strike.
+_GEX_LADDER_SPAN = 0.20
+_GEX_LADDER_MAX_LEVELS = 30
+_GEX_LADDER_MIN_FRAC = 0.045
+_GEX_LADDER_POS = (38, 198, 218)    # teal — stabilizing / GEX+
+_GEX_LADDER_NEG = (236, 64, 122)    # pink — amplifying / GEX−
 # Tall enough that the live session chart reads closer to square on a
 # wide layout — short heights squash vertical moves into a flat strip.
 _TODAY_CHART_HEIGHT = 820
@@ -4210,7 +4214,7 @@ def _fmt_gex_delta(value: float) -> str:
 
 
 def _fmt_gex_cell(value: float) -> str:
-    """Tight cell label for the on-chart GEX heatmap (`1.2M`, `-400K`)."""
+    """Tight label for on-chart GEX bars (`1.2M`, `-400K`)."""
     abs_v = abs(value)
     sign = "-" if value < 0 else ""
     if abs_v >= 1e9:
@@ -4222,89 +4226,68 @@ def _fmt_gex_cell(value: float) -> str:
     return f"{sign}{abs_v:.0f}"
 
 
-def _gex_heat_color(g: float, zmax: float) -> str:
-    """Bullflow-ish diverging fill: purple/pink −, cyan/yellow +."""
-    if zmax <= 0:
-        return "rgba(30, 34, 45, 0.45)"
-    n = max(-1.0, min(1.0, float(g) / float(zmax)))
-    if abs(n) < 0.05:
-        return "rgba(30, 34, 45, 0.50)"
-    if n >= 0.55:
-        return "rgba(253, 216, 53, 0.88)"
-    if n >= 0.18:
-        return "rgba(38, 198, 218, 0.82)"
-    if n > 0:
-        return "rgba(38, 198, 218, 0.42)"
-    if n <= -0.55:
-        return "rgba(106, 27, 154, 0.88)"
-    if n <= -0.18:
-        return "rgba(233, 30, 99, 0.78)"
-    return "rgba(233, 30, 99, 0.40)"
+def _day_gex_by_strike(ticker: str, today: date) -> dict | None:
+    """Today's-expiry net GEX per strike (0DTE, nearest-upcoming fallback).
 
-
-def _latest_gex_by_strike(ticker: str, expiration: date) -> dict[float, float]:
-    """Net GEX per strike from the freshest snapshot for this expiry."""
-    rows = gex_store.recent_snapshots(
-        ticker=ticker, expiration_date=expiration.isoformat(), limit=1,
-    )
-    if not rows:
-        return {}
+    Same snapshot pick as the GEX env / walls block so the ladder and
+    the amber/cyan wall lines always agree.
+    """
+    snap = _pick_day_gex_snapshot(ticker, today, allow_upcoming_fallback=True)
+    if snap is None:
+        return None
     by_k: dict[float, float] = {}
-    for row in gex_store.get_strikes(rows[0]["id"]):
+    for row in gex_store.get_strikes(snap["id"]):
         try:
             k = float(row["strike_price"])
             g = float(row["gex_per_contract"] or 0.0)
         except (TypeError, ValueError):
             continue
         by_k[k] = by_k.get(k, 0.0) + g
-    return by_k
+    if not by_k:
+        return None
+    return {
+        "expiration": str(snap["expiration_date"]),
+        "captured_at": snap["captured_at"],
+        "by_strike": by_k,
+    }
 
 
-def _gex_heatmap_matrix(
-    columns: list[tuple[date, dict[float, float]]],
+def _gex_ladder_levels(
+    by_strike: dict[float, float],
     *,
     y_lo: float,
     y_hi: float,
-    center: float | None = None,
-    max_strikes: int = _GEX_HM_MAX_STRIKES,
+    max_levels: int = _GEX_LADDER_MAX_LEVELS,
 ) -> dict | None:
-    """Strike × expiration net-GEX grid clipped to the visible price band."""
-    if not columns or y_hi <= y_lo:
+    """Visible-band strikes for the day ladder, capped by |GEX|.
+
+    Returns ``{"levels": [(strike, gex), ...] price-ascending, "gmax"}``.
+    """
+    if not by_strike or y_hi <= y_lo:
         return None
-    strikes = sorted({
-        k for _, m in columns for k in m
+    in_band = {
+        float(k): float(g) for k, g in by_strike.items()
         if y_lo <= float(k) <= y_hi
-    })
-    if not strikes:
-        return None
-    if len(strikes) > max_strikes:
-        score = {
-            k: sum(abs(m.get(k, 0.0)) for _, m in columns) for k in strikes
-        }
-        keep = set(sorted(strikes, key=lambda k: -score[k])[:max_strikes])
-        if center is not None:
-            keep.add(min(strikes, key=lambda k: abs(k - float(center))))
-        strikes = sorted(keep)
-    z: list[list[float | None]] = []
-    text: list[list[str]] = []
-    for k in strikes:
-        row_z: list[float | None] = []
-        row_t: list[str] = []
-        for _, m in columns:
-            g = m.get(k)
-            row_z.append(g)
-            row_t.append(_fmt_gex_cell(g) if g is not None else "")
-        z.append(row_z)
-        text.append(row_t)
-    vals = [g for row in z for g in row if g is not None]
-    zmax = max((abs(g) for g in vals), default=0.0)
-    return {
-        "strikes": strikes,
-        "exps": [e for e, _ in columns],
-        "z": z,
-        "text": text,
-        "zmax": zmax,
     }
+    if not in_band:
+        return None
+    strikes = sorted(in_band)
+    if len(strikes) > max_levels:
+        keep = sorted(strikes, key=lambda k: -abs(in_band[k]))[:max_levels]
+        strikes = sorted(keep)
+    levels = [(k, in_band[k]) for k in strikes]
+    gmax = max(abs(g) for _, g in levels)
+    if gmax <= 0:
+        return None
+    return {"levels": levels, "gmax": gmax}
+
+
+def _gex_ladder_fill(g: float, gmax: float) -> str:
+    """Magnitude-scaled fill: teal for GEX+, pink for GEX−."""
+    frac = min(1.0, abs(float(g)) / float(gmax)) if gmax > 0 else 0.0
+    r, gr, b = _GEX_LADDER_POS if g >= 0 else _GEX_LADDER_NEG
+    alpha = 0.28 + 0.62 * frac
+    return f"rgba({r}, {gr}, {b}, {alpha:.2f})"
 
 
 def _classify_gex_env(total: float) -> str:
@@ -4591,93 +4574,106 @@ def _add_gex_level_overlays(
         )
 
 
-def _add_gex_heatmap_overlay(
+def _add_gex_ladder_overlay(
     fig: go.Figure,
-    grid: dict,
+    ladder: dict,
     *,
+    exp_label: str,
     y_lo: float,
     y_hi: float,
     x_hover,
     row: int = 1,
     col: int = 1,
 ) -> None:
-    """Paint a strike × expiry GEX heatmap on the right of the price pane.
+    """Today-only GEX level ladder glued to the right / $ axis.
 
-    Uses x-domain coordinates so the grid stays glued to the $ axis when
-    the session is panned or zoomed — same trick as the volume profile.
+    One horizontal bar per strike — length ∝ |net GEX|, teal = GEX+
+    (stabilizing magnet), pink = GEX− (amplifying). The biggest wall on
+    each side gets a bright edge + label. Drawn in x-domain coordinates
+    so it stays pinned to price when the session is panned or zoomed.
     """
-    strikes: list[float] = list(grid.get("strikes") or [])
-    exps: list[date] = list(grid.get("exps") or [])
-    z = grid.get("z") or []
-    text = grid.get("text") or []
-    zmax = float(grid.get("zmax") or 0.0) or 1.0
-    n = len(exps)
-    if not strikes or n == 0:
+    levels: list[tuple[float, float]] = ladder["levels"]
+    gmax: float = ladder["gmax"]
+    if not levels or gmax <= 0:
         return
 
+    strikes = [k for k, _ in levels]
     if len(strikes) >= 2:
-        half = float(np.median(np.diff(strikes))) * 0.46
+        half = float(np.median(np.diff(strikes))) * 0.38
     else:
-        half = max((y_hi - y_lo) * 0.015, 0.15)
+        half = max((y_hi - y_lo) * 0.012, 0.12)
 
-    span = _GEX_HM_RIGHT - _GEX_HM_LEFT
+    top_pos = max((g for _, g in levels if g > 0), default=None)
+    top_neg = min((g for _, g in levels if g < 0), default=None)
+
     hover_x: list = []
     hover_y: list[float] = []
     hover_txt: list[str] = []
 
-    for j, exp in enumerate(exps):
-        x0 = _GEX_HM_LEFT + (j / n) * span
-        x1 = _GEX_HM_LEFT + ((j + 1) / n) * span
-        exp_label = f"{exp.strftime('%b')} {exp.day}"
-        for i, k in enumerate(strikes):
-            if k < y_lo or k > y_hi:
-                continue
-            g = z[i][j] if i < len(z) and j < len(z[i]) else None
-            if g is None:
-                continue
-            fig.add_shape(
-                type="rect",
-                xref="x domain", yref="y",
-                x0=x0, x1=x1,
-                y0=k - half, y1=k + half,
-                fillcolor=_gex_heat_color(float(g), zmax),
-                line=dict(width=0.35, color="rgba(19, 23, 34, 0.85)"),
-                layer="above",
-                row=row, col=col,
-            )
-            label = text[i][j] if i < len(text) and j < len(text[i]) else ""
-            if label and abs(float(g)) >= zmax * 0.12:
-                fig.add_annotation(
-                    xref="x domain", x=(x0 + x1) / 2.0,
-                    y=k, yref="y",
-                    text=label,
-                    showarrow=False,
-                    font=dict(size=8, color="#f5f5f5"),
-                    row=row, col=col,
-                )
-            hover_x.append(x_hover)
-            hover_y.append(k)
-            hover_txt.append(
-                f"{exp_label}  ·  ${k:,.2f}<br>"
-                f"Net GEX <b>{_fmt_gex_dollars(float(g))}</b>"
-            )
-
-        fig.add_annotation(
-            xref="x domain", x=(x0 + x1) / 2.0,
-            yref="y domain", y=1.0,
-            text=exp_label,
-            showarrow=False,
-            yanchor="bottom",
-            font=dict(size=9, color=_TV_MUTED),
+    for k, g in levels:
+        frac = abs(g) / gmax
+        length = _GEX_LADDER_SPAN * max(frac, _GEX_LADDER_MIN_FRAC)
+        x0 = 1.0 - length
+        is_wall = (top_pos is not None and g == top_pos) or (
+            top_neg is not None and g == top_neg
+        )
+        r, gr, b = _GEX_LADDER_POS if g >= 0 else _GEX_LADDER_NEG
+        fig.add_shape(
+            type="rect",
+            xref="x domain", yref="y",
+            x0=x0, x1=1.0,
+            y0=k - half, y1=k + half,
+            fillcolor=_gex_ladder_fill(g, gmax),
+            line=dict(
+                width=1.2 if is_wall else 0,
+                color=f"rgba({r}, {gr}, {b}, 0.95)",
+            ),
+            layer="above",
             row=row, col=col,
         )
+        # Label walls and any meaty level; skip dust so it stays clean.
+        if is_wall or frac >= 0.45:
+            fig.add_annotation(
+                xref="x domain", x=x0, xanchor="right",
+                y=k, yref="y",
+                text=(
+                    f"<b>{k:,.0f} · {_fmt_gex_cell(g)}</b>"
+                    if is_wall else f"{k:,.0f} · {_fmt_gex_cell(g)}"
+                ),
+                showarrow=False,
+                font=dict(
+                    size=10 if is_wall else 9,
+                    color=f"rgb({r}, {gr}, {b})",
+                ),
+                bgcolor="rgba(19, 23, 34, 0.72)",
+                borderpad=2,
+                xshift=-2,
+                row=row, col=col,
+            )
+        hover_x.append(x_hover)
+        hover_y.append(k)
+        side = "GEX+" if g >= 0 else "GEX−"
+        hover_txt.append(
+            f"${k:,.2f}  ·  {side}"
+            + ("  ·  <b>wall</b>" if is_wall else "")
+            + f"<br>Net GEX <b>{_fmt_gex_dollars(g)}</b>"
+        )
+
+    fig.add_annotation(
+        xref="x domain", x=1.0, xanchor="right",
+        yref="y domain", y=1.0, yanchor="bottom",
+        text=f"GEX levels · exp {exp_label}",
+        showarrow=False,
+        font=dict(size=10, color=_TV_MUTED),
+        row=row, col=col,
+    )
 
     if hover_x:
         fig.add_trace(
             go.Scatter(
                 x=hover_x, y=hover_y,
                 mode="markers",
-                marker=dict(size=8, color="rgba(0,0,0,0)"),
+                marker=dict(size=9, color="rgba(0,0,0,0)"),
                 text=hover_txt,
                 hovertemplate="%{text}<extra></extra>",
                 showlegend=False,
@@ -5257,9 +5253,7 @@ def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
     _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
 
 
-def _render_today_price_chart(
-    ticker: str, today: date, status: dict, exps: list[date] | None = None,
-) -> None:
+def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
     green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
@@ -5358,10 +5352,11 @@ def _render_today_price_chart(
         "The strip under the candles is volume-over-time: "
         "**bright** = above the 20-bar average, **faded** = light. "
         "**Amber / cyan** dashed lines are the day's GEX high / low "
-        "walls vs yesterday's close. The **grid on the right** is net "
-        "GEX by strike × the next working-day expirations (cyan/yellow "
-        "GEX+, pink/purple GEX−) — same ladder as a GEX heatmap, glued "
-        "to the $ axis."
+        "walls vs yesterday's close. The **bars on the right edge** are "
+        "today's GEX levels by strike (this expiration only): bar length "
+        "= size of the level, **teal = GEX+** magnet/support, **pink = "
+        "GEX−** amplifier. The brightest-edged bar on each side is the "
+        "day's biggest wall."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
@@ -5573,18 +5568,23 @@ def _render_today_price_chart(
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
 
-    gex_cols: list[tuple[date, dict[float, float]]] = []
-    for exp in (exps or []):
-        by_k = _latest_gex_by_strike(ticker, exp)
-        if by_k:
-            gex_cols.append((exp, by_k))
-    hm_center = float(ref) if ref else float(last_price)
-    gex_grid = _gex_heatmap_matrix(
-        gex_cols, y_lo=y_lo, y_hi=y_hi, center=hm_center,
-    )
-    if gex_grid is not None:
-        _add_gex_heatmap_overlay(
-            fig, gex_grid,
+    gex_day = _day_gex_by_strike(ticker, today)
+    gex_ladder = None
+    if gex_day is not None:
+        gex_ladder = _gex_ladder_levels(
+            gex_day["by_strike"], y_lo=y_lo, y_hi=y_hi,
+        )
+    if gex_ladder is not None:
+        try:
+            exp_d = date.fromisoformat(gex_day["expiration"][:10])
+            exp_label = f"{exp_d.strftime('%b')} {exp_d.day}"
+            if exp_d == today:
+                exp_label += " (0DTE)"
+        except ValueError:
+            exp_label = gex_day["expiration"]
+        _add_gex_ladder_overlay(
+            fig, gex_ladder,
+            exp_label=exp_label,
             y_lo=y_lo, y_hi=y_hi, x_hover=session_close,
         )
 
@@ -5595,7 +5595,7 @@ def _render_today_price_chart(
             today_bars=today_bars, y_lo=y_lo, y_hi=y_hi,
             x_hover=session_close,
             profile_x_right=(
-                _VOL_PROFILE_X1 if gex_grid is not None else 1.0
+                _VOL_PROFILE_X1 if gex_ladder is not None else 1.0
             ),
         )
     has_volume = vol_info is not None
@@ -7126,7 +7126,7 @@ def _render_today_and_twins(ticker: str, exps: list[date]) -> None:
         return
 
     status = _sync_daily_move_library(ticker, today.isoformat())
-    _render_today_price_chart(ticker, today, status, exps)
+    _render_today_price_chart(ticker, today, status)
     _render_gex_env_over_time(ticker, exps)
     _render_hod_lod_distribution(ticker, today)
     _render_hod_lod_gex_distribution(ticker, today)
