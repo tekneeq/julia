@@ -4716,7 +4716,90 @@ def _gex_snap_age_label(captured_at: str | None) -> str:
         return captured_at
 
 
-def _render_gex_day_summary(gex: dict) -> None:
+def _net_gex_day_history(
+    ticker: str, today: date, lookback: int = _HOD_LOD_LOOKBACK,
+) -> list[dict]:
+    """Each past session's own-expiry net GEX, oldest first.
+
+    Uses the same snapshot pick as the day summary (0DTE or same-day
+    capture; no upcoming fallback for history) so the ranking compares
+    apples to apples.
+    """
+    out: list[dict] = []
+    for d in _past_business_days(_prev_business_day(today), lookback):
+        snap = _pick_day_gex_snapshot(ticker, d, allow_upcoming_fallback=False)
+        if snap is None:
+            continue
+        total = snap["total_gex"]
+        if total is None:
+            continue
+        out.append({"day": d, "net": float(total)})
+    return out
+
+
+def _net_gex_rank_stats(
+    today_net: float, past_nets: list[float],
+) -> dict | None:
+    """Rank today's |net GEX| against past sessions'.
+
+    rank 1 = biggest |net| (today included). pctile = share of past
+    days today beats.
+    """
+    if not past_nets:
+        return None
+    abs_today = abs(float(today_net))
+    abs_past = sorted((abs(float(v)) for v in past_nets), reverse=True)
+    rank = 1 + sum(1 for v in abs_past if v > abs_today)
+    beaten = sum(1 for v in abs_past if v < abs_today)
+    n = len(abs_past)
+    mid = n // 2
+    median = (
+        abs_past[mid] if n % 2 == 1
+        else (abs_past[mid - 1] + abs_past[mid]) / 2.0
+    )
+    return {
+        "n": n,
+        "rank": rank,
+        "pctile": beaten / n * 100.0,
+        "avg_abs": sum(abs_past) / n,
+        "median_abs": median,
+        "max_abs": abs_past[0],
+    }
+
+
+def _upcoming_expiry_net_gex(
+    ticker: str, today: date, n: int = 5,
+) -> list[dict]:
+    """Latest net GEX per expiration for the next ``n`` working days."""
+    out: list[dict] = []
+    d = today if today.weekday() < 5 else _next_business_day(today)
+    while len(out) < n:
+        rows = gex_store.recent_snapshots(
+            ticker=ticker, expiration_date=d.isoformat(), limit=1,
+        )
+        net = None
+        captured = None
+        if rows:
+            total = rows[0]["total_gex"]
+            if total is None:
+                total = float(rows[0]["call_gex"] or 0.0) + float(
+                    rows[0]["put_gex"] or 0.0
+                )
+            net = float(total)
+            captured = rows[0]["captured_at"]
+        out.append({
+            "exp": d,
+            "net": net,
+            "env": _classify_gex_env(net) if net is not None else None,
+            "captured_at": captured,
+        })
+        d = _add_business_days(d, 1)
+    return out
+
+
+def _render_gex_day_summary(
+    gex: dict, ticker: str | None = None, today: date | None = None,
+) -> None:
     """Env metrics + plain-English meaning under the live chart."""
     st.markdown(
         f"**GEX env** · {gex['env_label']} · "
@@ -4725,9 +4808,38 @@ def _render_gex_day_summary(gex: dict) -> None:
         f"snap {_gex_snap_age_label(gex.get('captured_at'))}"
     )
 
+    rank = None
+    if ticker and today:
+        hist = _net_gex_day_history(ticker, today)
+        rank = _net_gex_rank_stats(
+            gex["total_gex"], [h["net"] for h in hist],
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Net GEX", _fmt_gex_dollars(gex["total_gex"]), gex["env"])
+        if rank is None:
+            st.metric("Net GEX", _fmt_gex_dollars(gex["total_gex"]), gex["env"])
+        else:
+            st.metric(
+                "Net GEX",
+                _fmt_gex_dollars(gex["total_gex"]),
+                (
+                    f"{gex['env']} · #{rank['rank']} of "
+                    f"{rank['n'] + 1} days by |net|"
+                ),
+                delta_color="off",
+                help=(
+                    f"Size rank of today's |net| against the last "
+                    f"{rank['n']} sessions with a same-day GEX snapshot "
+                    f"(#1 = biggest). Today is bigger than "
+                    f"{rank['pctile']:.0f}% of those days. Past-day "
+                    f"|net|: avg {_fmt_gex_dollars(rank['avg_abs'])} · "
+                    f"median {_fmt_gex_dollars(rank['median_abs'])} · "
+                    f"max {_fmt_gex_dollars(rank['max_abs'])}. Under "
+                    f"~{_fmt_gex_dollars(_GEX_NEUTRAL_ABS)} the day is "
+                    "effectively gamma-neutral regardless of sign."
+                ),
+            )
     with c2:
         st.metric(
             "Call GEX",
@@ -4762,8 +4874,70 @@ def _render_gex_day_summary(gex: dict) -> None:
         )
 
     st.caption(gex["meaning"])
+    if rank is not None:
+        st.caption(
+            f"**|Net| context** · last {rank['n']} snapshot days: "
+            f"avg `{_fmt_gex_dollars(rank['avg_abs'])}` · median "
+            f"`{_fmt_gex_dollars(rank['median_abs'])}` · max "
+            f"`{_fmt_gex_dollars(rank['max_abs'])}` — today "
+            f"`{_fmt_gex_dollars(abs(gex['total_gex']))}` ranks "
+            f"**#{rank['rank']} of {rank['n'] + 1}** "
+            f"(bigger than {rank['pctile']:.0f}% of them)."
+        )
     _render_gex_flip_row(gex)
+    if ticker and today:
+        _render_upcoming_gex_row(ticker, today, gex)
     _render_gex_levels_table(gex)
+
+
+def _render_upcoming_gex_row(ticker: str, today: date, gex: dict) -> None:
+    """Net GEX per expiration for the next 5 working days, one chip each."""
+    upcoming = _upcoming_expiry_net_gex(ticker, today, n=5)
+    if not any(u["net"] is not None for u in upcoming):
+        return
+
+    st.markdown("**Net GEX — next 5 working-day expirations**")
+    cols = st.columns(len(upcoming) + 1)
+    total = 0.0
+    have = 0
+    for col, u in zip(cols[:-1], upcoming):
+        exp = u["exp"]
+        label = f"{exp.strftime('%a %b %d')}"
+        if exp == today:
+            label += " · 0DTE"
+        with col:
+            if u["net"] is None:
+                st.metric(label, "—", "no snapshot", delta_color="off")
+                continue
+            total += u["net"]
+            have += 1
+            st.metric(
+                label,
+                _fmt_gex_dollars(u["net"]),
+                (
+                    f"{_gex_env_short(u['env'])} · "
+                    f"snap {_gex_snap_age_label(u.get('captured_at'))}"
+                ),
+                delta_color="off",
+            )
+    with cols[-1]:
+        if have:
+            st.metric(
+                "Σ next 5 expiries",
+                _fmt_gex_dollars(total),
+                _gex_env_short(_classify_gex_env(total)),
+                delta_color="off",
+                help=(
+                    "Sum of the latest net GEX across the expirations "
+                    "shown (missing days excluded). A rough whole-week "
+                    "gamma read — the 0DTE sign alone can be a tiny "
+                    "sliver of what dealers actually hedge."
+                ),
+            )
+    st.caption(
+        "Latest snapshot per expiration (julia put+/call− sign). The "
+        "full per-snapshot history lives in **GEX env over time** below."
+    )
 
 
 def _flip_vs_spot_label(price: float | None, spot: float) -> str | None:
@@ -5809,7 +5983,7 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         )
 
     if gex is not None:
-        _render_gex_day_summary(gex)
+        _render_gex_day_summary(gex, ticker, today)
     else:
         st.caption(
             "GEX levels unavailable — no cached GEX snapshot for this "
