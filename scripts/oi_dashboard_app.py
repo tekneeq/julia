@@ -3730,10 +3730,11 @@ _VOL_PROFILE_SPAN = 0.22
 # ladder occupies ``1 - _GEX_LADDER_SPAN``–1.0 so the two don't overlap.
 _VOL_PROFILE_X1 = 0.76
 # Today-only GEX level ladder on the $ axis: bars grow from the right
-# edge inward, length ∝ |net GEX| at that strike.
-_GEX_LADDER_SPAN = 0.20
+# edge inward, length ∝ |net GEX| at that strike. Kept slim and drawn
+# UNDER the price traces so candles are never hidden behind a wall bar.
+_GEX_LADDER_SPAN = 0.12
 _GEX_LADDER_MAX_LEVELS = 30
-_GEX_LADDER_MIN_FRAC = 0.045
+_GEX_LADDER_MIN_FRAC = 0.06
 _GEX_LADDER_POS = (38, 198, 218)    # teal — stabilizing / GEX+
 _GEX_LADDER_NEG = (236, 64, 122)    # pink — amplifying / GEX−
 # Tall enough that the live session chart reads closer to square on a
@@ -4283,10 +4284,14 @@ def _gex_ladder_levels(
 
 
 def _gex_ladder_fill(g: float, gmax: float) -> str:
-    """Magnitude-scaled fill: teal for GEX+, pink for GEX−."""
+    """Magnitude-scaled fill: teal for GEX+, pink for GEX−.
+
+    Alpha is capped low — the bars sit under the candles, and even the
+    biggest wall must stay a tint, not a paint bucket.
+    """
     frac = min(1.0, abs(float(g)) / float(gmax)) if gmax > 0 else 0.0
     r, gr, b = _GEX_LADDER_POS if g >= 0 else _GEX_LADDER_NEG
-    alpha = 0.28 + 0.62 * frac
+    alpha = 0.18 + 0.34 * frac
     return f"rgba({r}, {gr}, {b}, {alpha:.2f})"
 
 
@@ -4589,8 +4594,10 @@ def _add_gex_ladder_overlay(
 
     One horizontal bar per strike — length ∝ |net GEX|, teal = GEX+
     (stabilizing magnet), pink = GEX− (amplifying). The biggest wall on
-    each side gets a bright edge + label. Drawn in x-domain coordinates
-    so it stays pinned to price when the session is panned or zoomed.
+    each side gets a bright edge + a wall line across the pane. Bars are
+    slim, translucent, and drawn UNDER the price traces so candles stay
+    readable even when price trades inside a wall. X-domain coordinates
+    keep the ladder pinned to price when panning or zooming.
     """
     levels: list[tuple[float, float]] = ladder["levels"]
     gmax: float = ladder["gmax"]
@@ -4599,9 +4606,9 @@ def _add_gex_ladder_overlay(
 
     strikes = [k for k, _ in levels]
     if len(strikes) >= 2:
-        half = float(np.median(np.diff(strikes))) * 0.38
+        half = float(np.median(np.diff(strikes))) * 0.30
     else:
-        half = max((y_hi - y_lo) * 0.012, 0.12)
+        half = max((y_hi - y_lo) * 0.010, 0.10)
 
     top_pos = max((g for _, g in levels if g > 0), default=None)
     top_neg = min((g for _, g in levels if g < 0), default=None)
@@ -4625,12 +4632,27 @@ def _add_gex_ladder_overlay(
             y0=k - half, y1=k + half,
             fillcolor=_gex_ladder_fill(g, gmax),
             line=dict(
-                width=1.2 if is_wall else 0,
-                color=f"rgba({r}, {gr}, {b}, 0.95)",
+                width=1.0 if is_wall else 0,
+                color=f"rgba({r}, {gr}, {b}, 0.9)",
             ),
-            layer="above",
+            layer="below",
             row=row, col=col,
         )
+        if is_wall:
+            # A hairline across the whole pane marks the wall price
+            # without hiding anything behind a solid box.
+            fig.add_shape(
+                type="line",
+                xref="x domain", yref="y",
+                x0=0.0, x1=1.0, y0=k, y1=k,
+                line=dict(
+                    width=1,
+                    dash="dot",
+                    color=f"rgba({r}, {gr}, {b}, 0.55)",
+                ),
+                layer="below",
+                row=row, col=col,
+            )
         # Label walls and any meaty level; skip dust so it stays clean.
         if is_wall or frac >= 0.45:
             fig.add_annotation(
@@ -4645,7 +4667,7 @@ def _add_gex_ladder_overlay(
                     size=10 if is_wall else 9,
                     color=f"rgb({r}, {gr}, {b})",
                 ),
-                bgcolor="rgba(19, 23, 34, 0.72)",
+                bgcolor="rgba(19, 23, 34, 0.60)",
                 borderpad=2,
                 xshift=-2,
                 row=row, col=col,
@@ -5352,11 +5374,12 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "The strip under the candles is volume-over-time: "
         "**bright** = above the 20-bar average, **faded** = light. "
         "**Amber / cyan** dashed lines are the day's GEX high / low "
-        "walls vs yesterday's close. The **bars on the right edge** are "
-        "today's GEX levels by strike (this expiration only): bar length "
-        "= size of the level, **teal = GEX+** magnet/support, **pink = "
-        "GEX−** amplifier. The brightest-edged bar on each side is the "
-        "day's biggest wall."
+        "walls vs yesterday's close. The **slim bars on the right edge** "
+        "are today's GEX levels by strike (this expiration only): bar "
+        "length = size of the level, **teal = GEX+** magnet/support, "
+        "**pink = GEX−** amplifier. They're drawn *behind* the candles, "
+        "and the biggest wall on each side adds a dotted line across "
+        "the pane at that price."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
