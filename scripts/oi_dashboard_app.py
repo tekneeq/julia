@@ -3723,8 +3723,15 @@ _VOL_UP_DIM = "rgba(8, 153, 129, 0.28)"
 _VOL_DOWN_DIM = "rgba(242, 54, 69, 0.28)"
 _VOL_PROFILE = "rgba(41, 98, 255, 0.38)"
 _VOL_PROFILE_POC = "rgba(41, 98, 255, 0.82)"
-# Fraction of the price pane (from the right / $ axis) the profile spans.
-_VOL_PROFILE_SPAN = 0.30
+# Fraction of the price pane the profile spans, ending at
+# ``_VOL_PROFILE_X1`` (left of the GEX heatmap when that is drawn).
+_VOL_PROFILE_SPAN = 0.22
+# Right-edge of the volume-at-price bars in x-domain units. The GEX
+# heatmap occupies ``_GEX_HM_LEFT``–1.0 so the two don't overlap.
+_VOL_PROFILE_X1 = 0.78
+_GEX_HM_LEFT = 0.80
+_GEX_HM_RIGHT = 1.0
+_GEX_HM_MAX_STRIKES = 40
 # Tall enough that the live session chart reads closer to square on a
 # wide layout — short heights squash vertical moves into a flat strip.
 _TODAY_CHART_HEIGHT = 820
@@ -3857,6 +3864,7 @@ def _add_volume_profile(
     y_lo: float,
     y_hi: float,
     x_hover,
+    x_right: float = 1.0,
 ) -> dict | None:
     """Volume-at-price histogram glued to the right / $ axis.
 
@@ -3873,11 +3881,11 @@ def _add_volume_profile(
         return None
     for p in profile:
         frac = p["v"] / vmax
-        x0 = 1.0 - _VOL_PROFILE_SPAN * frac
+        x0 = x_right - _VOL_PROFILE_SPAN * frac
         fig.add_shape(
             type="rect",
             xref="x domain", yref="y",
-            x0=x0, x1=1.0,
+            x0=x0, x1=x_right,
             y0=p["price"] - p["width"] * 0.46,
             y1=p["price"] + p["width"] * 0.46,
             fillcolor=(
@@ -3895,7 +3903,7 @@ def _add_volume_profile(
         row=1, col=1,
     )
     fig.add_annotation(
-        xref="x domain", x=1.0, xanchor="right",
+        xref="x domain", x=x_right, xanchor="right",
         y=poc["price"], yref="y",
         text=f"POC ${poc['price']:,.2f} · {_fmt_volume(poc['v'])}",
         showarrow=False,
@@ -3936,6 +3944,7 @@ def _add_volume_layers(
     y_lo: float,
     y_hi: float,
     x_hover,
+    profile_x_right: float = 1.0,
 ) -> dict | None:
     """Time-series volume (row 2) + Y-axis volume-at-price profile.
 
@@ -4020,6 +4029,7 @@ def _add_volume_layers(
     )
     poc = _add_volume_profile(
         fig, today_bars, y_lo=y_lo, y_hi=y_hi, x_hover=x_hover,
+        x_right=profile_x_right,
     )
     return {"poc": poc, "vol_hi": vol_hi}
 
@@ -4197,6 +4207,104 @@ def _fmt_gex_delta(value: float) -> str:
     if value > 0:
         return f"+{_fmt_gex_dollars(value)}"
     return _fmt_gex_dollars(value)
+
+
+def _fmt_gex_cell(value: float) -> str:
+    """Tight cell label for the on-chart GEX heatmap (`1.2M`, `-400K`)."""
+    abs_v = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_v >= 1e9:
+        return f"{sign}{abs_v / 1e9:.1f}B"
+    if abs_v >= 1e6:
+        return f"{sign}{abs_v / 1e6:.1f}M"
+    if abs_v >= 1e3:
+        return f"{sign}{abs_v / 1e3:.0f}K"
+    return f"{sign}{abs_v:.0f}"
+
+
+def _gex_heat_color(g: float, zmax: float) -> str:
+    """Bullflow-ish diverging fill: purple/pink −, cyan/yellow +."""
+    if zmax <= 0:
+        return "rgba(30, 34, 45, 0.45)"
+    n = max(-1.0, min(1.0, float(g) / float(zmax)))
+    if abs(n) < 0.05:
+        return "rgba(30, 34, 45, 0.50)"
+    if n >= 0.55:
+        return "rgba(253, 216, 53, 0.88)"
+    if n >= 0.18:
+        return "rgba(38, 198, 218, 0.82)"
+    if n > 0:
+        return "rgba(38, 198, 218, 0.42)"
+    if n <= -0.55:
+        return "rgba(106, 27, 154, 0.88)"
+    if n <= -0.18:
+        return "rgba(233, 30, 99, 0.78)"
+    return "rgba(233, 30, 99, 0.40)"
+
+
+def _latest_gex_by_strike(ticker: str, expiration: date) -> dict[float, float]:
+    """Net GEX per strike from the freshest snapshot for this expiry."""
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration.isoformat(), limit=1,
+    )
+    if not rows:
+        return {}
+    by_k: dict[float, float] = {}
+    for row in gex_store.get_strikes(rows[0]["id"]):
+        try:
+            k = float(row["strike_price"])
+            g = float(row["gex_per_contract"] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        by_k[k] = by_k.get(k, 0.0) + g
+    return by_k
+
+
+def _gex_heatmap_matrix(
+    columns: list[tuple[date, dict[float, float]]],
+    *,
+    y_lo: float,
+    y_hi: float,
+    center: float | None = None,
+    max_strikes: int = _GEX_HM_MAX_STRIKES,
+) -> dict | None:
+    """Strike × expiration net-GEX grid clipped to the visible price band."""
+    if not columns or y_hi <= y_lo:
+        return None
+    strikes = sorted({
+        k for _, m in columns for k in m
+        if y_lo <= float(k) <= y_hi
+    })
+    if not strikes:
+        return None
+    if len(strikes) > max_strikes:
+        score = {
+            k: sum(abs(m.get(k, 0.0)) for _, m in columns) for k in strikes
+        }
+        keep = set(sorted(strikes, key=lambda k: -score[k])[:max_strikes])
+        if center is not None:
+            keep.add(min(strikes, key=lambda k: abs(k - float(center))))
+        strikes = sorted(keep)
+    z: list[list[float | None]] = []
+    text: list[list[str]] = []
+    for k in strikes:
+        row_z: list[float | None] = []
+        row_t: list[str] = []
+        for _, m in columns:
+            g = m.get(k)
+            row_z.append(g)
+            row_t.append(_fmt_gex_cell(g) if g is not None else "")
+        z.append(row_z)
+        text.append(row_t)
+    vals = [g for row in z for g in row if g is not None]
+    zmax = max((abs(g) for g in vals), default=0.0)
+    return {
+        "strikes": strikes,
+        "exps": [e for e, _ in columns],
+        "z": z,
+        "text": text,
+        "zmax": zmax,
+    }
 
 
 def _classify_gex_env(total: float) -> str:
@@ -4480,6 +4588,101 @@ def _add_gex_level_overlays(
                 color=_GEX_FLIP_COLOR,
             ),
             **subplot,
+        )
+
+
+def _add_gex_heatmap_overlay(
+    fig: go.Figure,
+    grid: dict,
+    *,
+    y_lo: float,
+    y_hi: float,
+    x_hover,
+    row: int = 1,
+    col: int = 1,
+) -> None:
+    """Paint a strike × expiry GEX heatmap on the right of the price pane.
+
+    Uses x-domain coordinates so the grid stays glued to the $ axis when
+    the session is panned or zoomed — same trick as the volume profile.
+    """
+    strikes: list[float] = list(grid.get("strikes") or [])
+    exps: list[date] = list(grid.get("exps") or [])
+    z = grid.get("z") or []
+    text = grid.get("text") or []
+    zmax = float(grid.get("zmax") or 0.0) or 1.0
+    n = len(exps)
+    if not strikes or n == 0:
+        return
+
+    if len(strikes) >= 2:
+        half = float(np.median(np.diff(strikes))) * 0.46
+    else:
+        half = max((y_hi - y_lo) * 0.015, 0.15)
+
+    span = _GEX_HM_RIGHT - _GEX_HM_LEFT
+    hover_x: list = []
+    hover_y: list[float] = []
+    hover_txt: list[str] = []
+
+    for j, exp in enumerate(exps):
+        x0 = _GEX_HM_LEFT + (j / n) * span
+        x1 = _GEX_HM_LEFT + ((j + 1) / n) * span
+        exp_label = f"{exp.strftime('%b')} {exp.day}"
+        for i, k in enumerate(strikes):
+            if k < y_lo or k > y_hi:
+                continue
+            g = z[i][j] if i < len(z) and j < len(z[i]) else None
+            if g is None:
+                continue
+            fig.add_shape(
+                type="rect",
+                xref="x domain", yref="y",
+                x0=x0, x1=x1,
+                y0=k - half, y1=k + half,
+                fillcolor=_gex_heat_color(float(g), zmax),
+                line=dict(width=0.35, color="rgba(19, 23, 34, 0.85)"),
+                layer="above",
+                row=row, col=col,
+            )
+            label = text[i][j] if i < len(text) and j < len(text[i]) else ""
+            if label and abs(float(g)) >= zmax * 0.12:
+                fig.add_annotation(
+                    xref="x domain", x=(x0 + x1) / 2.0,
+                    y=k, yref="y",
+                    text=label,
+                    showarrow=False,
+                    font=dict(size=8, color="#f5f5f5"),
+                    row=row, col=col,
+                )
+            hover_x.append(x_hover)
+            hover_y.append(k)
+            hover_txt.append(
+                f"{exp_label}  ·  ${k:,.2f}<br>"
+                f"Net GEX <b>{_fmt_gex_dollars(float(g))}</b>"
+            )
+
+        fig.add_annotation(
+            xref="x domain", x=(x0 + x1) / 2.0,
+            yref="y domain", y=1.0,
+            text=exp_label,
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(size=9, color=_TV_MUTED),
+            row=row, col=col,
+        )
+
+    if hover_x:
+        fig.add_trace(
+            go.Scatter(
+                x=hover_x, y=hover_y,
+                mode="markers",
+                marker=dict(size=8, color="rgba(0,0,0,0)"),
+                text=hover_txt,
+                hovertemplate="%{text}<extra></extra>",
+                showlegend=False,
+            ),
+            row=row, col=col,
         )
 
 
@@ -5054,7 +5257,9 @@ def _render_hod_lod_gex_distribution(ticker: str, today: date) -> None:
     _render_hod_lod_bars(ticker, dist, key_prefix="hod-lod-gex")
 
 
-def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
+def _render_today_price_chart(
+    ticker: str, today: date, status: dict, exps: list[date] | None = None,
+) -> None:
     """TradingView-style live session chart: $ on the right, % vs prev
     close on the left, crosshair spikes, prev-close baseline with
     green/red tint, H/L markers labeled with P(day extreme), SMA 9 /
@@ -5153,7 +5358,10 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "The strip under the candles is volume-over-time: "
         "**bright** = above the 20-bar average, **faded** = light. "
         "**Amber / cyan** dashed lines are the day's GEX high / low "
-        "walls vs yesterday's close."
+        "walls vs yesterday's close. The **grid on the right** is net "
+        "GEX by strike × the next working-day expirations (cyan/yellow "
+        "GEX+, pink/purple GEX−) — same ladder as a GEX heatmap, glued "
+        "to the $ axis."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
@@ -5365,12 +5573,30 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
 
+    gex_cols: list[tuple[date, dict[float, float]]] = []
+    for exp in (exps or []):
+        by_k = _latest_gex_by_strike(ticker, exp)
+        if by_k:
+            gex_cols.append((exp, by_k))
+    hm_center = float(ref) if ref else float(last_price)
+    gex_grid = _gex_heatmap_matrix(
+        gex_cols, y_lo=y_lo, y_hi=y_hi, center=hm_center,
+    )
+    if gex_grid is not None:
+        _add_gex_heatmap_overlay(
+            fig, gex_grid,
+            y_lo=y_lo, y_hi=y_hi, x_hover=session_close,
+        )
+
     vol_info = None
     if has_vol_data:
         vol_info = _add_volume_layers(
             fig, bars5,
             today_bars=today_bars, y_lo=y_lo, y_hi=y_hi,
             x_hover=session_close,
+            profile_x_right=(
+                _VOL_PROFILE_X1 if gex_grid is not None else 1.0
+            ),
         )
     has_volume = vol_info is not None
     if not has_volume:
@@ -6900,7 +7126,7 @@ def _render_today_and_twins(ticker: str, exps: list[date]) -> None:
         return
 
     status = _sync_daily_move_library(ticker, today.isoformat())
-    _render_today_price_chart(ticker, today, status)
+    _render_today_price_chart(ticker, today, status, exps)
     _render_gex_env_over_time(ticker, exps)
     _render_hod_lod_distribution(ticker, today)
     _render_hod_lod_gex_distribution(ticker, today)
