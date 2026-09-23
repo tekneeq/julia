@@ -4227,6 +4227,49 @@ def _fmt_gex_cell(value: float) -> str:
     return f"{sign}{abs_v:.0f}"
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _day_open_gex_flip(
+    ticker: str, today_iso: str, expiration: str,
+) -> dict | None:
+    """The GEX flip print from today's FIRST snapshot of this expiry.
+
+    The live flip line drifts as OI/IV snapshots refresh through the
+    session; this pins where the flip sat when tracking started this
+    morning, so you can see how far the boundary has migrated. Cached —
+    the day's first snapshot never changes once taken.
+    """
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration, limit=500,
+    )
+    todays = [
+        r for r in rows if (r["captured_at"] or "")[:10] == today_iso
+    ]
+    if not todays:
+        return None
+    first = min(todays, key=lambda r: r["captured_at"] or "")
+    strikes = gex_store.get_strikes(first["id"])
+    if not strikes:
+        return None
+    spot = float(first["spot_price"] or 0)
+    if spot <= 0:
+        return None
+    flips = find_gex_flips(
+        contracts_from_strike_rows(strikes),
+        spot=spot,
+        T=years_to_expiry(expiration, date.fromisoformat(today_iso)),
+        r=float(first["risk_free_rate"] or 0.02),
+    )
+    zero = flips.get("zero")
+    if zero is None:
+        return None
+    captured = _parse_utc(first["captured_at"]).astimezone()
+    return {
+        "zero": float(zero),
+        "captured_at_local": captured.strftime("%H:%M"),
+        "spot_at_snap": spot,
+    }
+
+
 def _day_gex_by_strike(ticker: str, today: date) -> dict | None:
     """Today's-expiry net GEX per strike (0DTE, nearest-upcoming fallback).
 
@@ -5553,7 +5596,9 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
         "length = size of the level, **teal = GEX+** magnet/support, "
         "**pink = GEX−** amplifier. They're drawn *behind* the candles, "
         "and the biggest wall on each side adds a dotted line across "
-        "the pane at that price."
+        "the pane at that price. The **yellow AM-flip line** pins where "
+        "the GEX env flip print sat on today's first snapshot (purple "
+        "dotted = the live, drifting flip)."
     )
     use_candles = view == "5-min candles"
     bars5 = _history_5min_bars(ticker, today, series)
@@ -5588,8 +5633,31 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             annotation_font=dict(size=11, color=_TV_MUTED),
             row=1, col=1,
         )
+    open_flip = None
     if gex is not None:
         _add_gex_level_overlays(fig, gex)
+        try:
+            open_flip = _day_open_gex_flip(
+                ticker, today.isoformat(), str(gex["expiration"]),
+            )
+        except Exception:
+            open_flip = None
+    if open_flip is not None:
+        fig.add_hline(
+            y=open_flip["zero"],
+            line_color="#fdd835",
+            line_width=1.1,
+            line_dash="dot",
+            annotation_text=(
+                f"AM flip {open_flip['zero']:,.2f} · "
+                f"{open_flip['captured_at_local']}"
+            ),
+            annotation_position="top left",
+            annotation_font=dict(size=9, color="#131722"),
+            annotation_bgcolor="#fdd835",
+            annotation_borderpad=2,
+            row=1, col=1,
+        )
 
     if use_candles:
         fig.add_trace(go.Candlestick(
@@ -5761,6 +5829,13 @@ def _render_today_price_chart(ticker: str, today: date, status: dict) -> None:
             y_all.append(float(gex["high"][0]))
         if gex.get("low"):
             y_all.append(float(gex["low"][0]))
+    if open_flip is not None:
+        # Keep the morning flip on screen when it's near the session
+        # range; a far-away flip shouldn't squash the candles.
+        lo_t, hi_t = min(y_all), max(y_all)
+        margin = max((hi_t - lo_t) * 0.5, 1.0)
+        if lo_t - margin <= open_flip["zero"] <= hi_t + margin:
+            y_all.append(float(open_flip["zero"]))
     lo_y, hi_y = min(y_all), max(y_all)
     pad = max((hi_y - lo_y) * 0.08, 0.15)
     y_lo, y_hi = lo_y - pad, hi_y + pad
