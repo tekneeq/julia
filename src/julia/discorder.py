@@ -10,6 +10,7 @@ Messages that start with ``!lia`` (and ``!spy watch``) are handled:
     !lia opt                # open option positions (with short ids)
     !lia buy  opt TICKER YYYY-MM-DD STRIKE call|put QTY [LIMIT]
     !lia sell opt <id> [QTY] [LIMIT]
+    !lia open spread TICKER EXP SHORT/LONG call|put QTY [CREDIT]
     !lia close spread <id1> <id2> [QTY] at 2pm|in 1h|if spy >= 650|now
     !lia close status
     !lia close cancel <job>
@@ -38,7 +39,7 @@ from datetime import date, datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from julia import price_watch, spread_close
+from julia import price_watch, spread_close, spread_open
 
 from dotenv import load_dotenv
 
@@ -66,6 +67,7 @@ HELP_TEXT = """**Julia · `!lia` commands**
 !lia opt                               open option positions (+ short ids)
 !lia buy  opt TICKER EXP STRIKE call|put QTY [LIMIT]
 !lia sell opt <id> [QTY] [LIMIT]       close option by id from !lia opt
+!lia open spread TICKER EXP S/L call|put QTY [CREDIT]
 !lia close spread <id1> <id2> [QTY] …  close both SPY spread legs
 !lia close status                      pending / recent spread closes
 !lia close cancel <job>                stop a pending spread close
@@ -81,6 +83,8 @@ Examples:
 `!lia buy opt SPY 0dte 755 call 1`
 `!lia buy opt SPY 0dte atm call 1`
 `!lia sell opt a1b2c3`
+`!lia open spread SPY 0dte 776/778 call 1`
+`!lia open spread SPY 0dte 770/768 put 1 0.35`
 `!lia close spread a1b2c3 d4e5f6 at 2pm`
 `!lia close spread a1b2c3 d4e5f6 in 1h`
 `!lia close spread a1b2c3 d4e5f6 if spy >= 650`
@@ -98,6 +102,9 @@ EXP can be `YYYY-MM-DD`, `0dte`, `1dte`, … (Nth upcoming listed expiration).
 STRIKE can be a number or `atm` (closest listed strike to spot).
 Stock qty may be fractional. Option qty is whole contracts.
 Buy/sell place **real orders**. Option orders are **limit** (default: mark).
+`open spread` sells SHORT/buys LONG as one credit-spread order (default
+credit: short bid − long ask). Calls: short below long (bear call).
+Puts: short above long (bull put).
 `close spread` is **SPY options only**. Ids come from `!lia opt` (order of
 the two legs does not matter). Trigger: clock (`at 2pm` / `at 14:00`),
 delay (`in 1h` / `in 30m`), SPY print (`if spy >= 650` / `when spy hits
@@ -724,6 +731,89 @@ def _cmd_sell_opt(
     return (
         _format_order("buy-to-close", label, float(close_qty), result)
         + f"\nLimit: `${limit}` (buy to close short)"
+    )
+
+
+def _cmd_open_spread(req: spread_open.SpreadOpenRequest) -> str:
+    """Open a credit spread: sell the short leg, buy the long hedge."""
+    if not _ensure_rh_login():
+        return "Robinhood login failed — check `RH_USERNAME` / `RH_PASSWORD`."
+    import robin_stocks.robinhood as rh
+
+    try:
+        expiration, exp_note = _resolve_expiration(req.symbol, req.exp_token)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    credit = req.credit
+    quote_note = ""
+    if credit is None:
+        short_q = _option_quote_prices(
+            req.symbol, expiration, req.short_strike, req.option_type
+        )
+        long_q = _option_quote_prices(
+            req.symbol, expiration, req.long_strike, req.option_type
+        )
+        credit = spread_open.default_credit(short_q, long_q)
+        if credit is None:
+            return (
+                f"No quotes for {req.symbol} {expiration} "
+                f"{req.short_strike:g}/{req.long_strike:g} "
+                f"{req.option_type} — pass an explicit CREDIT:\n"
+                "`!lia open spread TICKER EXP SHORT/LONG call|put QTY CREDIT`"
+            )
+        quote_note = (
+            f"\nQuotes: short bid `{_fnum(short_q.get('bid'))}` / "
+            f"long ask `{_fnum(long_q.get('ask'))}` → natural credit"
+        )
+    credit = round(float(credit), 2)
+    if credit >= req.width:
+        return (
+            f"❌ Credit `${credit:.2f}` ≥ spread width `${req.width:g}` — "
+            "that can't fill (max value of the spread is its width). "
+            "Check the strikes / credit."
+        )
+
+    legs = [
+        {
+            "expirationDate": expiration,
+            "strike": req.short_strike,
+            "optionType": req.option_type,
+            "effect": "open",
+            "action": "sell",
+        },
+        {
+            "expirationDate": expiration,
+            "strike": req.long_strike,
+            "optionType": req.option_type,
+            "effect": "open",
+            "action": "buy",
+        },
+    ]
+    result = rh.orders.order_option_credit_spread(
+        price=credit,
+        symbol=req.symbol,
+        quantity=req.qty,
+        spread=legs,
+        timeInForce="gtc",
+    )
+
+    s = spread_open.spread_summary(req, credit)
+    label = (
+        f"{req.symbol} {expiration} "
+        f"-{req.short_strike:g}/+{req.long_strike:g} "
+        f"{req.option_type.upper()} ({req.kind})"
+    )
+    return (
+        f"Resolved `{req.exp_token}` → **{exp_note}**\n"
+        + _format_order("open-spread", label, float(req.qty), result)
+        + f"\nCredit: `${credit:.2f}`{quote_note}"
+        + (
+            f"\nWidth `${s['width']:g}` · max gain `${s['max_gain']:,.0f}` · "
+            f"max loss `${s['max_loss']:,.0f}` · breakeven `{s['breakeven']:g}`"
+        )
+        + "\n_Legs show in_ `!lia opt` _after fill — close with_ "
+        "`!lia close spread <id1> <id2> …`"
     )
 
 
@@ -1454,8 +1544,13 @@ async def _handle_message(msg: discord.Message) -> None:
             return
 
         if sub in ("spreads", "spread"):
-            await msg.reply(_cmd_close_status())
-            return
+            # `!lia spread open …` is an alias for `!lia open spread …`;
+            # bare `!lia spread` shows pending/recent closes.
+            if args and args[0].lower() == "open":
+                sub, args = "open", ["spread", *args[1:]]
+            else:
+                await msg.reply(_cmd_close_status())
+                return
 
         if sub == "close":
             if not args or args[0].lower() in (
@@ -1501,6 +1596,35 @@ async def _handle_message(msg: discord.Message) -> None:
                     channel_id=str(msg.channel.id),
                 )
             )
+            return
+
+        if sub == "open":
+            if args and args[0].lower() in ("help", "?"):
+                await msg.reply(spread_open.USAGE)
+                return
+            if not _trader_allowed(msg.author.id):
+                await msg.reply(
+                    f"Not authorized to trade "
+                    f"(Discord user `{msg.author.id}` not in "
+                    f"`LIA_DISCORD_ALLOWLIST`)."
+                )
+                return
+            spread_args = (
+                args[1:] if args and args[0].lower() in ("spread", "spr")
+                else args
+            )
+            try:
+                req = spread_open.parse_open_spread_args(spread_args)
+            except ValueError as e:
+                await msg.reply(str(e))
+                return
+            await msg.reply(
+                f"Submitting **{req.kind} credit spread** "
+                f"`{req.symbol} {req.exp_token} "
+                f"-{req.short_strike:g}/+{req.long_strike:g} "
+                f"{req.option_type}` x `{req.qty}`…"
+            )
+            await msg.reply(_cmd_open_spread(req))
             return
 
         if sub in ("positions", "position", "own", "holdings", "portfolio"):
