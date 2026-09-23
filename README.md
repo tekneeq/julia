@@ -189,6 +189,8 @@ The bot responds to `!lia …` messages (and `!spy watch` for price alerts):
 !lia buy  opt SPY 0dte 755 call 1
 !lia buy  opt SPY 0dte atm call 1
 !lia sell opt <id> [QTY] [LIMIT]   # close by id from !lia opt
+!lia open spread SPY 0dte 776/778 call 1        # bear call credit spread
+!lia open spread SPY 0dte 770/768 put 1 [0.35]  # bull put credit spread
 !lia close spread <id1> <id2> [QTY] at 2pm
 !lia close spread <id1> <id2> [QTY] in 1h
 !lia close spread <id1> <id2> [QTY] if spy >= 650
@@ -208,6 +210,15 @@ The bot responds to `!lia …` messages (and `!spy watch` for price alerts):
 
 `EXP` accepts `YYYY-MM-DD` or `0dte` / `1dte` / … (Nth upcoming listed expiration).
 `STRIKE` accepts a number or `atm` (closest listed strike to spot).
+
+`!lia open spread` opens a **credit spread** as one order: the first
+strike is sold (short leg), the second bought (long hedge). Calls need
+short below long (`776/778` = bear call); puts need short above long
+(`770/768` = bull put). Omit `CREDIT` to price at the natural credit
+(short bid − long ask); pass it explicitly to pin your fill. The reply
+shows width, max gain/loss, and breakeven, and the legs appear in
+`!lia opt` after the fill — from there `!lia close spread` can watch
+them with a time or SPY-price trigger.
 
 `!lia close spread` is **SPY options only**. Pass the two short ids from
 `!lia opt` (long lower-strike put + short higher-strike put for a put
