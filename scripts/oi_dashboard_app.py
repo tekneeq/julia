@@ -2078,7 +2078,6 @@ def _restart_bundle_script(
             "echo 'Clearing RH session pickles…' | tee -a \"$LOG\"",
             "uv run python - <<'PY' | tee -a \"$LOG\"",
             "from pathlib import Path",
-            "from julia.rh_auth import clear_login_cooldown",
             "cleared = []",
             "for d in (Path.home() / '.tokens', Path('.') / '.tokens'):",
             "    if not d.is_dir():",
@@ -2091,12 +2090,20 @@ def _restart_bundle_script(
             "    rh.logout()",
             "except Exception:",
             "    pass",
-            "clear_login_cooldown()",
             "print('cleared:', ', '.join(cleared) if cleared else '(none)')",
             "PY",
         ]
 
     lines += [
+        # THIS is the manual re-enable: the button click clears the
+        # failed-login latch + cooldown so exactly one fresh MFA runs.
+        "echo 'Re-enabling RH auto-login (clearing latch + cooldown)…' | tee -a \"$LOG\"",
+        "uv run python - <<'PY' | tee -a \"$LOG\"",
+        "from julia.rh_auth import clear_login_cooldown, clear_manual_login_required",
+        "clear_login_cooldown()",
+        "clear_manual_login_required()",
+        "print('auto-login re-enabled for this attempt')",
+        "PY",
         "echo 'RH login (approve device push in the Robinhood app within ~2 min)…' | tee -a \"$LOG\"",
         "uv run python - <<'PY' | tee -a \"$LOG\"",
         "import os, sys, traceback",
@@ -2118,7 +2125,7 @@ def _restart_bundle_script(
         "PY",
         "login_rc=$?",
         "if [ \"$login_rc\" -ne 0 ]; then",
-        "  echo \"RH login exited $login_rc — services still restart, but they share a login lock + 3min cooldown so they will not each fire a new MFA poll\" | tee -a \"$LOG\"",
+        "  echo \"RH login exited $login_rc — services still restart, but auto-login is now LATCHED OFF (no new MFA challenges) until you run this again\" | tee -a \"$LOG\"",
         "fi",
         "echo 'Restarting services (staggered)…' | tee -a \"$LOG\"",
     ]
@@ -2181,10 +2188,31 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
         "Restart in-container workers from here (no SSH). "
         "With **Clear RH session** on, login sends a **new device-approval "
         "push** — approve it in the Robinhood app within ~2 minutes, then "
-        "the pollers start. Only **one** process may MFA at a time; after "
-        "a 429 the rest wait ~3 minutes instead of stacking more pushes. "
+        "the pollers start. Only **one** process may MFA at a time, and "
+        "after ANY failed login auto-MFA **latches off** — nothing retries "
+        "until you click **Restart selected + RH login** again. "
         "Don't mash restart if a challenge is already pending."
     )
+
+    try:
+        from julia.rh_auth import manual_login_required, manual_login_since
+
+        _latch_reason = manual_login_required()
+    except Exception:
+        _latch_reason = None
+    if _latch_reason is not None:
+        try:
+            _since = manual_login_since()
+            _since_s = _since.strftime("%b %d %H:%M") if _since else "?"
+        except Exception:
+            _since_s = "?"
+        st.warning(
+            f"**RH auto-login is OFF** (latched {_since_s} after: "
+            f"`{_latch_reason}`). Workers use the saved session if it "
+            "still works but will NOT start new MFA challenges. Click "
+            "**Restart selected + RH login** below to re-enable and run "
+            "one fresh login."
+        )
 
     for key in _SERVICE_SPECS:
         st.text(_service_status_line(key))
