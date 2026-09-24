@@ -12,6 +12,10 @@ This module:
   * lets waiters load the pickle the winner just wrote
   * cools down after 429 / failed MFA so we don't immediately stack
     more prompt-status polls
+  * after ANY failed login, **latches to manual**: no process starts
+    another MFA challenge until a human clears the latch (dashboard
+    sidebar → Restart selected + RH login). Cached sessions keep
+    working; only *new* challenges are blocked.
 """
 from __future__ import annotations
 
@@ -21,11 +25,13 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 TOKEN_DIR = Path.home() / ".tokens"
 LOCK_PATH = TOKEN_DIR / "rh-login.lock"
 COOLDOWN_PATH = TOKEN_DIR / "rh-login.cooldown"
+# Set after a failed login; while present, automatic MFA is disabled.
+MANUAL_PATH = TOKEN_DIR / "rh-login.manual"
 # After a 429 / failed challenge, wait before anyone starts another.
 DEFAULT_COOLDOWN_SEC = 180
 SESSION_EXPIRES_SEC = 86400 * 7
@@ -67,6 +73,36 @@ def clear_login_cooldown() -> None:
         pass
 
 
+def manual_login_required() -> Optional[str]:
+    """Reason string when auto-login is latched off, else None."""
+    try:
+        text = MANUAL_PATH.read_text().strip()
+    except OSError:
+        return None
+    return text or "previous login failed"
+
+
+def manual_login_since() -> Optional[datetime]:
+    """When the manual latch was set (file mtime), else None."""
+    try:
+        return datetime.fromtimestamp(MANUAL_PATH.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def set_manual_login_required(reason: str) -> None:
+    """Disable automatic MFA until a human clears the latch."""
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    MANUAL_PATH.write_text(reason.strip() or "previous login failed")
+
+
+def clear_manual_login_required() -> None:
+    try:
+        MANUAL_PATH.unlink()
+    except OSError:
+        pass
+
+
 def is_logged_in() -> bool:
     """True if *this process* already has a working Authorization header."""
     try:
@@ -93,6 +129,17 @@ def login_robinhood(username: str, password: str) -> bool:
     with login_lock():
         if is_logged_in():
             return True
+
+        reason = manual_login_required()
+        if reason is not None:
+            print(
+                f"[{_now_label()}] RH auto-login is OFF (latched after: "
+                f"{reason}). No new device challenge will be started. "
+                "Re-enable via the dashboard sidebar → 'Restart selected "
+                "+ RH login' (or julia.rh_auth.clear_manual_login_required).",
+                flush=True,
+            )
+            return False
 
         wait = cooldown_remaining()
         if wait > 0:
@@ -124,20 +171,32 @@ def login_robinhood(username: str, password: str) -> bool:
             print(f"[{_now_label()}] RH login error: {exc!r}", flush=True)
             extra = 120 if _looks_like_rate_limit(exc) else 0
             set_login_cooldown(DEFAULT_COOLDOWN_SEC + extra)
+            set_manual_login_required(
+                f"{type(exc).__name__}: {exc}"[:200]
+            )
+            print(
+                f"[{_now_label()}] Auto-login now DISABLED so no more "
+                "challenges stack up. Re-enable from the dashboard: "
+                "Services → Restart selected + RH login.",
+                flush=True,
+            )
             return False
 
         if is_logged_in():
             clear_login_cooldown()
+            clear_manual_login_required()
             print(f"[{_now_label()}] RH login OK", flush=True)
             return True
 
         print(
             f"[{_now_label()}] RH login did not establish a session "
-            f"(robin_stocks returned {data!r}). Cooling down "
-            f"{DEFAULT_COOLDOWN_SEC}s so we don't pile more MFA polls.",
+            f"(robin_stocks returned {data!r}). Auto-login now DISABLED "
+            "so we don't pile more MFA polls — re-enable from the "
+            "dashboard: Services → Restart selected + RH login.",
             flush=True,
         )
         set_login_cooldown()
+        set_manual_login_required("login returned no session (missed MFA?)")
         return False
 
 

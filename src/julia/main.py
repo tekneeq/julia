@@ -56,9 +56,11 @@ def ensure_logged_in(func):
                 raise SystemExit(1) from e
             if not ok:
                 click.echo(
-                    "❌ Login failed or cooling down after a 429 / MFA miss. "
-                    "Approve the app push if one is pending, wait a couple "
-                    "of minutes, and retry — don't restart every worker at once."
+                    "❌ Login failed, cooling down, or auto-login is latched "
+                    "off after an earlier failure. Approve the app push if "
+                    "one is pending. Re-enable via the dashboard sidebar "
+                    "(Services → Restart selected + RH login) — no worker "
+                    "will start a new MFA challenge until then."
                 )
                 raise SystemExit(1)
             click.echo("✅ Successfully logged in to Robinhood")

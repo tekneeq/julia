@@ -149,6 +149,14 @@ restart everything again** — one challenge is already in flight. Approve the
 app push and wait ~3 minutes; extra workers reuse the saved session instead of
 starting more MFA polls.
 
+After **any** failed login (429, missed approval, bad credentials), automatic
+MFA **latches off**: a `~/.tokens/rh-login.manual` flag stops every worker from
+starting new device challenges, no matter how many times they restart. Workers
+keep using the saved session pickle while it's valid. The sidebar shows a
+warning while the latch is on; clicking **Restart selected + RH login** clears
+it and runs exactly one fresh login. (Manually: delete the file, or
+`python -c "from julia.rh_auth import clear_manual_login_required; clear_manual_login_required()"`.)
+
 ### Discord `!lia` bot (optional)
 
 Create a **new** Discord application at https://discord.com/developers/applications
