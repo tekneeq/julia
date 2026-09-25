@@ -1905,6 +1905,440 @@ def _render_gex_env_over_time(ticker: str, exps: list[date]) -> None:
             _render_gex_env_chart(ticker, exp, gex_hist)
 
 
+# Strikes around the session open, plus a few around the live price so a
+# trend out of the open band still shows where volume is printing.
+_FLOW_STRIKES_FROM_OPEN = 10
+_FLOW_STRIKES_AROUND_SPOT = 3
+_FLOW_BUCKET_MIN = 30
+
+
+def _flow_fmt_contracts(n: float) -> str:
+    """Compact contract count (`860`, `1.2k`, `12k`)."""
+    n = abs(float(n))
+    if n >= 1000:
+        v = n / 1000.0
+        return f"{v:.0f}k" if v >= 10 else f"{v:.1f}k"
+    return f"{n:.0f}"
+
+
+def _flow_bucket_floor(ts: datetime, bucket_min: int = _FLOW_BUCKET_MIN) -> datetime:
+    """Floor a timestamp to the start of its volume bucket."""
+    minute = (ts.minute // bucket_min) * bucket_min
+    return ts.replace(minute=minute, second=0, microsecond=0)
+
+
+def _flow_strike_window(
+    strikes: list[float],
+    day_open: float | None,
+    spot: float | None,
+    *,
+    n: int = _FLOW_STRIKES_FROM_OPEN,
+    spot_pad: int = _FLOW_STRIKES_AROUND_SPOT,
+) -> list[float]:
+    """Listed strikes within ``n`` steps of the open, plus ``spot_pad`` around spot."""
+    ordered = sorted({float(k) for k in strikes})
+    if not ordered:
+        return []
+
+    def _idx(px: float) -> int:
+        return min(range(len(ordered)), key=lambda i: abs(ordered[i] - px))
+
+    anchor = day_open if day_open and day_open > 0 else spot
+    if not anchor or anchor <= 0:
+        if len(ordered) <= n * 2 + 1:
+            return ordered
+        mid = len(ordered) // 2
+        return ordered[max(0, mid - n): mid + n + 1]
+
+    i = _idx(float(anchor))
+    keep = set(ordered[max(0, i - n): i + n + 1])
+    if spot and spot > 0:
+        j = _idx(float(spot))
+        keep.update(ordered[max(0, j - spot_pad): j + spot_pad + 1])
+    return sorted(keep)
+
+
+def _flow_volume_deltas(
+    snaps: list[dict],
+    strikes: list[float],
+    bucket_min: int = _FLOW_BUCKET_MIN,
+) -> dict | None:
+    """New call/put volume per strike between successive snapshots.
+
+    ``snaps`` carry cumulative session volume (``call`` / ``put`` dicts
+    keyed by strike). The first bucket's delta is that cumulative print
+    (volume since the open). Later buckets are the increase since the
+    previous bucket. Missing strikes keep the prior cumulative so a gap
+    in one snapshot doesn't look like volume disappeared.
+    """
+    if not snaps or not strikes:
+        return None
+    ordered_snaps = sorted(snaps, key=lambda s: s["ts"])
+    buckets: dict[datetime, dict] = {}
+    for snap in ordered_snaps:
+        key = _flow_bucket_floor(snap["ts"], bucket_min)
+        if key not in buckets or snap["ts"] >= buckets[key]["ts"]:
+            buckets[key] = snap
+    keys = sorted(buckets)
+    strike_list = [float(k) for k in strikes]
+    prev_c = {k: 0 for k in strike_list}
+    prev_p = {k: 0 for k in strike_list}
+    call_cols: list[list[int]] = []
+    put_cols: list[list[int]] = []
+    nets: list[int] = []
+    labels: list[str] = []
+    for key in keys:
+        snap = buckets[key]
+        col_c: list[int] = []
+        col_p: list[int] = []
+        net = 0
+        for k in strike_list:
+            raw_c = snap["call"].get(k)
+            raw_p = snap["put"].get(k)
+            cum_c = prev_c[k] if raw_c is None else int(raw_c)
+            cum_p = prev_p[k] if raw_p is None else int(raw_p)
+            c = max(0, cum_c - prev_c[k])
+            p = max(0, cum_p - prev_p[k])
+            prev_c[k] = cum_c
+            prev_p[k] = cum_p
+            col_c.append(c)
+            col_p.append(p)
+            net += c - p
+        call_cols.append(col_c)
+        put_cols.append(col_p)
+        nets.append(net)
+        labels.append(key.strftime("%H:%M"))
+
+    def _rows(cols: list[list[int]]) -> list[list[int]]:
+        return [
+            [cols[j][i] for j in range(len(cols))]
+            for i in range(len(strike_list))
+        ]
+
+    return {
+        "labels": labels,
+        "strikes": strike_list,
+        "call": _rows(call_cols),
+        "put": _rows(put_cols),
+        "net": nets,
+    }
+
+
+def _flow_cell_text(call_v: int, put_v: int) -> str:
+    """`call/put` compact text. Blank when nothing printed."""
+    if call_v <= 0 and put_v <= 0:
+        return ""
+    return f"{_flow_fmt_contracts(call_v)}/{_flow_fmt_contracts(put_v)}"
+
+
+def _flow_cell_balance(call_v: int, put_v: int) -> float:
+    """Call-vs-put share in [-1, 1]. 0 when the cell printed nothing.
+
+    Color uses this share so a huge opening print doesn't wash out
+    later buckets. Size stays in the cell text and the summary bar.
+    """
+    total = int(call_v) + int(put_v)
+    if total <= 0:
+        return 0.0
+    return (int(call_v) - int(put_v)) / total
+
+
+def _flow_strike_axis_label(strike: float, *, oi_up: bool = False) -> str:
+    """Y-axis label. An arrow marks open interest up vs the prior session."""
+    if abs(float(strike) - round(float(strike))) < 1e-6:
+        label = f"${float(strike):,.0f}"
+    else:
+        label = f"${float(strike):,.2f}"
+    if oi_up:
+        label += " ↑"
+    return label
+
+
+def _flow_oi_increases(prior: dict, latest: dict) -> dict[float, int]:
+    """Strikes whose open interest rose vs a prior session's last print.
+
+    Strikes missing from the prior snapshot are skipped — their whole
+    OI would otherwise look like a one-day increase.
+    """
+    out: dict[float, int] = {}
+    for k, v in latest.items():
+        if k not in prior:
+            continue
+        delta = int(v) - int(prior[k])
+        if delta > 0:
+            out[float(k)] = delta
+    return out
+
+
+def _flow_side_maps(rows) -> tuple[dict[float, int], dict[float, int], dict[float, int], dict[float, int]]:
+    """Split strike rows into call/put volume and open interest."""
+    call: dict[float, int] = {}
+    put: dict[float, int] = {}
+    call_oi: dict[float, int] = {}
+    put_oi: dict[float, int] = {}
+    for row in rows:
+        try:
+            k = float(row["strike_price"])
+            vol = int(row["volume"] or 0)
+            oi = int(row["open_interest"] or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        typ = str(row["option_type"] or "").lower()
+        if typ == "call":
+            call[k] = call.get(k, 0) + vol
+            call_oi[k] = call_oi.get(k, 0) + oi
+        elif typ == "put":
+            put[k] = put.get(k, 0) + vol
+            put_oi[k] = put_oi.get(k, 0) + oi
+    return call, put, call_oi, put_oi
+
+
+def _flow_load_today(ticker: str, today: date) -> dict | None:
+    """Today's day-expiry volume snapshots plus prior-session OI.
+
+    Uses the same expiration pick as the GEX ladder (0DTE, else the
+    nearest upcoming expiry). Volume is cumulative session volume, so
+    the renderer differences it.
+    """
+    snap = _pick_day_gex_snapshot(ticker, today, allow_upcoming_fallback=True)
+    if snap is None:
+        return None
+    expiration = str(snap["expiration_date"])
+    rows = gex_store.recent_snapshots(
+        ticker=ticker, expiration_date=expiration, limit=500,
+    )
+    snaps: list[dict] = []
+    prior = None
+    for r in rows:
+        captured = _parse_utc(r["captured_at"])
+        local = captured.astimezone()
+        if local.date() > today:
+            continue
+        if local.date() < today:
+            if prior is None or r["captured_at"] > prior["captured_at"]:
+                prior = r
+            continue
+        call, put, call_oi, put_oi = _flow_side_maps(gex_store.get_strikes(r["id"]))
+        if not call and not put:
+            continue
+        snaps.append({
+            "ts": local.replace(tzinfo=None),
+            "call": call,
+            "put": put,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+        })
+    if not snaps:
+        return None
+    prior_call_oi: dict[float, int] = {}
+    prior_put_oi: dict[float, int] = {}
+    if prior is not None:
+        _, _, prior_call_oi, prior_put_oi = _flow_side_maps(
+            gex_store.get_strikes(prior["id"])
+        )
+    latest = max(snaps, key=lambda s: s["ts"])
+    return {
+        "expiration": expiration,
+        "snaps": snaps,
+        "call_oi_up": _flow_oi_increases(prior_call_oi, latest["call_oi"]),
+        "put_oi_up": _flow_oi_increases(prior_put_oi, latest["put_oi"]),
+    }
+
+
+def _render_option_flow(ticker: str, today: date, status: dict) -> None:
+    """Strike × time heatmap of new call/put volume for today's expiry."""
+    st.markdown("##### Option volume by strike")
+    st.caption(
+        "New contracts printed in each window — **not** buys vs sells "
+        "(the chain only reports total volume). The first bucket is "
+        "everything traded since the open; later buckets are the increase "
+        "since the previous save. Cell text is **call / put**. Green means "
+        "that window was call-heavy, red means put-heavy. Strikes are the "
+        "10 above and below the day's open, plus a few around the live "
+        "price. Buckets are "
+        f"{_FLOW_BUCKET_MIN} minutes, which is how often the chain is saved."
+    )
+    loaded = _flow_load_today(ticker, today)
+    if loaded is None:
+        st.caption(
+            "No option-chain snapshots for today yet — the grid fills in "
+            "after the next OI batch."
+        )
+        return
+
+    ref = status.get("today_ref")
+    open_pct = status.get("today_open_pct")
+    day_open = None
+    if ref and open_pct is not None:
+        day_open = float(ref) * (1.0 + float(open_pct) / 100.0)
+    path = daily_moves_store.get_session_path(ticker, today)
+    spot = float(path[-1]["spot"]) if path else None
+
+    all_strikes = sorted({
+        k
+        for snap in loaded["snaps"]
+        for k in list(snap["call"]) + list(snap["put"])
+    })
+    window = _flow_strike_window(all_strikes, day_open, spot)
+    grid = _flow_volume_deltas(loaded["snaps"], window)
+    if grid is None:
+        st.caption("Not enough strike volume in today's snapshots yet.")
+        return
+
+    strikes = grid["strikes"]
+    labels = grid["labels"]
+    call = grid["call"]
+    put = grid["put"]
+    nets = grid["net"]
+    text = [
+        [_flow_cell_text(call[i][j], put[i][j]) for j in range(len(labels))]
+        for i in range(len(strikes))
+    ]
+    # Share, not raw size: color says which side dominated the window.
+    z = [
+        [_flow_cell_balance(call[i][j], put[i][j]) for j in range(len(labels))]
+        for i in range(len(strikes))
+    ]
+    # Integer rows keep every strike the same height even when the live
+    # price has walked away from the open band.
+    y_pos = list(range(len(strikes)))
+    y_labels = [
+        _flow_strike_axis_label(
+            k,
+            oi_up=bool(
+                loaded["call_oi_up"].get(k) or loaded["put_oi_up"].get(k)
+            ),
+        )
+        for k in strikes
+    ]
+    custom = [
+        [[strikes[i], call[i][j] - put[i][j]] for j in range(len(labels))]
+        for i in range(len(strikes))
+    ]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.18, 0.82], vertical_spacing=0.04,
+    )
+    fig.add_trace(go.Bar(
+        x=labels, y=nets,
+        marker_color=[_TV_UP if n >= 0 else _TV_DOWN for n in nets],
+        name="call − put",
+        hovertemplate=(
+            "%{x}<br>call − put <b>%{y:+,.0f}</b> contracts<extra></extra>"
+        ),
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Heatmap(
+        x=labels, y=y_pos, z=z,
+        text=text,
+        customdata=custom,
+        texttemplate="%{text}",
+        textfont=dict(size=10, color="#f5f5f5"),
+        colorscale=[
+            [0.0, _TV_DOWN],
+            [0.5, "#1e222d"],
+            [1.0, _TV_UP],
+        ],
+        zmin=-1, zmax=1,
+        xgap=3, ygap=3,
+        showscale=False,
+        hovertemplate=(
+            "%{x} · $%{customdata[0]:,.2f}<br>"
+            "call − put <b>%{customdata[1]:+,.0f}</b><br>"
+            "call/put %{text}<extra></extra>"
+        ),
+        showlegend=False,
+    ), row=2, col=1)
+
+    def _near(px: float | None) -> float | None:
+        if px is None or px <= 0 or not strikes:
+            return None
+        return min(strikes, key=lambda k: abs(k - px))
+
+    def _y_of(strike: float | None) -> float | None:
+        if strike is None or strike not in strikes:
+            return None
+        return float(strikes.index(strike))
+
+    open_y = _y_of(_near(day_open))
+    spot_y = _y_of(_near(spot))
+    if open_y is not None:
+        fig.add_hline(
+            y=open_y, line_dash="dot", line_color="#fdd835", line_width=1,
+            annotation_text=f"open {day_open:,.2f}" if day_open else "open",
+            annotation_position="right",
+            annotation_font=dict(size=10, color="#131722"),
+            annotation_bgcolor="#fdd835",
+            row=2, col=1,
+        )
+    if spot_y is not None and spot_y != open_y:
+        fig.add_hline(
+            y=spot_y, line_dash="dot", line_color="#d1d4dc", line_width=1,
+            annotation_text=f"last {spot:,.2f}" if spot else "last",
+            annotation_position="left",
+            annotation_font=dict(size=10, color="#131722"),
+            annotation_bgcolor="#d1d4dc",
+            row=2, col=1,
+        )
+
+    exp = loaded["expiration"]
+    fig.update_layout(**_tv_layout(
+        title=f"{ticker} {exp} — new volume by strike",
+        height=max(420, 26 * len(strikes) + 160),
+        margin=dict(t=48, l=72, r=88, b=40),
+    ))
+    fig.update_yaxes(
+        title=dict(text="call − put", font=dict(size=11)),
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=y_pos,
+        ticktext=y_labels,
+        title=dict(text="strike", font=dict(size=11)),
+        row=2, col=1,
+    )
+    _show_plotly(fig, key=f"opt-flow-{ticker}-{today.isoformat()}")
+
+    last_i = len(labels) - 1
+    ranked = sorted(
+        (
+            (strikes[i], call[i][last_i], put[i][last_i])
+            for i in range(len(strikes))
+        ),
+        key=lambda t: -(t[1] + t[2]),
+    )
+    busy = [t for t in ranked if t[1] + t[2] > 0][:2]
+    if busy:
+        bits = [
+            f"**${k:,.0f}** call {_flow_fmt_contracts(c)} / "
+            f"put {_flow_fmt_contracts(p)}"
+            for k, c, p in busy
+        ]
+        st.caption(
+            f"Busiest in the {labels[last_i]} bucket: " + " · ".join(bits)
+        )
+
+    oi_bits = []
+    for k in strikes:
+        c_up = loaded["call_oi_up"].get(k, 0)
+        p_up = loaded["put_oi_up"].get(k, 0)
+        parts = []
+        if c_up:
+            parts.append(f"call +{_flow_fmt_contracts(c_up)}")
+        if p_up:
+            parts.append(f"put +{_flow_fmt_contracts(p_up)}")
+        if parts:
+            oi_bits.append(f"${k:,.0f} {' '.join(parts)}")
+    if oi_bits:
+        st.caption(
+            "↑ on the strike means open interest rose vs the prior "
+            "session (new positions, not just intraday churn): "
+            + " · ".join(oi_bits[:6])
+        )
+
+
 # ---------------------------------------------------------------------------
 # Background batch runner
 # ---------------------------------------------------------------------------
@@ -7427,6 +7861,7 @@ def _render_today_and_twins(ticker: str, exps: list[date]) -> None:
 
     status = _sync_daily_move_library(ticker, today.isoformat())
     _render_today_price_chart(ticker, today, status)
+    _render_option_flow(ticker, today, status)
     _render_gex_env_over_time(ticker, exps)
     _render_hod_lod_distribution(ticker, today)
     _render_hod_lod_gex_distribution(ticker, today)
