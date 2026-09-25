@@ -345,3 +345,5 @@ When using `--show-gex`, additional analysis is provided:
 - Risk-free rate defaults to 2% but can be adjusted
 - Options without valid pricing or implied volatility are filtered out
 - GEX analysis helps predict market volatility and dealer flow patterns
+
+<!-- dummy: no-op PR to exercise commit, pull request, and merge. Safe to delete. -->
