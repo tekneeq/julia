@@ -116,7 +116,9 @@ since the last print. `%` and price watches fire once when hit.
 # Short-id → enriched option position, refreshed by ``!lia opt``.
 _OPT_POS_BY_ID: dict[str, dict[str, Any]] = {}
 
-# Discord hard limit is 2000; leave room for reply chrome.
+# Discord rejects message content over 2000 characters (error 50035).
+_DISCORD_MAX_LEN = 2000
+# Truncation budget for portfolio dumps that would otherwise flood chat.
 _DISCORD_SAFE_LEN = 1800
 
 
@@ -160,6 +162,92 @@ def _clip(text: str) -> str:
     if len(text) <= _DISCORD_SAFE_LEN:
         return text
     return text[: _DISCORD_SAFE_LEN - 20] + "\n… _(truncated)_"
+
+
+def _discord_chunks(text: str, limit: int = _DISCORD_MAX_LEN) -> list[str]:
+    """Split ``text`` into pieces Discord will accept.
+
+    Breaks on newlines. A code fence left open at a break is closed on
+    that piece and reopened on the next, so each message still renders.
+    """
+    raw = "" if text is None else str(text)
+    if len(raw) <= limit:
+        return [raw]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    fence_open = False
+
+    def _flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        body = "\n".join(current)
+        if fence_open:
+            body += "\n```"
+        chunks.append(body)
+        if fence_open:
+            current = ["```"]
+            current_len = 3
+        else:
+            current = []
+            current_len = 0
+
+    for line in raw.split("\n"):
+        is_fence = bool(line.strip().startswith("```")) and len(line) <= limit
+        parts = (
+            [line[i : i + limit] for i in range(0, len(line), limit)]
+            if len(line) > limit
+            else [line]
+        )
+        for pi, part in enumerate(parts):
+            part_is_fence = is_fence and pi == 0
+            while True:
+                fence_after = (not fence_open) if part_is_fence else fence_open
+                added = len(part) if not current else len(part) + 1
+                tail = 4 if fence_after else 0
+                if not current or current_len + added + tail <= limit:
+                    break
+                if current == ["```"] and fence_open:
+                    # Nothing to flush but the reopened fence. Slice the line.
+                    budget = limit - current_len - 1 - tail
+                    if budget < 1:
+                        budget = 1
+                    head, part = part[:budget], part[budget:]
+                    current.append(head)
+                    current_len += 1 + len(head)
+                    _flush()
+                    if not part:
+                        part = None
+                        break
+                    continue
+                _flush()
+            if part is None:
+                continue
+            if current:
+                current_len += 1
+            current_len += len(part)
+            current.append(part)
+            if part_is_fence:
+                fence_open = not fence_open
+
+    if current:
+        body = "\n".join(current)
+        if fence_open:
+            body += "\n```"
+        chunks.append(body)
+    return chunks or [""]
+
+
+async def _reply(msg: discord.Message, text: str) -> None:
+    """Reply, then send follow-ups, each within Discord's length limit."""
+    chunks = _discord_chunks(text)
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await msg.reply(chunk)
+        else:
+            await msg.channel.send(chunk)
 
 
 def _today_et() -> date:
@@ -1485,12 +1573,12 @@ async def _handle_spy_message(msg: discord.Message, content: str) -> None:
     if rest and rest[0].lower() in ("watch", "watches"):
         rest = rest[1:]
     elif rest:
-        await msg.reply(
+        await _reply(msg, 
             "SPY watches: `!spy watch` · `!spy watch 1m` · "
             "`!spy watch close <id>`"
         )
         return
-    await msg.reply(
+    await _reply(msg, 
         _handle_watch_args(
             rest,
             created_by=str(msg.author.id),
@@ -1508,7 +1596,7 @@ async def _handle_message(msg: discord.Message) -> None:
             await _handle_spy_message(msg, content)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            await msg.reply(f"Error: `{type(e).__name__}: {e}`")
+            await _reply(msg, f"Error: `{type(e).__name__}: {e}`")
         return
     if not lower.startswith("!lia"):
         # Ignore every other message (including old !price / !help).
@@ -1520,11 +1608,11 @@ async def _handle_message(msg: discord.Message) -> None:
 
     try:
         if sub in ("help", "commands", "?"):
-            await msg.reply(HELP_TEXT)
+            await _reply(msg, HELP_TEXT)
             return
 
         if sub in ("watch", "watches"):
-            await msg.reply(
+            await _reply(msg, 
                 _handle_watch_args(
                     args,
                     created_by=str(msg.author.id),
@@ -1534,13 +1622,13 @@ async def _handle_message(msg: discord.Message) -> None:
             return
 
         if sub in ("today", "buys"):
-            await msg.reply(_cmd_today())
+            await _reply(msg, _cmd_today())
             return
 
         if sub in ("opt", "opts", "options"):
             # `!lia opt` / `!lia options` → list option positions.
             # `!lia opt positions` also accepted.
-            await msg.reply(_cmd_opt_positions())
+            await _reply(msg, _cmd_opt_positions())
             return
 
         if sub in ("spreads", "spread"):
@@ -1549,7 +1637,7 @@ async def _handle_message(msg: discord.Message) -> None:
             if args and args[0].lower() == "open":
                 sub, args = "open", ["spread", *args[1:]]
             else:
-                await msg.reply(_cmd_close_status())
+                await _reply(msg, _cmd_close_status())
                 return
 
         if sub == "close":
@@ -1559,10 +1647,10 @@ async def _handle_message(msg: discord.Message) -> None:
                 "list",
                 "pending",
             ):
-                await msg.reply(_cmd_close_status())
+                await _reply(msg, _cmd_close_status())
                 return
             if args[0].lower() in ("help", "?"):
-                await msg.reply(
+                await _reply(msg, 
                     "Close both SPY spread legs (buy the short, sell the long).\n"
                     "`!lia close spread <id1> <id2> [QTY] at 2pm`\n"
                     "`!lia close spread <id1> <id2> [QTY] in 1h`\n"
@@ -1574,7 +1662,7 @@ async def _handle_message(msg: discord.Message) -> None:
                 )
                 return
             if not _trader_allowed(msg.author.id):
-                await msg.reply(
+                await _reply(msg, 
                     f"Not authorized to trade "
                     f"(Discord user `{msg.author.id}` not in "
                     f"`LIA_DISCORD_ALLOWLIST`)."
@@ -1582,14 +1670,14 @@ async def _handle_message(msg: discord.Message) -> None:
                 return
             if args[0].lower() in ("cancel", "stop", "rm", "delete"):
                 if len(args) < 2:
-                    await msg.reply(
+                    await _reply(msg, 
                         "Usage: `!lia close cancel <job>` — ids from `!lia close status`."
                     )
                     return
-                await msg.reply(_cmd_close_cancel(args[1]))
+                await _reply(msg, _cmd_close_cancel(args[1]))
                 return
             spread_args = args[1:] if args[0].lower() in ("spread", "spr") else args
-            await msg.reply(
+            await _reply(msg, 
                 _schedule_spread_close(
                     spread_args,
                     created_by=str(msg.author.id),
@@ -1600,10 +1688,10 @@ async def _handle_message(msg: discord.Message) -> None:
 
         if sub == "open":
             if args and args[0].lower() in ("help", "?"):
-                await msg.reply(spread_open.USAGE)
+                await _reply(msg, spread_open.USAGE)
                 return
             if not _trader_allowed(msg.author.id):
-                await msg.reply(
+                await _reply(msg, 
                     f"Not authorized to trade "
                     f"(Discord user `{msg.author.id}` not in "
                     f"`LIA_DISCORD_ALLOWLIST`)."
@@ -1616,28 +1704,28 @@ async def _handle_message(msg: discord.Message) -> None:
             try:
                 req = spread_open.parse_open_spread_args(spread_args)
             except ValueError as e:
-                await msg.reply(str(e))
+                await _reply(msg, str(e))
                 return
-            await msg.reply(
+            await _reply(msg, 
                 f"Submitting **{req.kind} credit spread** "
                 f"`{req.symbol} {req.exp_token} "
                 f"-{req.short_strike:g}/+{req.long_strike:g} "
                 f"{req.option_type}` x `{req.qty}`…"
             )
-            await msg.reply(_cmd_open_spread(req))
+            await _reply(msg, _cmd_open_spread(req))
             return
 
         if sub in ("positions", "position", "own", "holdings", "portfolio"):
             # `!lia positions opt` → option positions; else stocks.
             if args and args[0].lower() in ("opt", "opts", "options", "option"):
-                await msg.reply(_cmd_opt_positions())
+                await _reply(msg, _cmd_opt_positions())
             else:
-                await msg.reply(_cmd_positions())
+                await _reply(msg, _cmd_positions())
             return
 
         if sub in ("buy", "sell"):
             if not _trader_allowed(msg.author.id):
-                await msg.reply(
+                await _reply(msg, 
                     f"Not authorized to trade "
                     f"(Discord user `{msg.author.id}` not in "
                     f"`LIA_DISCORD_ALLOWLIST`)."
@@ -1658,13 +1746,13 @@ async def _handle_message(msg: discord.Message) -> None:
                             limit,
                         ) = _parse_opt_buy_args(opt_args)
                     except ValueError as e:
-                        await msg.reply(str(e))
+                        await _reply(msg, str(e))
                         return
-                    await msg.reply(
+                    await _reply(msg, 
                         f"Submitting **buy-opt** `{symbol} {exp_token} "
                         f"{strike_token} {otype}` x `{qty}`…"
                     )
-                    await msg.reply(
+                    await _reply(msg, 
                         _resolve_opt_buy(
                             symbol, exp_token, strike_token, otype, qty, limit
                         )[0]
@@ -1674,19 +1762,19 @@ async def _handle_message(msg: discord.Message) -> None:
                 try:
                     short_id, qty, limit = _parse_opt_sell_args(opt_args)
                 except ValueError as e:
-                    await msg.reply(str(e))
+                    await _reply(msg, str(e))
                     return
-                await msg.reply(
+                await _reply(msg, 
                     f"Submitting **sell-opt** `{short_id}`"
                     + (f" x `{qty}`" if qty is not None else " (all)")
                     + "…"
                 )
-                await msg.reply(_cmd_sell_opt(short_id, qty, limit))
+                await _reply(msg, _cmd_sell_opt(short_id, qty, limit))
                 return
 
             # Stock branch.
             if len(args) != 2:
-                await msg.reply(
+                await _reply(msg, 
                     f"Usage: `!lia {sub} TICKER QTY` "
                     f"or `!lia {sub} opt …` (see `!lia help`)"
                 )
@@ -1695,24 +1783,24 @@ async def _handle_message(msg: discord.Message) -> None:
             try:
                 qty = _parse_qty(args[1])
             except ValueError as e:
-                await msg.reply(f"Bad quantity: {e}")
+                await _reply(msg, f"Bad quantity: {e}")
                 return
             if not symbol.isalnum():
-                await msg.reply(f"Bad ticker `{symbol}`.")
+                await _reply(msg, f"Bad ticker `{symbol}`.")
                 return
-            await msg.reply(f"Submitting **{sub}** `{symbol}` x `{qty}`…")
+            await _reply(msg, f"Submitting **{sub}** `{symbol}` x `{qty}`…")
             if sub == "buy":
-                await msg.reply(_cmd_buy(symbol, qty))
+                await _reply(msg, _cmd_buy(symbol, qty))
             else:
-                await msg.reply(_cmd_sell(symbol, qty))
+                await _reply(msg, _cmd_sell(symbol, qty))
             return
 
-        await msg.reply(
+        await _reply(msg, 
             f"Unknown `!lia` command `{sub}`. Try `!lia help`."
         )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
-        await msg.reply(f"Error: `{type(e).__name__}: {e}`")
+        await _reply(msg, f"Error: `{type(e).__name__}: {e}`")
 
 
 def build_client() -> discord.Client:
