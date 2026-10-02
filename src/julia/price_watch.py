@@ -4,6 +4,7 @@
     !lia watch SPY 1%      print when today's % change hits +1%
     !lia watch SPY -1%     print when today's % change hits −1%
     !lia watch SPY 759     print when last hits 759
+    !lia watch SPY fractal print when a 5m local top or bottom confirms
     !lia watch             list watches
     !lia watch close <id>
     !spy watch             same list (SPY shorthand also accepts a trigger)
@@ -28,6 +29,12 @@ DEFAULT_DB_PATH = os.path.join(".options_cache", "price_watch.db")
 KIND_INTERVAL = "interval"
 KIND_PCT = "pct"
 KIND_PRICE = "price"
+KIND_FRACTAL = "fractal"
+
+# Bill Williams fractal: the middle candle must beat this many bars
+# on each side. Two filters 5-minute noise; one flags almost every zigzag.
+FRACTAL_WING = 2
+FRACTAL_BAR_SECONDS = 300
 
 STATUS_PENDING = "pending"
 STATUS_FIRED = "fired"
@@ -173,6 +180,26 @@ def parse_watch_spec(text: str) -> WatchSpec:
             pct_level=level,
         )
 
+    fractal = re.fullmatch(
+        r"(?:(?P<mins>\d+)\s*(?:m|min|mins|minute|minutes)\s+)?"
+        r"fractals?"
+        r"|fractals?(?:\s+(?P<mins2>\d+)\s*(?:m|min|mins|minute|minutes))?",
+        raw,
+    )
+    if fractal:
+        mins_raw = fractal.group("mins") or fractal.group("mins2")
+        mins = int(mins_raw) if mins_raw else 5
+        if mins != 5:
+            raise ValueError(
+                "Fractal watches use 5-minute candles. "
+                "Try `!lia watch SPY fractal`."
+            )
+        return WatchSpec(
+            KIND_FRACTAL,
+            "5m fractal top/bottom (2 candles each side)",
+            interval_seconds=FRACTAL_BAR_SECONDS,
+        )
+
     price = re.fullmatch(r"(\d+(?:\.\d+)?)", raw)
     if price:
         level = float(price.group(1))
@@ -191,7 +218,7 @@ def parse_watch_args(args: list[str]) -> WatchRequest:
     """Parse ``TICKER 1m|1%|-1%|759``."""
     if len(args) < 2:
         raise ValueError(
-            "Usage: `!lia watch TICKER 1m|1%|-1%|759`\n"
+            "Usage: `!lia watch TICKER 1m|1%|-1%|759|fractal`\n"
             "List: `!lia watch` / `!spy watch` · "
             "Stop: `!lia watch close <id>` / `!spy watch close <id>`"
         )
@@ -207,7 +234,9 @@ def _watch_usage() -> str:
         "Watch trigger must be one of:\n"
         "  `1m` / `5m` / `1h`     print every interval\n"
         "  `1%` / `-1%`           print when today's % hits that level\n"
-        "  `759`                  print when last hits that price"
+        "  `759`                  print when last hits that price\n"
+        "  `fractal`              5m local top / bottom "
+        "(2 candles each side)"
     )
 
 
@@ -245,6 +274,132 @@ def pct_condition_met(level: Optional[float], daily_pct: Optional[float]) -> boo
     if level >= 0:
         return daily_pct >= level
     return daily_pct <= level
+
+
+def _as_et(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=ET)
+    return dt.astimezone(ET)
+
+
+def _candle_ts(candle: dict[str, Any]) -> datetime:
+    ts = candle.get("ts")
+    if not isinstance(ts, datetime):
+        raise TypeError("candle ts must be a datetime")
+    return _as_et(ts)
+
+
+def confirmed_fractals(
+    candles: list[dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    wing: int = FRACTAL_WING,
+    bar_seconds: int = FRACTAL_BAR_SECONDS,
+) -> list[dict[str, Any]]:
+    """5-minute local tops and bottoms that have already confirmed.
+
+    A **top** is a candle whose high is strictly above the highs of the
+    ``wing`` candles before it and the ``wing`` candles after it. A
+    **bottom** is the same test on the low. The candle still forming is
+    ignored, so a fractal prints only after the later candles have closed
+    (10 minutes later when ``wing`` is 2).
+    """
+    now = _as_et(now or _now_et())
+    complete: list[dict[str, Any]] = []
+    for candle in candles or []:
+        try:
+            ts = _candle_ts(candle)
+            high = float(candle["high"])
+            low = float(candle["low"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts + timedelta(seconds=bar_seconds) > now:
+            continue
+        complete.append({"ts": ts, "high": high, "low": low})
+    complete.sort(key=lambda c: c["ts"])
+    # One row per bar start; a later print of the same bar wins.
+    deduped: dict[datetime, dict[str, Any]] = {}
+    for candle in complete:
+        deduped[candle["ts"]] = candle
+    complete = [deduped[k] for k in sorted(deduped)]
+
+    found: list[dict[str, Any]] = []
+    if wing < 1 or len(complete) < wing * 2 + 1:
+        return found
+    for i in range(wing, len(complete) - wing):
+        mid = complete[i]
+        neighbors = complete[i - wing : i] + complete[i + 1 : i + 1 + wing]
+        confirmed_at = complete[i + wing]["ts"] + timedelta(seconds=bar_seconds)
+        if all(mid["high"] > n["high"] for n in neighbors):
+            found.append({
+                "kind": "top",
+                "ts": mid["ts"],
+                "price": mid["high"],
+                "confirmed_at": confirmed_at,
+            })
+        if all(mid["low"] < n["low"] for n in neighbors):
+            found.append({
+                "kind": "bottom",
+                "ts": mid["ts"],
+                "price": mid["low"],
+                "confirmed_at": confirmed_at,
+            })
+    return found
+
+
+def fractals_since(
+    candles: list[dict[str, Any]],
+    since: Optional[datetime],
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Fractals whose confirmation is strictly after ``since``."""
+    found = confirmed_fractals(candles, now=now)
+    if since is not None:
+        watermark = _as_et(since)
+        found = [f for f in found if f["confirmed_at"] > watermark]
+    if limit > 0 and len(found) > limit:
+        found = found[-limit:]
+    return found
+
+
+def latest_fractal_each_side(
+    candles: list[dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """Most recent confirmed top and most recent confirmed bottom."""
+    found = confirmed_fractals(candles, now=now)
+    latest: dict[str, dict[str, Any]] = {}
+    for fractal in found:
+        latest[fractal["kind"]] = fractal
+    ordered = []
+    for kind in ("top", "bottom"):
+        if kind in latest:
+            ordered.append(latest[kind])
+    return ordered
+
+
+def format_fractal_line(fractal: dict[str, Any]) -> str:
+    kind = fractal.get("kind") or "?"
+    price = fractal.get("price")
+    ts = fractal.get("ts")
+    when = ts.astimezone(ET).strftime("%H:%M") if isinstance(ts, datetime) else "?"
+    side = "high" if kind == "top" else "low"
+    px = f"${float(price):,.2f}" if price is not None else "—"
+    return f"**{kind}** · {side} `{px}` at {when}"
+
+
+def format_latest_fractals(
+    candles: list[dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> str:
+    latest = latest_fractal_each_side(candles, now=now)
+    if not latest:
+        return ""
+    return "Latest confirmed: " + " · ".join(format_fractal_line(f) for f in latest)
 
 
 def interval_due(job: dict[str, Any], now: datetime) -> bool:
@@ -405,6 +560,7 @@ def claim_due_watches(
     quotes: dict[str, dict[str, Any]],
     now: Optional[datetime] = None,
     *,
+    candles: Optional[dict[str, list[dict[str, Any]]]] = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Claim pending watches that should print. Interval stays pending."""
@@ -415,11 +571,40 @@ def claim_due_watches(
         now = now.astimezone(ET)
     claimed: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for job in list_pending(db_path=db_path):
-        quote = quotes.get(str(job.get("symbol") or "").upper())
+        symbol = str(job.get("symbol") or "").upper()
+        kind = job.get("kind")
+        if kind == KIND_FRACTAL:
+            series = (candles or {}).get(symbol) or []
+            fresh = fractals_since(
+                series,
+                _parse_iso(job.get("last_printed_at")),
+                now=now,
+            )
+            if not fresh:
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            price = quote.get("price")
+            if price is None:
+                price = fresh[-1]["price"]
+            quote["symbol"] = symbol
+            quote["fractals"] = fresh
+            quote["prev_print_price"] = job.get("last_price")
+            updated = mark_printed(
+                int(job["id"]),
+                price=float(price),
+                now=now,
+                expected_last_printed_at=job.get("last_printed_at"),
+                status=None,
+                db_path=db_path,
+            )
+            if updated:
+                claimed.append((updated, quote))
+            continue
+
+        quote = quotes.get(symbol)
         if not quote or quote.get("price") is None:
             continue
         last = float(quote["price"])
-        kind = job.get("kind")
         new_status: Optional[str] = None
         due = False
         if kind == KIND_INTERVAL:
@@ -490,6 +675,24 @@ def format_quote_message(job: dict[str, Any], quote: dict[str, Any]) -> str:
     trig = job.get("trigger_text") or "?"
     status = job.get("status") or "?"
 
+    if kind == KIND_FRACTAL:
+        events = quote.get("fractals") or []
+        lines = [
+            f"**{symbol}** 5m fractal {format_fractal_line(f)}"
+            for f in events
+        ]
+        if not lines:
+            lines = [f"**{symbol}** 5m fractal"]
+        lines.append(
+            "Two candles on each side confirmed it "
+            "(about 10 min after that bar)."
+        )
+        lines.append(
+            f"Day `{_signed_money(daily_chg)}` (`{_signed_pct(daily_pct)}`)"
+        )
+        lines.append(f"`#{jid}` `{status}` {trig}")
+        return "\n".join(lines)
+
     if kind == KIND_PCT:
         headline = f"**{symbol}** hit `{_signed_pct(job.get('pct_level'))}` on the day"
     elif kind == KIND_PRICE:
@@ -526,7 +729,8 @@ def format_watch_status(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return (
             "No price watches. Start one with `!lia watch SPY 1m`, "
-            "`!lia watch SPY 1%`, or `!lia watch SPY 759`.\n"
+            "`!lia watch SPY fractal`, `!lia watch SPY 1%`, "
+            "or `!lia watch SPY 759`.\n"
             "List: `!spy watch` · stop: `!spy watch close <id>`"
         )
     lines = [f"**Price watches** · {len(jobs)}"]
