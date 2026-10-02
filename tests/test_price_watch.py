@@ -79,6 +79,20 @@ class ParseSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pw.parse_watch_spec("soon")
 
+    def test_fractal_spec(self) -> None:
+        spec = pw.parse_watch_spec("fractal")
+        self.assertEqual(spec.kind, pw.KIND_FRACTAL)
+        self.assertEqual(spec.interval_seconds, 300)
+        self.assertEqual(pw.parse_watch_spec("5m fractal").kind, pw.KIND_FRACTAL)
+        self.assertEqual(pw.parse_watch_spec("fractal 5m").kind, pw.KIND_FRACTAL)
+        req = pw.parse_watch_args(["spy", "fractal"])
+        self.assertEqual(req.symbol, "SPY")
+        self.assertEqual(req.spec.kind, pw.KIND_FRACTAL)
+
+    def test_fractal_other_timeframe_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            pw.parse_watch_spec("1m fractal")
+
 
 class StoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -162,6 +176,112 @@ class StoreTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_fractal_watch_prints_once(self) -> None:
+        start = _et(2026, 10, 2, 9, 30)
+        bars = _bars(start, [
+            (5, 1), (6, 1), (7, 1), (10, 1), (8, 1), (7, 1), (6, 1),
+        ])
+        now = start + timedelta(minutes=35)
+        spec = pw.parse_watch_spec("fractal")
+        pw.insert_watch(
+            symbol="SPY",
+            spec=spec,
+            last_price=9.0,
+            last_printed_at=start,
+            db_path=self.db,
+        )
+        due = pw.claim_due_watches(
+            {"SPY": self._quote(9.5)},
+            now,
+            candles={"SPY": bars},
+            db_path=self.db,
+        )
+        self.assertEqual(len(due), 1)
+        job, quote = due[0]
+        self.assertEqual(job["status"], pw.STATUS_PENDING)
+        self.assertEqual(job["print_count"], 1)
+        msg = pw.format_quote_message(job, quote)
+        self.assertIn("fractal **top**", msg)
+        self.assertIn("$10.00", msg)
+        self.assertIn("09:45", msg)
+        again = pw.claim_due_watches(
+            {"SPY": self._quote(9.5)},
+            now + timedelta(seconds=20),
+            candles={"SPY": bars},
+            db_path=self.db,
+        )
+        self.assertEqual(again, [])
+
+
+def _bars(start: datetime, pairs: list[tuple[float, float]]) -> list[dict]:
+    return [
+        {
+            "ts": start + timedelta(minutes=5 * i),
+            "high": high,
+            "low": low,
+        }
+        for i, (high, low) in enumerate(pairs)
+    ]
+
+
+class FractalTests(unittest.TestCase):
+    def test_two_candle_top_and_not_one_candle_noise(self) -> None:
+        start = _et(2026, 10, 2, 9, 30)
+        # Index 3 is a real top: high 10 beats two candles each side.
+        bars = _bars(start, [
+            (5, 1), (6, 1), (7, 1), (10, 1), (8, 1), (7, 1), (6, 1),
+        ])
+        # All seven bars are closed.
+        now = start + timedelta(minutes=35)
+        found = pw.confirmed_fractals(bars, now=now)
+        tops = [f for f in found if f["kind"] == "top"]
+        self.assertEqual(len(tops), 1)
+        self.assertEqual(tops[0]["price"], 10)
+        self.assertEqual(tops[0]["ts"], start + timedelta(minutes=15))
+        # Confirmed when the second candle after it closes (10:00 bar
+        # starts 9:55, closes 10:00).
+        self.assertEqual(tops[0]["confirmed_at"], start + timedelta(minutes=30))
+
+        # 5 is above the candles next to it, but the candle two back is
+        # higher, so a two-candle fractal does not count it.
+        noise = _bars(start, [
+            (6, 1), (3, 1), (5, 1), (4, 1), (4, 1), (4, 1), (4, 1),
+        ])
+        self.assertEqual(pw.confirmed_fractals(noise, now=now), [])
+
+    def test_bottom_and_outside_bar(self) -> None:
+        start = _et(2026, 10, 2, 9, 30)
+        now = start + timedelta(minutes=35)
+        bars = _bars(start, [
+            (9, 5), (9, 4), (9, 3), (10, 1), (9, 3), (9, 4), (9, 5),
+        ])
+        found = pw.confirmed_fractals(bars, now=now)
+        kinds = {(f["kind"], f["price"]) for f in found}
+        self.assertIn(("top", 10), kinds)
+        self.assertIn(("bottom", 1), kinds)
+
+    def test_forming_bar_does_not_confirm(self) -> None:
+        start = _et(2026, 10, 2, 9, 30)
+        bars = _bars(start, [
+            (5, 1), (6, 1), (7, 1), (10, 1), (8, 1), (7, 1), (6, 1),
+        ])
+        # The confirming candle (the second one after the top) is still open.
+        too_soon = start + timedelta(minutes=30) - timedelta(seconds=1)
+        self.assertEqual(pw.confirmed_fractals(bars, now=too_soon), [])
+        closed = pw.confirmed_fractals(bars, now=start + timedelta(minutes=30))
+        self.assertEqual([f["kind"] for f in closed], ["top"])
+
+    def test_watermark_skips_already_confirmed(self) -> None:
+        start = _et(2026, 10, 2, 9, 30)
+        bars = _bars(start, [
+            (5, 1), (6, 1), (7, 1), (10, 1), (8, 1), (7, 1), (6, 1),
+        ])
+        now = start + timedelta(minutes=35)
+        confirm = start + timedelta(minutes=30)
+        self.assertEqual(pw.fractals_since(bars, confirm, now=now), [])
+        fresh = pw.fractals_since(bars, confirm - timedelta(seconds=1), now=now)
+        self.assertEqual(len(fresh), 1)
 
 
 if __name__ == "__main__":

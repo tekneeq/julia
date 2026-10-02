@@ -72,6 +72,7 @@ HELP_TEXT = """**Julia · `!lia` commands**
 !lia close status                      pending / recent spread closes
 !lia close cancel <job>                stop a pending spread close
 !lia watch TICKER 1m|1%|-1%|759        price prints / alerts
+!lia watch TICKER fractal              5m local top / bottom
 !lia watch                             list price watches
 !lia watch close <id>                  stop a price watch
 ```
@@ -95,6 +96,8 @@ Examples:
 `!lia watch SPY 1%`
 `!lia watch SPY -1%`
 `!lia watch SPY 759`
+`!lia watch SPY fractal`
+`!spy watch fractal`
 `!spy watch`
 `!spy watch close 3`
 
@@ -111,6 +114,9 @@ delay (`in 1h` / `in 30m`), SPY print (`if spy >= 650` / `when spy hits
 650`), or `now`.
 `watch` prints last + daily $/% change. Interval (`1m`) also shows change
 since the last print. `%` and price watches fire once when hit.
+`fractal` watches 5-minute candles. A top is a candle whose high is above
+the two candles before it and the two after it; a bottom is the same test
+on the low. It prints once those next two candles have closed.
 """
 
 # Short-id → enriched option position, refreshed by ``!lia opt``.
@@ -1012,6 +1018,45 @@ def _stock_quote(symbol: str) -> Optional[dict[str, Any]]:
     }
 
 
+def _five_minute_candles(symbol: str) -> list[dict[str, Any]]:
+    """Today's regular-session 5-minute bars, oldest first.
+
+    ``ts`` is the bar open in ET. The bar still forming is left in the
+    list; fractal detection drops it until it has closed.
+    """
+    if not _ensure_rh_login():
+        return []
+    try:
+        import robin_stocks.robinhood as rh
+
+        raw = rh.stocks.get_stock_historicals(
+            symbol,
+            interval="5minute",
+            span="day",
+            bounds="regular",
+        ) or []
+    except Exception:  # noqa: BLE001
+        return []
+    candles: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        begins = row.get("begins_at") or ""
+        try:
+            ts = datetime.fromisoformat(
+                begins.replace("Z", "+00:00")
+            ).astimezone(ET)
+            candles.append({
+                "ts": ts,
+                "high": float(row["high_price"]),
+                "low": float(row["low_price"]),
+            })
+        except (TypeError, ValueError, KeyError):
+            continue
+    candles.sort(key=lambda c: c["ts"])
+    return candles
+
+
 def _cmd_watch_status() -> str:
     jobs = price_watch.list_watches(
         statuses=(price_watch.STATUS_PENDING,),
@@ -1080,6 +1125,11 @@ def _schedule_price_watch(
         fire_now = True  # first print immediately, then every interval
 
     now = datetime.now(ET)
+    fractal_latest = ""
+    if spec.kind == price_watch.KIND_FRACTAL:
+        fractal_latest = price_watch.format_latest_fractals(
+            _five_minute_candles(req.symbol), now=now,
+        )
     if fire_now and spec.kind != price_watch.KIND_INTERVAL:
         job = price_watch.insert_watch(
             symbol=req.symbol,
@@ -1098,16 +1148,36 @@ def _schedule_price_watch(
             )
         )
 
+    # Fractal watches stamp last_printed_at as a watermark so today's
+    # already-confirmed swings are not replayed. New ones confirm later.
+    stamp_now = spec.kind in (
+        price_watch.KIND_INTERVAL,
+        price_watch.KIND_FRACTAL,
+    )
     job = price_watch.insert_watch(
         symbol=req.symbol,
         spec=spec,
         created_by=created_by,
         channel_id=channel_id,
-        last_price=float(quote["price"]) if spec.kind == price_watch.KIND_INTERVAL else None,
-        last_printed_at=now if spec.kind == price_watch.KIND_INTERVAL else None,
+        last_price=float(quote["price"]) if stamp_now else None,
+        last_printed_at=now if stamp_now else None,
         print_count=1 if spec.kind == price_watch.KIND_INTERVAL else 0,
         status=price_watch.STATUS_PENDING,
     )
+    if spec.kind == price_watch.KIND_FRACTAL:
+        latest = f"\n{fractal_latest}" if fractal_latest else ""
+        return (
+            f"Watching `#{job['id']}` **{req.symbol}** 5m fractals. "
+            f"`!spy watch close {job['id']}` to stop.\n"
+            "A **top** is a 5-minute candle whose high is above the two "
+            "candles on each side. A **bottom** is the same test on the low. "
+            "It prints once those next two candles have closed "
+            "(about 10 minutes after the extreme)."
+            f"{latest}\n"
+            f"Now `{req.symbol}` `${float(quote['price']):,.2f}` · "
+            f"day `{price_watch.signed_money(quote.get('daily_chg'))}` "
+            f"(`{price_watch.signed_pct(quote.get('daily_pct'))}`)"
+        )
     if spec.kind == price_watch.KIND_INTERVAL:
         return (
             f"Watching `#{job['id']}` **{req.symbol}** {spec.text}. "
@@ -1131,6 +1201,9 @@ _WATCH_HELP = (
     "(also % since last print)\n"
     "`!lia watch SPY 1%` / `!lia watch SPY -1%` — print when today's % hits\n"
     "`!lia watch SPY 759` — print when last hits 759\n"
+    "`!lia watch SPY fractal` — 5m local top / bottom. A top's high "
+    "(or a bottom's low) beats the two candles on each side. It prints "
+    "once those next two candles have closed.\n"
     "`!lia watch` or `!spy watch` — list with ids\n"
     "`!lia watch close <id>` or `!spy watch close <id>` — stop"
 )
@@ -1355,7 +1428,21 @@ async def _tick_price_watches(client: discord.Client) -> None:
         quote = await asyncio.to_thread(_stock_quote, symbol)
         if quote:
             quotes[symbol] = quote
-    due = await asyncio.to_thread(price_watch.claim_due_watches, quotes, None)
+    fractal_symbols = sorted(
+        {
+            str(j.get("symbol") or "").upper()
+            for j in pending
+            if j.get("kind") == price_watch.KIND_FRACTAL and j.get("symbol")
+        }
+    )
+    candles: dict[str, list[dict[str, Any]]] = {}
+    for symbol in fractal_symbols:
+        bars = await asyncio.to_thread(_five_minute_candles, symbol)
+        if bars:
+            candles[symbol] = bars
+    due = await asyncio.to_thread(
+        price_watch.claim_due_watches, quotes, None, candles=candles,
+    )
     for job, quote in due:
         await _notify_channel(
             client,
