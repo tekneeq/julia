@@ -863,6 +863,129 @@ def _implied_vs_actual_history(
     return out
 
 
+# How far back to look for the last ≥1σ / ≥2σ / ≥3σ close. The chart
+# window tops out at 40 sessions, and a 3σ day can easily be rarer
+# than that, so this lookup scans deeper than what is drawn.
+_SIGMA_LAST_HIT_SESSIONS = 250
+
+
+def _last_sigma_hits(
+    history: list[dict],
+    today: date,
+    *,
+    levels: tuple[float, ...] | None = None,
+) -> dict[float, dict | None]:
+    """Most recent session whose close landed at or beyond each σ band.
+
+    ``history`` is oldest → newest from ``_implied_vs_actual_history``.
+    "Hit" means ``|actual_pct| >= implied[conf]`` — the close, not an
+    intraday wick, to match the "Days within ±σ" hit-rate metrics.
+    Today counts when its live close-so-far is already beyond the band.
+
+    Returns ``{conf: {"day", "actual_pct", "implied_pct", "sessions_ago",
+    "calendar_days", "is_live", "scanned"} or None}``. ``scanned`` is how
+    many sessions had both an implied band and a close to score.
+    """
+    confs = tuple(levels) if levels else tuple(c for c, _, _ in IMPLIED_MOVE_LEVELS)
+    scored = [
+        h for h in history
+        if h.get("actual_pct") is not None and h.get("implied")
+        and h["day"] <= today
+    ]
+    out: dict[float, dict | None] = {}
+    for conf in confs:
+        hit = None
+        for h in reversed(scored):
+            band = h["implied"].get(conf)
+            if band is None or band <= 0:
+                continue
+            if abs(float(h["actual_pct"])) >= float(band):
+                hit = h
+                break
+        if hit is None:
+            out[conf] = None
+            continue
+        day = hit["day"]
+        out[conf] = {
+            "day": day,
+            "actual_pct": float(hit["actual_pct"]),
+            "implied_pct": float(hit["implied"][conf]),
+            "sessions_ago": _business_days_between(day, today),
+            "calendar_days": (today - day).days,
+            "is_live": day == today,
+            "scanned": len(scored),
+        }
+    return out
+
+
+def _fmt_sessions_ago(hit: dict) -> str:
+    if hit["is_live"]:
+        return "today (live)"
+    n = int(hit["sessions_ago"])
+    cal = int(hit["calendar_days"])
+    if n == 0:
+        # Weekend view: the hit is the latest completed session.
+        return f"last session ({cal}d)"
+    if n == 1:
+        return f"1 session ago ({cal}d)"
+    return f"{n} sessions ago ({cal}d)"
+
+
+def _render_sigma_last_hits(ticker: str, end_day: date, today: date) -> None:
+    """Row of metrics: last time the close beat ±1σ / ±2σ / ±3σ."""
+    deep = _implied_vs_actual_history(
+        ticker, _SIGMA_LAST_HIT_SESSIONS, end_day.isoformat(),
+    )
+    hits = _last_sigma_hits(deep, today)
+    scanned = max(
+        (h["scanned"] for h in hits.values() if h), default=0,
+    ) or sum(
+        1 for h in deep
+        if h.get("actual_pct") is not None and h.get("implied")
+    )
+    cols = st.columns(3)
+    for col, (conf, label, _color) in zip(cols, reversed(IMPLIED_MOVE_LEVELS)):
+        sigma_n = label.split("(")[-1].rstrip(")")
+        hit = hits.get(conf)
+        with col:
+            if hit is None:
+                st.metric(
+                    f"Last ≥{sigma_n} close",
+                    "none yet",
+                    f"in the last {scanned} scored session"
+                    f"{'s' if scanned != 1 else ''}",
+                    delta_color="off",
+                    help=(
+                        f"No session's close has landed at or beyond its "
+                        f"{sigma_n} implied band in the history we have. "
+                        "Only sessions with both a prior-day implied band "
+                        "and a close are scored."
+                    ),
+                )
+                continue
+            st.metric(
+                f"Last ≥{sigma_n} close",
+                hit["day"].strftime("%a %b %d"),
+                f"{_fmt_sessions_ago(hit)} · {hit['actual_pct']:+.2f}% "
+                f"vs ±{hit['implied_pct']:.2f}%",
+                delta_color="off",
+                help=(
+                    f"Most recent session whose close was at or beyond the "
+                    f"{sigma_n} band priced before that open. "
+                    f"{hit['day'].strftime('%b %d')}: moved "
+                    f"{hit['actual_pct']:+.2f}% against a ±"
+                    f"{hit['implied_pct']:.2f}% {sigma_n} band. "
+                    "Sessions = trading days since; the number in "
+                    "parentheses is calendar days. Close only — an "
+                    "intraday wick through the band does not count."
+                    + (
+                        " Today is live, so this can still change by the close."
+                        if hit["is_live"] else ""
+                    )
+                ),
+            )
+
+
 def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
     if not any(
         h["implied"] is not None or h["actual_pct"] is not None for h in history
@@ -1084,6 +1207,13 @@ def _render_implied_vs_actual_chart(ticker: str, history: list[dict]) -> None:
             )
         else:
             st.metric("Biggest move", "n/a")
+
+    if history:
+        st.caption(
+            "**Last time the close beat each band** — looks back up to "
+            f"{_SIGMA_LAST_HIT_SESSIONS} sessions, past the window drawn above."
+        )
+        _render_sigma_last_hits(ticker, history[-1]["day"], today)
 
 
 # ---------------------------------------------------------------------------
