@@ -35,6 +35,9 @@ MANUAL_PATH = TOKEN_DIR / "rh-login.manual"
 # After a 429 / failed challenge, wait before anyone starts another.
 DEFAULT_COOLDOWN_SEC = 180
 SESSION_EXPIRES_SEC = 86400 * 7
+# robin_stocks issues GETs with no timeout, so one dead socket can park
+# a poller forever with nothing in the log. Every request gets this cap.
+REQUEST_TIMEOUT_SEC = 15.0
 
 
 def _now_label() -> str:
@@ -103,13 +106,47 @@ def clear_manual_login_required() -> None:
         pass
 
 
+def install_request_timeout(seconds: float = REQUEST_TIMEOUT_SEC) -> bool:
+    """Give every robin_stocks HTTP call a default timeout.
+
+    Wraps the library's shared ``requests.Session.request`` so calls
+    that pass no ``timeout`` get ``seconds``; explicit timeouts (its
+    POSTs use 16s) are left alone. Idempotent. Returns False when
+    robin_stocks is not importable.
+    """
+    try:
+        from robin_stocks.robinhood import helper
+    except Exception:  # noqa: BLE001
+        return False
+    session = getattr(helper, "SESSION", None)
+    if session is None:
+        return False
+    if getattr(session, "_julia_timeout_sec", None) == seconds:
+        return True
+    original = getattr(session, "_julia_request_original", None) or session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", seconds)
+        return original(method, url, **kwargs)
+
+    session._julia_request_original = original
+    session.request = request_with_timeout
+    session._julia_timeout_sec = seconds
+    return True
+
+
 def is_logged_in() -> bool:
-    """True if *this process* already has a working Authorization header."""
+    """True if *this process* already has a working Authorization header.
+
+    robin_stocks swallows HTTP errors and returns ``None`` instead of
+    raising, so an expired token must be detected from an empty
+    profile, not from an exception.
+    """
     try:
         import robin_stocks.robinhood as rh
 
-        rh.profiles.load_account_profile()
-        return True
+        profile = rh.profiles.load_account_profile()
+        return isinstance(profile, dict) and bool(profile)
     except Exception:
         return False
 
@@ -202,6 +239,7 @@ def login_robinhood(username: str, password: str) -> bool:
 
 def ensure_robinhood_login() -> bool:
     """Best-effort login from ``RH_USERNAME`` / ``RH_PASSWORD``."""
+    install_request_timeout()
     if is_logged_in():
         return True
     username = os.getenv("RH_USERNAME")
