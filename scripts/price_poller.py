@@ -18,8 +18,11 @@ Runs forever in the foreground. Ctrl-C to stop. Handles:
     next open otherwise)
   * interval alignment (fires at :00 / :15 / :30 / :45 of each minute
     for interval=15, so tick spacing stays even)
-  * Robinhood login (cached ~/.tokens or RH_USERNAME / RH_PASSWORD),
+    * Robinhood login (cached ~/.tokens or RH_USERNAME / RH_PASSWORD),
     with re-login and backoff on transient failures
+  * a per-request timeout, so a dead socket is a logged failure rather
+    than a silent hang; and a session re-check after a run of empty
+    quotes (robin_stocks hides an expired token's 401 as ``[None]``)
   * clean shutdown on SIGINT / SIGTERM, pid-file management
 
 Examples
@@ -164,6 +167,18 @@ def _stop_running(pid_file: Path, timeout: float = 15.0) -> bool:
 
 _login_ok = False
 
+# robin_stocks swallows HTTP errors (an expired token's 401 included)
+# and hands back ``[None]``. After this many empty quotes in a row the
+# session is re-verified instead of trusting ``_login_ok`` all day.
+EMPTY_QUOTE_RELOGIN_AFTER = 3
+_empty_quotes = 0
+
+# Failure kinds from ``_fetch_last_price``.
+FAIL_RATE_LIMIT = "rate_limit"
+FAIL_NETWORK = "network"
+FAIL_EMPTY = "empty"
+FAIL_ERROR = "error"
+
 
 def _ensure_login() -> bool:
     """Best-effort login, reusing the CLI's cached token or env creds."""
@@ -180,27 +195,71 @@ def _ensure_login() -> bool:
     return False
 
 
-def _fetch_last_price(ticker: str) -> float | None:
-    """Latest regular-session print, or None on any failure."""
-    global _login_ok
+def _classify_fetch_error(exc: BaseException) -> str:
+    """Rate limit, network trouble, or anything else."""
+    msg = f"{exc!r} {exc}"
+    if "429" in msg or "Too Many Requests" in msg:
+        return FAIL_RATE_LIMIT
+    try:
+        import requests
+
+        if isinstance(exc, (requests.exceptions.Timeout,
+                            requests.exceptions.ConnectionError)):
+            return FAIL_NETWORK
+    except Exception:  # noqa: BLE001
+        pass
+    name = type(exc).__name__
+    if name in ("Timeout", "ReadTimeout", "ConnectTimeout",
+                "ConnectionError", "TimeoutError", "SSLError"):
+        return FAIL_NETWORK
+    return FAIL_ERROR
+
+
+def _note_empty_quote(ticker: str) -> None:
+    """Count an empty quote; after a streak, force a session re-check."""
+    global _empty_quotes, _login_ok
+    _empty_quotes += 1
+    if _empty_quotes >= EMPTY_QUOTE_RELOGIN_AFTER and _login_ok:
+        _login_ok = False
+        print(
+            f"[{datetime.now():%H:%M:%S}] {ticker}: {_empty_quotes} empty "
+            "quotes in a row (robin_stocks hides HTTP errors — likely an "
+            "expired token). Re-checking the Robinhood session."
+        )
+
+
+def _fetch_last_price(ticker: str) -> tuple[float | None, str | None]:
+    """Latest regular-session print as ``(price, None)``.
+
+    On failure returns ``(None, kind)``. Network kinds leave the login
+    state alone (a blip must not start an MFA challenge); other errors
+    drop ``_login_ok`` so the next poll re-verifies the session.
+    """
+    global _login_ok, _empty_quotes
     try:
         import robin_stocks.robinhood as rh
         vals = rh.stocks.get_latest_price(
             ticker, priceType=None, includeExtendedHours=False
         )
         if vals and vals[0]:
-            return float(vals[0])
+            _empty_quotes = 0
+            return float(vals[0]), None
+        _note_empty_quote(ticker)
+        return None, FAIL_EMPTY
     except Exception as e:  # noqa: BLE001
-        msg = f"{e!r}"
-        if "429" in msg or "Too Many Requests" in msg:
+        kind = _classify_fetch_error(e)
+        stamp = f"[{datetime.now():%H:%M:%S}] {ticker}"
+        if kind == FAIL_RATE_LIMIT:
             # Rate-limited on quotes — do not invalidate the session or
             # we immediately start another MFA challenge.
-            print(f"[{datetime.now():%H:%M:%S}] {ticker}: 429, backing off")
-            return None
-        # Expired token usually surfaces as a generic request error.
-        _login_ok = False
-        print(f"[{datetime.now():%H:%M:%S}] {ticker}: fetch failed: {e!r}")
-    return None
+            print(f"{stamp}: 429, backing off")
+        elif kind == FAIL_NETWORK:
+            print(f"{stamp}: network error, will retry: {e!r}")
+        else:
+            # Expired token usually surfaces as a generic request error.
+            _login_ok = False
+            print(f"{stamp}: fetch failed: {e!r}")
+        return None, kind
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +360,7 @@ def _poll_once(tickers: list[str]) -> int:
         return 0
     recorded = 0
     for ticker in tickers:
-        price = _fetch_last_price(ticker)
+        price, _why = _fetch_last_price(ticker)
         if price is None or price <= 0:
             continue
         ts = datetime.now(timezone.utc)
@@ -392,6 +451,16 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     _write_pid(pid_file)
+
+    # Cap every Robinhood request so a dead socket surfaces as a logged
+    # failure (and a backoff) instead of parking the loop forever.
+    try:
+        from julia.rh_auth import REQUEST_TIMEOUT_SEC, install_request_timeout
+
+        if install_request_timeout():
+            print(f"request timeout: {REQUEST_TIMEOUT_SEC:.0f}s per call")
+    except Exception as e:  # noqa: BLE001
+        print(f"could not install request timeout: {e!r}")
 
     print(
         f"[{datetime.now():%Y-%m-%d %H:%M:%S}] price poller starting  "
