@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -201,6 +203,131 @@ class PollerFailureTests(unittest.TestCase):
         _price, why = self.pp._fetch_last_price("SPY")
         self.assertEqual(why, self.pp.FAIL_ERROR)
         self.assertFalse(self.pp._login_ok)
+
+
+PROMPT_URL = "https://api.robinhood.com/push/abc/get_prompts_status/"
+
+
+class PromptDeadlineTests(unittest.TestCase):
+    """A missed app-push must not spin inside the login lock."""
+
+    def setUp(self) -> None:
+        self.rh = _install_fake_robin_stocks(profile=None)
+        self.auth = types.ModuleType("robin_stocks.robinhood.authentication")
+        self.gets: list[str] = []
+        self._bodies: list[dict] = []
+
+        def request_get(*args, **kwargs):
+            url = args[0] if args else kwargs.get("url", "")
+            self.gets.append(str(url))
+            if self._bodies:
+                return self._bodies.pop(0)
+            return {"challenge_status": "issued"}
+
+        def original_input(prompt=""):
+            return "typed"
+
+        self.auth.request_get = request_get
+        self.auth.input = original_input
+        self.rh.authentication = self.auth
+        sys.modules["robin_stocks.robinhood.authentication"] = self.auth
+
+        def rh_login(**kwargs):
+            # Same shape as robin_stocks 3.4.0 ``_validate_sherrif_id``:
+            # poll until validated, with no deadline of its own.
+            # login() catches that error and returns None.
+            try:
+                for _ in range(30):
+                    body = self.auth.request_get(url=PROMPT_URL)
+                    if (
+                        isinstance(body, dict)
+                        and body.get("challenge_status") == "validated"
+                    ):
+                        return {"access_token": "tok"}
+                return {"access_token": "gave-up-uncapped"}
+            except Exception:
+                return None
+
+        self.rh.login = rh_login
+        self.ra = _load("rh_auth_t", _RA_SRC)
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self._tmp.name)
+        self.ra.TOKEN_DIR = tmp
+        self.ra.LOCK_PATH = tmp / "rh-login.lock"
+        self.ra.COOLDOWN_PATH = tmp / "rh-login.cooldown"
+        self.ra.MANUAL_PATH = tmp / "rh-login.manual"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        for k in list(sys.modules):
+            if k.startswith("robin_stocks") or k == "rh_auth_t":
+                sys.modules.pop(k, None)
+
+    def test_uncapped_prompt_loop_stops_and_latches(self) -> None:
+        self.assertTrue(self.ra.install_prompt_deadline(0))
+        started = time.monotonic()
+        self.assertFalse(self.ra.login_robinhood("user", "pass"))
+        self.assertLess(time.monotonic() - started, 2.0)
+        reason = self.ra.manual_login_required() or ""
+        self.assertIn("app-push approval not confirmed", reason)
+        # First poll is allowed; the second hits the deadline.
+        self.assertEqual(self.gets, [PROMPT_URL, PROMPT_URL])
+
+    def test_validated_prompt_is_not_cut_off(self) -> None:
+        self._bodies = [
+            {"challenge_status": "issued"},
+            {"challenge_status": "validated"},
+        ]
+        self.ra.install_prompt_deadline(0)
+        self.assertEqual(
+            self.auth.request_get(url=PROMPT_URL)["challenge_status"], "issued"
+        )
+        self.assertEqual(
+            self.auth.request_get(url=PROMPT_URL)["challenge_status"],
+            "validated",
+        )
+
+    def test_terminal_prompt_fails_immediately(self) -> None:
+        self._bodies = [{"challenge_status": "expired"}]
+        self.ra.install_prompt_deadline(90)
+        with self.assertRaises(TimeoutError):
+            self.auth.request_get(url=PROMPT_URL)
+        self.assertEqual(len(self.gets), 1)
+        self.assertIn("expired", self.ra.take_prompt_failure() or "")
+
+    def test_other_gets_are_not_capped(self) -> None:
+        self.ra.install_prompt_deadline(0)
+        quote = "https://api.robinhood.com/quotes/SPY/"
+        self.auth.request_get(quote)
+        self.auth.request_get(quote)
+        self.assertEqual(self.gets, [quote, quote])
+
+    def test_stdin_code_does_not_block(self) -> None:
+        self.ra.install_prompt_deadline(90)
+        with self.assertRaises(TimeoutError):
+            self.auth.input(
+                "Enter the sms verification code sent to your device: "
+            )
+        self.assertEqual(self.auth.input("Robinhood username: "), "typed")
+        self.assertIn("stdin", self.ra.take_prompt_failure() or "")
+
+    def test_reinstall_without_seconds_keeps_the_cap(self) -> None:
+        self.ra.install_prompt_deadline(0)
+        self.assertTrue(self.ra.install_prompt_deadline())
+        self.assertEqual(self.auth._julia_prompt_wait_sec, 0)
+        self.auth.request_get(url=PROMPT_URL)
+        with self.assertRaises(TimeoutError):
+            self.auth.request_get(url=PROMPT_URL)
+
+    def test_missing_library_is_false(self) -> None:
+        for k in list(sys.modules):
+            if k.startswith("robin_stocks"):
+                sys.modules.pop(k)
+        sys.modules["robin_stocks"] = None  # type: ignore[assignment]
+        try:
+            self.assertFalse(self.ra.install_prompt_deadline())
+        finally:
+            sys.modules.pop("robin_stocks", None)
 
 
 if __name__ == "__main__":
