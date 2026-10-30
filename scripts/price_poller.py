@@ -21,8 +21,10 @@ Runs forever in the foreground. Ctrl-C to stop. Handles:
     * Robinhood login (cached ~/.tokens or RH_USERNAME / RH_PASSWORD),
     with re-login and backoff on transient failures
   * a per-request timeout, so a dead socket is a logged failure rather
-    than a silent hang; and a session re-check after a run of empty
-    quotes (robin_stocks hides an expired token's 401 as ``[None]``)
+    than a silent hang; a session re-check after a run of empty
+    quotes (robin_stocks hides an expired token's 401 as ``[None]``);
+    and a cap on the Robinhood app-push poll so a missed approval
+    latches auto-login off instead of freezing this process
   * clean shutdown on SIGINT / SIGTERM, pid-file management
 
 Examples
@@ -455,10 +457,20 @@ def main() -> int:
     # Cap every Robinhood request so a dead socket surfaces as a logged
     # failure (and a backoff) instead of parking the loop forever.
     try:
-        from julia.rh_auth import REQUEST_TIMEOUT_SEC, install_request_timeout
+        from julia.rh_auth import (
+            PROMPT_WAIT_SEC,
+            REQUEST_TIMEOUT_SEC,
+            install_prompt_deadline,
+            install_request_timeout,
+        )
 
         if install_request_timeout():
             print(f"request timeout: {REQUEST_TIMEOUT_SEC:.0f}s per call")
+        if install_prompt_deadline():
+            print(
+                f"app-push wait: {PROMPT_WAIT_SEC:.0f}s, then auto-login "
+                "latches off"
+            )
     except Exception as e:  # noqa: BLE001
         print(f"could not install request timeout: {e!r}")
 
