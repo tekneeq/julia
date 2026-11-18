@@ -221,6 +221,24 @@ class PollerFailureTests(unittest.TestCase):
             [82, 267],
         )
 
+    def test_ppid_parser(self) -> None:
+        text = "Name:\tuv\nPPid:\t80\n"
+        self.assertEqual(self.pp._ppid_from_status(text), 80)
+        self.assertIsNone(self.pp._ppid_from_status("Name:\tuv\n"))
+
+    def test_stop_skips_the_process_that_launched_us(self) -> None:
+        # sh -c and uv run both mention price_poller.py because they
+        # launched it. --replace must not signal those parents.
+        launcher = "sh -c uv run python scripts/price_poller.py --replace"
+        other = "uv run python scripts/price_poller.py --replace"
+        ancestors = {10, 80}
+        self.assertFalse(
+            self.pp._is_other_daemon(80, launcher, me=10, ancestors=ancestors)
+        )
+        self.assertTrue(
+            self.pp._is_other_daemon(87, other, me=10, ancestors=ancestors)
+        )
+
     def test_stop_does_not_signal_the_recorded_pid_twice(self) -> None:
         self.pp._running_pid = lambda _path: 267
         self.pp._daemon_poller_pids = lambda: [267, 82]
