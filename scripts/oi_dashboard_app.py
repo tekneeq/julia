@@ -2538,7 +2538,7 @@ def _restart_bundle_script(
         "clear_manual_login_required()",
         "print('auto-login re-enabled for this attempt')",
         "PY",
-        "echo 'RH login (approve device push in the Robinhood app within ~2 min)…' | tee -a \"$LOG\"",
+        "echo 'RH login (approve device push in the Robinhood app within 90s)…' | tee -a \"$LOG\"",
         "uv run python - <<'PY' | tee -a \"$LOG\"",
         "import os, sys, traceback",
         "from datetime import datetime",
@@ -2621,7 +2621,7 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
     st.caption(
         "Restart in-container workers from here (no SSH). "
         "With **Clear RH session** on, login sends a **new device-approval "
-        "push** — approve it in the Robinhood app within ~2 minutes, then "
+        "push** — approve it in the Robinhood app within 90 seconds, then "
         "the pollers start. Only **one** process may MFA at a time, and "
         "after ANY failed login auto-MFA **latches off** — nothing retries "
         "until you click **Restart selected + RH login** again. "
@@ -2699,7 +2699,7 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
             st.session_state["_svc_restart_notes"] = [
                 (
                     "RH login started first — **approve the Robinhood app "
-                    "push now** (≈2 min window)."
+                    "push now** (90s window)."
                     if force_mfa
                     else "RH login / session check started, then services restart."
                 ),
