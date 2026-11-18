@@ -111,6 +111,39 @@ def _is_our_process(pid: int) -> bool:
     return _PID_MARKER in _pid_cmdline(pid)
 
 
+def _ppid_from_status(text: str) -> int | None:
+    for line in text.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _ancestor_pids() -> set[int]:
+    """This process and the parents that launched it.
+
+    ``./restart-price-poller.sh`` starts ``sh -c 'uv run python
+    price_poller.py --replace'``. Those parent command lines also
+    contain the script name. Signaling them during ``--replace`` kills
+    the poller that just started.
+    """
+    found = {os.getpid()}
+    pid = os.getpid()
+    for _ in range(32):
+        try:
+            text = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            break
+        ppid = _ppid_from_status(text)
+        if ppid is None or ppid <= 1 or ppid in found:
+            break
+        found.add(ppid)
+        pid = ppid
+    return found
+
+
 def _cmdline_is_daemon_poller(cmd: str, *, pid: int, me: int) -> bool:
     """A long-running poller, not this process or a one-shot status/once/stop."""
     if pid == me or _PID_MARKER not in cmd:
@@ -120,24 +153,34 @@ def _cmdline_is_daemon_poller(cmd: str, *, pid: int, me: int) -> bool:
     return True
 
 
+def _is_other_daemon(pid: int, cmd: str, *, me: int, ancestors: set[int]) -> bool:
+    if pid in ancestors:
+        return False
+    return _cmdline_is_daemon_poller(cmd, pid=pid, me=me)
+
+
 def _daemon_poller_pids() -> list[int]:
     """Every live price-poller daemon, including one whose pid file is gone.
 
     ``./restart-price-poller.sh`` used to delete the pid file and then
     start a new process with ``--replace``. ``--replace`` only signals
     the pid in that file, so the previous poller kept running and both
-    wrote to the same log.
+    wrote to the same log. Parents of this process are skipped: their
+    command lines mention the script because they launched it.
     """
     proc = Path("/proc")
     if not proc.is_dir():
         return []
     me = os.getpid()
+    ancestors = _ancestor_pids()
     found: list[int] = []
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
-        if _cmdline_is_daemon_poller(_pid_cmdline(pid), pid=pid, me=me) and _pid_alive(pid):
+        if _is_other_daemon(
+            pid, _pid_cmdline(pid), me=me, ancestors=ancestors
+        ) and _pid_alive(pid):
             found.append(pid)
     return found
 
