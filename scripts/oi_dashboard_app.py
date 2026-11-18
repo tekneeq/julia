@@ -2505,7 +2505,30 @@ def _restart_bundle_script(
         "export UV_NATIVE_TLS=\"${UV_NATIVE_TLS:-true}\"",
         f"LOG={shlex.quote(str(bundle_log))}",
         "echo \"── dashboard restart $(date '+%Y-%m-%d %H:%M:%S') ──\" | tee -a \"$LOG\"",
+        # Stop before clearing the latch. A leftover price poller (pid file
+        # already deleted) would otherwise notice the latch is gone and
+        # start its own device challenge while this script is logging in.
+        "echo 'Stopping selected services…' | tee -a \"$LOG\"",
     ]
+
+    for key in service_keys:
+        spec = _SERVICE_SPECS[key]
+        if spec["needs_discord_token"]:
+            lines.append(
+                'if [ -z "${DISCORD_BOT_TOKEN:-}" ]; then '
+                f'echo "⏭ skip stopping {spec["label"]} (no DISCORD_BOT_TOKEN)" | tee -a "$LOG"; '
+                "else"
+            )
+        script = REPO_ROOT / spec["script"]
+        stop_argv = ["uv", "run", "python", str(script), "--stop"]
+        if spec.get("uses_tickers"):
+            stop_argv += ["--tickers", ticker_csv]
+        lines += [
+            f"echo '■ stopping {spec['label']}' | tee -a \"$LOG\"",
+            " ".join(shlex.quote(a) for a in stop_argv) + " | tee -a \"$LOG\" || true",
+        ]
+        if spec["needs_discord_token"]:
+            lines.append("fi")
 
     if force_mfa:
         lines += [
@@ -2574,7 +2597,6 @@ def _restart_bundle_script(
             )
         script = REPO_ROOT / spec["script"]
         log_path = REPO_ROOT / spec["log"]
-        pid_path = REPO_ROOT / spec["pid"]
         args = ["--replace"]
         if spec.get("uses_tickers"):
             args += ["--tickers", ticker_csv]
@@ -2582,8 +2604,9 @@ def _restart_bundle_script(
             args += ["--days-ahead", str(int(days_ahead))]
         argv = ["uv", "run", "python", str(script), *args]
         quoted = " ".join(shlex.quote(a) for a in argv)
+        # Do not delete the pid file here. --replace only signals the pid
+        # recorded in it; deleting it first leaves the old process running.
         lines += [
-            f"rm -f {shlex.quote(str(pid_path))}",
             f"echo '↺ starting {spec['label']}' | tee -a \"$LOG\"",
             f"setsid {quoted} >>{shlex.quote(str(log_path))} 2>&1 </dev/null &",
             "sleep 4",
@@ -2620,12 +2643,15 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
     st.subheader("Services")
     st.caption(
         "Restart in-container workers from here (no SSH). "
-        "With **Clear RH session** on, login sends a **new device-approval "
-        "push** — approve it in the Robinhood app within 90 seconds, then "
-        "the pollers start. Only **one** process may MFA at a time, and "
-        "after ANY failed login auto-MFA **latches off** — nothing retries "
-        "until you click **Restart selected + RH login** again. "
-        "Don't mash restart if a challenge is already pending."
+        "The button stops the checked services, including a leftover price "
+        "poller, and clears the Robinhood latch files (root-owned on the "
+        "host, so they need sudo over SSH). "
+        "With **Clear RH session** on, login then sends a **new "
+        "device-approval push** — approve it in the Robinhood app within "
+        "90 seconds, then the pollers start. Only **one** process may MFA "
+        "at a time, and after ANY failed login auto-MFA **latches off** — "
+        "nothing retries until you click **Restart selected + RH login** "
+        "again. Don't mash restart if a challenge is already pending."
     )
 
     try:
@@ -2642,10 +2668,10 @@ def _render_services_sidebar(tickers: list[str], days_ahead: int) -> None:
             _since_s = "?"
         st.warning(
             f"**RH auto-login is OFF** (latched {_since_s} after: "
-            f"`{_latch_reason}`). Workers use the saved session if it "
-            "still works but will NOT start new MFA challenges. Click "
-            "**Restart selected + RH login** below to re-enable and run "
-            "one fresh login."
+            f"`{_latch_reason}`). Leave **Price poller** checked and click "
+            "**Restart selected + RH login**. That stops leftover pollers "
+            "and clears the latch, then sends one app push — approve it "
+            "within 90 seconds. No SSH."
         )
 
     for key in _SERVICE_SPECS:
