@@ -111,6 +111,48 @@ def _is_our_process(pid: int) -> bool:
     return _PID_MARKER in _pid_cmdline(pid)
 
 
+def _cmdline_is_daemon_poller(cmd: str, *, pid: int, me: int) -> bool:
+    """A long-running poller, not this process or a one-shot status/once/stop."""
+    if pid == me or _PID_MARKER not in cmd:
+        return False
+    if set(cmd.split()) & {"--status", "--once", "--stop"}:
+        return False
+    return True
+
+
+def _daemon_poller_pids() -> list[int]:
+    """Every live price-poller daemon, including one whose pid file is gone.
+
+    ``./restart-price-poller.sh`` used to delete the pid file and then
+    start a new process with ``--replace``. ``--replace`` only signals
+    the pid in that file, so the previous poller kept running and both
+    wrote to the same log.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    me = os.getpid()
+    found: list[int] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if _cmdline_is_daemon_poller(_pid_cmdline(pid), pid=pid, me=me) and _pid_alive(pid):
+            found.append(pid)
+    return found
+
+
+def _pids_to_stop(pid_file: Path) -> list[int]:
+    pids: list[int] = []
+    recorded = _running_pid(pid_file)
+    if recorded is not None:
+        pids.append(recorded)
+    for pid in _daemon_poller_pids():
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
 def _scrub_stale_pid(pid_file: Path) -> None:
     pid = _read_pid(pid_file)
     if pid is None or pid == os.getpid():
@@ -138,11 +180,7 @@ def _clear_pid(pid_file: Path) -> None:
         pid_file.unlink(missing_ok=True)
 
 
-def _stop_running(pid_file: Path, timeout: float = 15.0) -> bool:
-    _scrub_stale_pid(pid_file)
-    pid = _running_pid(pid_file)
-    if pid is None:
-        return False
+def _signal_and_wait(pid: int, timeout: float) -> bool:
     print(f"[{datetime.now():%H:%M:%S}] stopping price poller pid {pid}…")
     try:
         os.kill(pid, signal.SIGTERM)
@@ -161,6 +199,17 @@ def _stop_running(pid_file: Path, timeout: float = 15.0) -> bool:
     except OSError:
         pass
     return True
+
+
+def _stop_running(pid_file: Path, timeout: float = 15.0) -> bool:
+    _scrub_stale_pid(pid_file)
+    pids = _pids_to_stop(pid_file)
+    if not pids:
+        return False
+    stopped = False
+    for pid in pids:
+        stopped = _signal_and_wait(pid, timeout) or stopped
+    return stopped
 
 
 # ---------------------------------------------------------------------------

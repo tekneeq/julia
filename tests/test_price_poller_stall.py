@@ -195,6 +195,40 @@ class PollerFailureTests(unittest.TestCase):
         self.assertEqual(why, self.pp.FAIL_RATE_LIMIT)
         self.assertTrue(self.pp._login_ok)
 
+    def test_daemon_cmdline_skips_one_shots(self) -> None:
+        me = 10
+        daemon = "uv run python scripts/price_poller.py --replace"
+        self.assertTrue(
+            self.pp._cmdline_is_daemon_poller(daemon, pid=20, me=me)
+        )
+        for flag in ("--status", "--once", "--stop"):
+            cmd = f"uv run python scripts/price_poller.py {flag}"
+            self.assertFalse(
+                self.pp._cmdline_is_daemon_poller(cmd, pid=20, me=me)
+            )
+        self.assertFalse(
+            self.pp._cmdline_is_daemon_poller(daemon, pid=me, me=me)
+        )
+        self.assertFalse(
+            self.pp._cmdline_is_daemon_poller("python other.py", pid=20, me=me)
+        )
+
+    def test_stop_includes_orphan_missing_from_pid_file(self) -> None:
+        self.pp._running_pid = lambda _path: None
+        self.pp._daemon_poller_pids = lambda: [82, 267]
+        self.assertEqual(
+            self.pp._pids_to_stop(Path("/tmp/missing.pid")),
+            [82, 267],
+        )
+
+    def test_stop_does_not_signal_the_recorded_pid_twice(self) -> None:
+        self.pp._running_pid = lambda _path: 267
+        self.pp._daemon_poller_pids = lambda: [267, 82]
+        self.assertEqual(
+            self.pp._pids_to_stop(Path("/tmp/price-poller.pid")),
+            [267, 82],
+        )
+
     def test_other_error_drops_session(self) -> None:
         def boom(*a, **k):
             raise ValueError("weird payload")

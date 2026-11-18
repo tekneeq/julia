@@ -81,6 +81,11 @@ fi
 QUOTED=""
 for a in --replace "$@"; do QUOTED+=" $(printf '%q' "$a")"; done
 
+# Stop every price poller, including one whose pid file was already
+# deleted. --replace only signals the pid in that file, so a restart
+# used to leave the previous process running.
+docker exec "$CONTAINER" uv run python "$POLLER" --stop "$@" || true
+
 # Pid files are root-owned (written in-container); delete via docker exec.
 docker exec "$CONTAINER" rm -f logs/price-poller.pid
 
